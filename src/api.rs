@@ -1,12 +1,11 @@
+use crate::models::{
+    DebugEndpoint, DebugEndpointDetail, DebugEndpointDetailResponse, DebugEndpointsResponse,
+    ForwardResponse, WebhookRequest, WebhookRequestDetailResponse, WebhookRequestsResponse,
+};
 use anyhow::Result;
 use reqwest::Client;
-use crate::models::{
-    DebugEndpoint, DebugEndpointsResponse,
-    DebugEndpointDetail, DebugEndpointDetailResponse,
-    WebhookRequestsResponse, WebhookRequest, WebhookRequestDetailResponse, ForwardResponse
-};
-use std::time::Instant;
 use std::collections::HashMap;
+use std::time::Instant;
 
 pub struct ApiClient {
     client: Client,
@@ -25,8 +24,9 @@ impl ApiClient {
 
     pub async fn fetch_debug_endpoints(&self) -> Result<Vec<DebugEndpoint>> {
         let url = format!("{}/api/v1/debug-endpoints", self.base_url);
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
@@ -45,8 +45,9 @@ impl ApiClient {
 
     pub async fn fetch_endpoint_detail(&self, endpoint_id: &str) -> Result<DebugEndpointDetail> {
         let url = format!("{}/api/v1/debug-endpoints/{}", self.base_url, endpoint_id);
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
@@ -64,17 +65,18 @@ impl ApiClient {
     }
 
     pub async fn fetch_endpoint_requests(
-        &self, 
+        &self,
         endpoint_id: &str,
         page: i32,
-        page_size: i32
+        page_size: i32,
     ) -> Result<WebhookRequestsResponse> {
         let url = format!(
             "{}/api/v1/debug-endpoints/{}/requests?page={}&page_size={}",
             self.base_url, endpoint_id, page, page_size
         );
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
@@ -91,13 +93,18 @@ impl ApiClient {
         Ok(requests_response)
     }
 
-    pub async fn fetch_request_details(&self, endpoint_id: &str, request_id: &str) -> Result<WebhookRequest> {
+    pub async fn fetch_request_details(
+        &self,
+        endpoint_id: &str,
+        request_id: &str,
+    ) -> Result<WebhookRequest> {
         let url = format!(
             "{}/api/v1/debug-endpoints/{}/requests/{}",
             self.base_url, endpoint_id, request_id
         );
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
@@ -122,9 +129,13 @@ impl ApiClient {
         }
     }
 
-    pub async fn forward_request(&self, original_request: &WebhookRequest, target_url: &str) -> Result<ForwardResponse> {
+    pub async fn forward_request(
+        &self,
+        original_request: &WebhookRequest,
+        target_url: &str,
+    ) -> Result<ForwardResponse> {
         let start_time = Instant::now();
-        
+
         // Build the forwarding request
         let method = match original_request.method.as_str() {
             "GET" => reqwest::Method::GET,
@@ -137,16 +148,16 @@ impl ApiClient {
             _ => reqwest::Method::GET,
         };
 
-        let mut request_builder = self.client
-            .request(method, target_url);
+        let mut request_builder = self.client.request(method, target_url);
 
         // Add headers (excluding host-related ones)
         for (key, value) in &original_request.headers {
             let key_lower = key.to_lowercase();
-            if !key_lower.starts_with("host") && 
-               !key_lower.starts_with("x-forwarded") && 
-               !key_lower.starts_with("cf-") &&
-               key_lower != "content-length" {
+            if !key_lower.starts_with("host")
+                && !key_lower.starts_with("x-forwarded")
+                && !key_lower.starts_with("cf-")
+                && key_lower != "content-length"
+            {
                 request_builder = request_builder.header(key, value);
             }
         }
@@ -158,17 +169,23 @@ impl ApiClient {
 
         // Add body if present (for POST, PUT, PATCH requests)
         // Use full body if available, otherwise fall back to preview
-        let body_content = original_request.body.as_ref().or(original_request.body_preview.as_ref());
+        let body_content = original_request
+            .body
+            .as_ref()
+            .or(original_request.body_preview.as_ref());
         if let Some(body) = body_content
-            && !body.is_empty() && original_request.method != "GET" && original_request.method != "HEAD" {
-                request_builder = request_builder.body(body.clone());
-            }
+            && !body.is_empty()
+            && original_request.method != "GET"
+            && original_request.method != "HEAD"
+        {
+            request_builder = request_builder.body(body.clone());
+        }
 
         // Execute the request
         match request_builder.send().await {
             Ok(response) => {
                 let status_code = response.status().as_u16();
-                
+
                 // Extract response headers
                 let mut response_headers = HashMap::new();
                 for (key, value) in response.headers() {
@@ -178,10 +195,13 @@ impl ApiClient {
                 }
 
                 // Get response body
-                let body = response.text().await.unwrap_or_else(|_| "(Failed to read response body)".to_string());
-                
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "(Failed to read response body)".to_string());
+
                 let duration = start_time.elapsed();
-                
+
                 Ok(ForwardResponse {
                     success: true,
                     status_code: Some(status_code),
@@ -194,7 +214,7 @@ impl ApiClient {
             }
             Err(e) => {
                 let duration = start_time.elapsed();
-                
+
                 Ok(ForwardResponse {
                     success: false,
                     status_code: None,
