@@ -1,11 +1,14 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
-    pub api_key: Option<String>,
+    pub access_token: Option<String>,
+    pub token_expires_at: Option<DateTime<Utc>>,
+    pub selected_organization_id: Option<String>,
 }
 
 impl Config {
@@ -17,7 +20,11 @@ impl Config {
             let config: Config = serde_json::from_str(&content)?;
             Ok(config)
         } else {
-            Ok(Config { api_key: None })
+            Ok(Config {
+                access_token: None,
+                token_expires_at: None,
+                selected_organization_id: None,
+            })
         }
     }
 
@@ -41,7 +48,25 @@ impl Config {
         Ok(home.join("hooklistener").join("config.json"))
     }
 
-    pub fn set_api_key(&mut self, api_key: String) {
-        self.api_key = Some(api_key);
+    pub fn set_access_token(&mut self, access_token: String, expires_at: DateTime<Utc>) {
+        self.access_token = Some(access_token);
+        self.token_expires_at = Some(expires_at);
+    }
+
+    pub fn is_token_valid(&self) -> bool {
+        if let (Some(_), Some(expires_at)) = (&self.access_token, &self.token_expires_at) {
+            Utc::now() < *expires_at
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_token(&mut self) {
+        self.access_token = None;
+        self.token_expires_at = None;
+    }
+
+    pub fn set_selected_organization(&mut self, organization_id: String) {
+        self.selected_organization_id = Some(organization_id);
     }
 }

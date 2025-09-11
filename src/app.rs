@@ -1,13 +1,20 @@
 use crate::api::ApiClient;
+use crate::auth::DeviceCodeFlow;
 use crate::config::Config;
-use crate::models::{DebugEndpoint, DebugEndpointDetail, ForwardResponse, WebhookRequest};
+use crate::models::{
+    DebugEndpoint, DebugEndpointDetail, ForwardResponse, Organization, WebhookRequest,
+};
 use anyhow::Result;
+use chrono::{Duration, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 #[derive(Debug)]
 pub enum AppState {
-    InputApiKey,
+    InitiatingDeviceFlow,
+    DisplayingDeviceCode,
+    WaitingForAuth,
     Loading,
+    ShowOrganizations,
     ShowEndpoints,
     ShowEndpointDetail,
     ShowRequests,
@@ -21,7 +28,10 @@ pub enum AppState {
 pub struct App {
     pub state: AppState,
     pub config: Config,
-    pub api_key_input: String,
+    pub device_flow: Option<DeviceCodeFlow>,
+    pub auth_poll_counter: u64,
+    pub organizations: Vec<Organization>,
+    pub selected_organization_index: usize,
     pub endpoints: Vec<DebugEndpoint>,
     pub selected_index: usize,
     pub selected_endpoint: Option<DebugEndpointDetail>,
@@ -36,23 +46,27 @@ pub struct App {
     pub headers_scroll_offset: usize,
     pub body_scroll_offset: usize,
     pub should_quit: bool,
-    pub loading_frame: usize, // For animated loading spinner
+    pub loading_frame: usize,
 }
 
 impl App {
     pub fn new() -> Result<Self> {
         let config = Config::load()?;
 
-        let state = if config.api_key.is_some() {
+        let state = if config.is_token_valid() {
+            // Start by loading organizations
             AppState::Loading
         } else {
-            AppState::InputApiKey
+            AppState::InitiatingDeviceFlow
         };
 
         Ok(Self {
             state,
             config,
-            api_key_input: String::new(),
+            device_flow: None,
+            auth_poll_counter: 0,
+            organizations: Vec::new(),
+            selected_organization_index: 0,
             endpoints: Vec::new(),
             selected_index: 0,
             selected_endpoint: None,
@@ -71,29 +85,95 @@ impl App {
         })
     }
 
-    pub async fn load_endpoints(&mut self) -> Result<()> {
-        if let Some(api_key) = &self.config.api_key {
-            let client = ApiClient::new(api_key.clone());
+    pub async fn load_organizations(&mut self) -> Result<()> {
+        log::info!("load_organizations: Starting");
+        if let Some(access_token) = &self.config.access_token {
+            if self.config.is_token_valid() {
+                let client = ApiClient::new(access_token.clone());
 
-            match client.fetch_debug_endpoints().await {
-                Ok(endpoints) => {
-                    self.endpoints = endpoints;
-                    self.state = AppState::ShowEndpoints;
+                match client.fetch_organizations().await {
+                    Ok(organizations) => {
+                        log::info!(
+                            "load_organizations: Loaded {} organizations",
+                            organizations.len()
+                        );
+                        self.organizations = organizations;
+                        if self.config.selected_organization_id.is_some() {
+                            log::info!(
+                                "load_organizations: User has selected org, loading endpoints directly"
+                            );
+                            // User has a selected organization, load endpoints directly
+                            self.load_endpoints().await?;
+                        } else {
+                            log::info!(
+                                "load_organizations: No selected org, showing organization selection"
+                            );
+                            // User needs to select an organization
+                            self.state = AppState::ShowOrganizations;
+                        }
+                    }
+                    Err(_e) => {
+                        // Token might be invalid, trigger re-authentication
+                        self.config.clear_token();
+                        self.config.save()?;
+                        self.state = AppState::InitiatingDeviceFlow;
+                    }
                 }
-                Err(e) => {
-                    self.state = AppState::Error(format!("Failed to fetch endpoints: {}", e));
-                }
+            } else {
+                // Token expired, clear and re-authenticate
+                self.config.clear_token();
+                self.config.save()?;
+                self.state = AppState::InitiatingDeviceFlow;
             }
         } else {
-            self.state = AppState::InputApiKey;
+            self.state = AppState::InitiatingDeviceFlow;
+        }
+
+        Ok(())
+    }
+
+    pub async fn load_endpoints(&mut self) -> Result<()> {
+        log::info!("load_endpoints: Starting");
+        if let Some(access_token) = &self.config.access_token {
+            if self.config.is_token_valid() {
+                let client = ApiClient::with_organization(
+                    access_token.clone(),
+                    self.config.selected_organization_id.clone(),
+                );
+
+                match client.fetch_debug_endpoints().await {
+                    Ok(endpoints) => {
+                        log::info!("load_endpoints: Loaded {} endpoints", endpoints.len());
+                        self.endpoints = endpoints;
+                        self.state = AppState::ShowEndpoints;
+                        log::info!("load_endpoints: State set to ShowEndpoints");
+                    }
+                    Err(_e) => {
+                        // Token might be invalid, trigger re-authentication
+                        self.config.clear_token();
+                        self.config.save()?;
+                        self.state = AppState::InitiatingDeviceFlow;
+                    }
+                }
+            } else {
+                // Token expired, clear and re-authenticate
+                self.config.clear_token();
+                self.config.save()?;
+                self.state = AppState::InitiatingDeviceFlow;
+            }
+        } else {
+            self.state = AppState::InitiatingDeviceFlow;
         }
 
         Ok(())
     }
 
     pub async fn load_endpoint_detail(&mut self, endpoint_id: &str) -> Result<()> {
-        if let Some(api_key) = &self.config.api_key {
-            let client = ApiClient::new(api_key.clone());
+        if let Some(access_token) = &self.config.access_token {
+            let client = ApiClient::with_organization(
+                access_token.clone(),
+                self.config.selected_organization_id.clone(),
+            );
 
             match client.fetch_endpoint_detail(endpoint_id).await {
                 Ok(detail) => {
@@ -110,8 +190,11 @@ impl App {
     }
 
     pub async fn load_requests(&mut self, endpoint_id: &str) -> Result<()> {
-        if let Some(api_key) = &self.config.api_key {
-            let client = ApiClient::new(api_key.clone());
+        if let Some(access_token) = &self.config.access_token {
+            let client = ApiClient::with_organization(
+                access_token.clone(),
+                self.config.selected_organization_id.clone(),
+            );
 
             match client
                 .fetch_endpoint_requests(endpoint_id, self.current_page, 50)
@@ -137,8 +220,11 @@ impl App {
         endpoint_id: &str,
         request_id: &str,
     ) -> Result<()> {
-        if let Some(api_key) = &self.config.api_key {
-            let client = ApiClient::new(api_key.clone());
+        if let Some(access_token) = &self.config.access_token {
+            let client = ApiClient::with_organization(
+                access_token.clone(),
+                self.config.selected_organization_id.clone(),
+            );
 
             match client.fetch_request_details(endpoint_id, request_id).await {
                 Ok(request_detail) => {
@@ -173,22 +259,44 @@ impl App {
         }
 
         match &self.state {
-            AppState::InputApiKey => match key.code {
-                KeyCode::Enter => {
-                    if !self.api_key_input.is_empty() {
-                        self.config.set_api_key(self.api_key_input.clone());
-                        self.config.save()?;
-                        self.state = AppState::Loading;
+            AppState::ShowOrganizations => match key.code {
+                KeyCode::Up => {
+                    if self.selected_organization_index > 0 {
+                        self.selected_organization_index -= 1;
                     }
                 }
-                KeyCode::Char(c) => {
-                    self.api_key_input.push(c);
+                KeyCode::Down => {
+                    if self.selected_organization_index < self.organizations.len().saturating_sub(1)
+                    {
+                        self.selected_organization_index += 1;
+                    }
                 }
-                KeyCode::Backspace => {
-                    self.api_key_input.pop();
+                KeyCode::Enter => {
+                    self.state = AppState::Loading;
                 }
-                KeyCode::Esc => {
+                KeyCode::Char('q') => {
                     self.should_quit = true;
+                }
+                KeyCode::Char('r') => {
+                    self.state = AppState::Loading;
+                }
+                _ => {}
+            },
+            AppState::DisplayingDeviceCode => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.should_quit = true;
+                }
+                KeyCode::Char('r') => {
+                    self.state = AppState::InitiatingDeviceFlow;
+                }
+                _ => {}
+            },
+            AppState::WaitingForAuth => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.should_quit = true;
+                }
+                KeyCode::Char('r') => {
+                    self.state = AppState::InitiatingDeviceFlow;
                 }
                 _ => {}
             },
@@ -213,6 +321,9 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     self.state = AppState::Loading;
+                }
+                KeyCode::Char('o') => {
+                    self.state = AppState::ShowOrganizations;
                 }
                 _ => {}
             },
@@ -470,10 +581,9 @@ impl App {
                     self.state = AppState::Loading;
                 }
                 KeyCode::Char('c') => {
-                    self.api_key_input.clear();
-                    self.config.api_key = None;
+                    self.config.clear_token();
                     self.config.save()?;
-                    self.state = AppState::InputApiKey;
+                    self.state = AppState::InitiatingDeviceFlow;
                 }
                 _ => {}
             },
@@ -489,13 +599,40 @@ impl App {
             .map(|e| e.id.clone())
     }
 
+    pub fn get_selected_organization_id(&self) -> Option<String> {
+        self.organizations
+            .get(self.selected_organization_index)
+            .map(|org| org.id.clone())
+    }
+
+    pub async fn select_organization(&mut self) -> Result<()> {
+        log::info!("select_organization: Starting");
+        if let Some(org_id) = self.get_selected_organization_id() {
+            log::info!("select_organization: Selected org ID: {}", org_id);
+            self.config.set_selected_organization(org_id);
+            self.config.save()?;
+            log::info!("select_organization: Config saved, loading endpoints");
+            // Now load endpoints with the selected organization
+            self.load_endpoints().await?;
+            log::info!("select_organization: Endpoints loaded successfully");
+        } else {
+            log::warn!("select_organization: No organization selected");
+        }
+        Ok(())
+    }
+
     pub fn is_valid_url(&self, url: &str) -> bool {
         url.starts_with("http://") || url.starts_with("https://")
     }
 
     pub async fn forward_request(&mut self) -> Result<()> {
-        if let (Some(request), Some(api_key)) = (&self.selected_request, &self.config.api_key) {
-            let client = ApiClient::new(api_key.clone());
+        if let (Some(request), Some(access_token)) =
+            (&self.selected_request, &self.config.access_token)
+        {
+            let client = ApiClient::with_organization(
+                access_token.clone(),
+                self.config.selected_organization_id.clone(),
+            );
 
             match client
                 .forward_request(request, &self.forward_url_input)
@@ -512,6 +649,62 @@ impl App {
         }
 
         Ok(())
+    }
+
+    pub async fn initiate_device_flow(&mut self) -> Result<()> {
+        let mut device_flow = DeviceCodeFlow::new("https://api.hooklistener.com".to_string());
+
+        match device_flow.initiate_device_flow().await {
+            Ok(_user_code) => {
+                self.device_flow = Some(device_flow);
+                self.state = AppState::DisplayingDeviceCode;
+            }
+            Err(e) => {
+                self.state = AppState::Error(format!("Failed to initiate device flow: {}", e));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn start_device_authentication(&mut self) {
+        if self.device_flow.is_some() {
+            self.state = AppState::WaitingForAuth;
+            self.auth_poll_counter = 0;
+        }
+    }
+
+    pub async fn poll_device_authentication(&mut self) -> Result<()> {
+        if let Some(device_flow) = &self.device_flow {
+            // Only poll every 50 ticks (roughly every 5 seconds at 100ms tick rate)
+            self.auth_poll_counter += 1;
+            if self.auth_poll_counter % 50 == 0 {
+                match device_flow.poll_for_authorization().await {
+                    Ok(Some(access_token)) => {
+                        // Authentication successful!
+                        let expires_at = Utc::now() + Duration::hours(24);
+                        self.config.set_access_token(access_token, expires_at);
+                        self.config.save()?;
+                        self.device_flow = None;
+                        self.state = AppState::Loading;
+                    }
+                    Ok(None) => {
+                        // Still pending, keep waiting
+                    }
+                    Err(e) => {
+                        self.state = AppState::Error(format!("Authentication failed: {}", e));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_device_code_info(&self) -> Option<(String, Option<Duration>)> {
+        self.device_flow.as_ref().and_then(|flow| {
+            flow.format_user_code()
+                .map(|code| (code, flow.time_remaining()))
+        })
     }
 
     pub fn tick(&mut self) {
