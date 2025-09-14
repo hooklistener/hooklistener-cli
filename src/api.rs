@@ -1,3 +1,4 @@
+use crate::logger::generate_request_id;
 use crate::models::{
     DebugEndpoint, DebugEndpointDetail, DebugEndpointDetailResponse, DebugEndpointsResponse,
     ForwardResponse, Organization, WebhookRequest, WebhookRequestDetailResponse,
@@ -7,6 +8,7 @@ use anyhow::Result;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::time::Instant;
+use tracing::{debug, error, info};
 
 pub struct ApiClient {
     client: Client,
@@ -42,54 +44,173 @@ impl ApiClient {
 
     pub async fn fetch_organizations(&self) -> Result<Vec<Organization>> {
         let url = format!("{}/api/v1/organizations", self.base_url);
+        let request_id = generate_request_id();
+        let start_time = Instant::now();
+
+        crate::log_api_request!("GET", &url, &request_id);
 
         let request_builder = self.client.get(&url);
-        let response = self.add_headers(request_builder).send().await?;
+        let response = self.add_headers(request_builder).send().await;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch organizations: {}",
-                response.status()
-            ));
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                crate::log_api_response!(&request_id, status, duration_ms);
+
+                if !response.status().is_success() {
+                    error!(
+                        request_id = %request_id,
+                        status = status,
+                        url = %url,
+                        "API request failed with non-success status"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Failed to fetch organizations: {}",
+                        response.status()
+                    ));
+                }
+
+                match response.json::<Vec<Organization>>().await {
+                    Ok(organizations) => {
+                        info!(
+                            request_id = %request_id,
+                            count = organizations.len(),
+                            "Successfully fetched organizations"
+                        );
+                        Ok(organizations)
+                    }
+                    Err(e) => {
+                        error!(
+                            request_id = %request_id,
+                            error = %e,
+                            "Failed to parse organizations response"
+                        );
+                        Err(e.into())
+                    }
+                }
+            }
+            Err(e) => {
+                crate::log_api_error!(&request_id, &e, duration_ms);
+                Err(e.into())
+            }
         }
-
-        // The API returns an array directly based on the provided example
-        let organizations: Vec<Organization> = response.json().await?;
-        Ok(organizations)
     }
 
     pub async fn fetch_debug_endpoints(&self) -> Result<Vec<DebugEndpoint>> {
         let url = format!("{}/api/v1/debug-endpoints", self.base_url);
+        let request_id = generate_request_id();
+        let start_time = Instant::now();
+
+        crate::log_api_request!("GET", &url, &request_id);
 
         let request_builder = self.client.get(&url);
-        let response = self.add_headers(request_builder).send().await?;
+        let response = self.add_headers(request_builder).send().await;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch debug endpoints: {}",
-                response.status()
-            ));
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                crate::log_api_response!(&request_id, status, duration_ms);
+
+                if !response.status().is_success() {
+                    error!(
+                        request_id = %request_id,
+                        status = status,
+                        url = %url,
+                        "Failed to fetch debug endpoints"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Failed to fetch debug endpoints: {}",
+                        response.status()
+                    ));
+                }
+
+                match response.json::<DebugEndpointsResponse>().await {
+                    Ok(endpoints_response) => {
+                        info!(
+                            request_id = %request_id,
+                            count = endpoints_response.data.len(),
+                            "Successfully fetched debug endpoints"
+                        );
+                        Ok(endpoints_response.data)
+                    }
+                    Err(e) => {
+                        error!(
+                            request_id = %request_id,
+                            error = %e,
+                            "Failed to parse debug endpoints response"
+                        );
+                        Err(e.into())
+                    }
+                }
+            }
+            Err(e) => {
+                crate::log_api_error!(&request_id, &e, duration_ms);
+                Err(e.into())
+            }
         }
-
-        let endpoints_response: DebugEndpointsResponse = response.json().await?;
-        Ok(endpoints_response.data)
     }
 
     pub async fn fetch_endpoint_detail(&self, endpoint_id: &str) -> Result<DebugEndpointDetail> {
         let url = format!("{}/api/v1/debug-endpoints/{}", self.base_url, endpoint_id);
+        let request_id = generate_request_id();
+        let start_time = Instant::now();
+
+        crate::log_api_request!("GET", &url, &request_id);
+        debug!(request_id = %request_id, endpoint_id = %endpoint_id, "Fetching endpoint detail");
 
         let request_builder = self.client.get(&url);
-        let response = self.add_headers(request_builder).send().await?;
+        let response = self.add_headers(request_builder).send().await;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch endpoint detail: {}",
-                response.status()
-            ));
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                crate::log_api_response!(&request_id, status, duration_ms);
+
+                if !response.status().is_success() {
+                    error!(
+                        request_id = %request_id,
+                        endpoint_id = %endpoint_id,
+                        status = status,
+                        url = %url,
+                        "Failed to fetch endpoint detail"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Failed to fetch endpoint detail: {}",
+                        response.status()
+                    ));
+                }
+
+                match response.json::<DebugEndpointDetailResponse>().await {
+                    Ok(detail_response) => {
+                        info!(
+                            request_id = %request_id,
+                            endpoint_id = %endpoint_id,
+                            "Successfully fetched endpoint detail"
+                        );
+                        Ok(detail_response.data)
+                    }
+                    Err(e) => {
+                        error!(
+                            request_id = %request_id,
+                            endpoint_id = %endpoint_id,
+                            error = %e,
+                            "Failed to parse endpoint detail response"
+                        );
+                        Err(e.into())
+                    }
+                }
+            }
+            Err(e) => {
+                crate::log_api_error!(&request_id, &e, duration_ms);
+                Err(e.into())
+            }
         }
-
-        let detail_response: DebugEndpointDetailResponse = response.json().await?;
-        Ok(detail_response.data)
     }
 
     pub async fn fetch_endpoint_requests(
