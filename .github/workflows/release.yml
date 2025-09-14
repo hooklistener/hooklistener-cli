@@ -54,11 +54,9 @@ jobs:
           mkdir -p target/dist
 
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            cd target/${{ matrix.target }}/release
-            7z a "../../../dist/${binary_name}-${{ matrix.target }}.zip" "${binary_name}"
+            7z a "target/dist/${binary_name}-${{ matrix.target }}.zip" "target/${{ matrix.target }}/release/${binary_name}"
           else
-            cd target/${{ matrix.target }}/release
-            tar -czf "../../../dist/${binary_name}-${{ matrix.target }}.tar.gz" "${binary_name}"
+            tar -czf "target/dist/${binary_name}-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "${binary_name}"
           fi
 
       - name: Upload artifact
