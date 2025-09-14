@@ -115,7 +115,7 @@ fn draw_device_code(frame: &mut Frame, app: &App, area: Rect) {
 
     let help_text = vec![
         Line::from(""),
-        Line::from("Visit https://app.hooklistener.com/auth/device and enter the code above"),
+        Line::from("Visit https://app.hooklistener.com/device-codes and enter the code above"),
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -1163,7 +1163,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 app.selected_index + 1,
                 app.endpoints.len()
             ),
-            "↑/↓: Navigate | Enter: Details | O: Switch Org | R: Refresh | Q: Quit",
+            "↑/↓: Navigate | Enter: Details | O: Switch Org | L: Logout | R: Refresh | Q: Quit",
         ),
         AppState::ShowEndpointDetail => (
             "🔍 Endpoint Details".to_string(),

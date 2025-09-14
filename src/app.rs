@@ -325,6 +325,10 @@ impl App {
                 KeyCode::Char('o') => {
                     self.state = AppState::ShowOrganizations;
                 }
+                KeyCode::Char('l') => {
+                    // Logout and redirect to authentication
+                    let _ = self.logout();
+                }
                 _ => {}
             },
             AppState::ShowEndpointDetail => match key.code {
@@ -710,5 +714,20 @@ impl App {
     pub fn tick(&mut self) {
         // Update loading animation frame
         self.loading_frame = (self.loading_frame + 1) % 8;
+    }
+
+    pub fn logout(&mut self) -> Result<()> {
+        // Clear all authentication data
+        self.config.clear_all();
+        self.config.save()?;
+
+        // Reset app state to authentication flow
+        self.state = AppState::InitiatingDeviceFlow;
+        self.organizations.clear();
+        self.endpoints.clear();
+        self.selected_organization_index = 0;
+        self.selected_index = 0;
+
+        Ok(())
     }
 }

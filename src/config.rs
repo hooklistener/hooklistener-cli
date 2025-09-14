@@ -69,4 +69,10 @@ impl Config {
     pub fn set_selected_organization(&mut self, organization_id: String) {
         self.selected_organization_id = Some(organization_id);
     }
+
+    pub fn clear_all(&mut self) {
+        self.access_token = None;
+        self.token_expires_at = None;
+        self.selected_organization_id = None;
+    }
 }
