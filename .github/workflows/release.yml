@@ -43,16 +43,23 @@ jobs:
       - name: Build (cargo)
         run: cargo build --release --target ${{ matrix.target }} --locked
 
-      - name: Install cargo-dist
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-dist
-
-      - name: Package with cargo-dist
+      - name: Package binary
+        shell: bash
         run: |
-          cargo dist build \
-            --target ${{ matrix.target }} \
-            --locked
+          binary_name="hooklistener-cli"
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            binary_name="${binary_name}.exe"
+          fi
+
+          mkdir -p target/dist
+
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            cd target/${{ matrix.target }}/release
+            7z a "../../../dist/${binary_name}-${{ matrix.target }}.zip" "${binary_name}"
+          else
+            cd target/${{ matrix.target }}/release
+            tar -czf "../../../dist/${binary_name}-${{ matrix.target }}.tar.gz" "${binary_name}"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
