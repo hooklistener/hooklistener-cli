@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Organization {
+    pub id: String,
+    pub name: String,
+    pub updated_at: String,
+    pub created_at: String,
+    pub signing_secret_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugEndpoint {
     pub id: String,
     pub name: String,

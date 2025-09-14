@@ -1,6 +1,7 @@
 use crate::models::{
     DebugEndpoint, DebugEndpointDetail, DebugEndpointDetailResponse, DebugEndpointsResponse,
-    ForwardResponse, WebhookRequest, WebhookRequestDetailResponse, WebhookRequestsResponse,
+    ForwardResponse, Organization, WebhookRequest, WebhookRequestDetailResponse,
+    WebhookRequestsResponse,
 };
 use anyhow::Result;
 use reqwest::Client;
@@ -9,28 +10,59 @@ use std::time::Instant;
 
 pub struct ApiClient {
     client: Client,
-    api_key: String,
+    access_token: String,
     base_url: String,
+    organization_id: Option<String>,
 }
 
 impl ApiClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(access_token: String) -> Self {
+        Self::with_organization(access_token, None)
+    }
+
+    pub fn with_organization(access_token: String, organization_id: Option<String>) -> Self {
         Self {
             client: Client::new(),
-            api_key,
+            access_token,
             base_url: "https://api.hooklistener.com".to_string(),
+            organization_id,
         }
+    }
+
+    fn add_headers(&self, mut request_builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request_builder =
+            request_builder.header("Authorization", format!("Bearer {}", self.access_token));
+
+        if let Some(org_id) = &self.organization_id {
+            request_builder = request_builder.header("x-organization-id", org_id);
+        }
+
+        request_builder
+    }
+
+    pub async fn fetch_organizations(&self) -> Result<Vec<Organization>> {
+        let url = format!("{}/api/v1/organizations", self.base_url);
+
+        let request_builder = self.client.get(&url);
+        let response = self.add_headers(request_builder).send().await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to fetch organizations: {}",
+                response.status()
+            ));
+        }
+
+        // The API returns an array directly based on the provided example
+        let organizations: Vec<Organization> = response.json().await?;
+        Ok(organizations)
     }
 
     pub async fn fetch_debug_endpoints(&self) -> Result<Vec<DebugEndpoint>> {
         let url = format!("{}/api/v1/debug-endpoints", self.base_url);
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
+        let request_builder = self.client.get(&url);
+        let response = self.add_headers(request_builder).send().await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
@@ -46,12 +78,8 @@ impl ApiClient {
     pub async fn fetch_endpoint_detail(&self, endpoint_id: &str) -> Result<DebugEndpointDetail> {
         let url = format!("{}/api/v1/debug-endpoints/{}", self.base_url, endpoint_id);
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
+        let request_builder = self.client.get(&url);
+        let response = self.add_headers(request_builder).send().await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
@@ -75,12 +103,8 @@ impl ApiClient {
             self.base_url, endpoint_id, page, page_size
         );
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
+        let request_builder = self.client.get(&url);
+        let response = self.add_headers(request_builder).send().await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
@@ -103,12 +127,8 @@ impl ApiClient {
             self.base_url, endpoint_id, request_id
         );
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
+        let request_builder = self.client.get(&url);
+        let response = self.add_headers(request_builder).send().await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(

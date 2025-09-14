@@ -35,8 +35,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Draw main content
     match &app.state {
-        AppState::InputApiKey => draw_api_key_input(frame, app, chunks[0]),
+        AppState::InitiatingDeviceFlow => draw_loading(frame, app, chunks[0]),
+        AppState::DisplayingDeviceCode => draw_device_code(frame, app, chunks[0]),
         AppState::Loading => draw_loading(frame, app, chunks[0]),
+        AppState::ShowOrganizations => draw_organizations_list(frame, app, chunks[0]),
         AppState::ShowEndpoints => draw_endpoints_list(frame, app, chunks[0]),
         AppState::ShowEndpointDetail => draw_endpoint_detail(frame, app, chunks[0]),
         AppState::ShowRequests => draw_requests_list(frame, app, chunks[0]),
@@ -51,20 +53,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_bar(frame, app, chunks[1]);
 }
 
-fn draw_api_key_input(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_device_code(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Min(0),
         ])
         .split(area);
 
-    let title = Paragraph::new("Welcome to Hooklistener CLI")
+    let title = Paragraph::new("Device Authentication")
         .style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(colors::PRIMARY)
                 .add_modifier(Modifier::BOLD),
         )
         .alignment(Alignment::Center)
@@ -72,50 +76,87 @@ fn draw_api_key_input(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(title, chunks[0]);
 
-    let input_block = Block::default()
-        .title(" Enter API Key ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+    if let Some((user_code, time_remaining)) = app.get_device_code_info() {
+        let code_block = Block::default()
+            .title(" Enter this code in your browser ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::SUCCESS));
 
-    let input = Paragraph::new(app.api_key_input.as_str())
-        .style(Style::default().fg(Color::White))
-        .block(input_block);
+        let code_display = Paragraph::new(user_code)
+            .style(
+                Style::default()
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center)
+            .block(code_block);
 
-    frame.render_widget(input, chunks[1]);
+        frame.render_widget(code_display, chunks[1]);
+
+        let time_text = if let Some(remaining) = time_remaining {
+            let minutes = remaining.num_minutes();
+            let seconds = remaining.num_seconds() % 60;
+            if minutes > 0 {
+                format!("Code expires in: {}m {}s", minutes, seconds)
+            } else {
+                format!("Code expires in: {}s", seconds)
+            }
+        } else {
+            "Code expired".to_string()
+        };
+
+        let timer = Paragraph::new(time_text)
+            .style(Style::default().fg(colors::WARNING))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::NONE));
+
+        frame.render_widget(timer, chunks[2]);
+    }
+
+    // Show polling status
+    let poll_status = if app.auth_poll_counter > 0 {
+        let dots = ".".repeat(((app.auth_poll_counter / 10) % 4) as usize);
+        format!("⏳ Checking for authorization{}", dots)
+    } else {
+        "⏳ Starting authentication...".to_string()
+    };
+
+    let status = Paragraph::new(poll_status)
+        .style(Style::default().fg(colors::INFO))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::NONE));
+
+    frame.render_widget(status, chunks[3]);
 
     let help_text = vec![
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Submit | "),
-            Span::styled(
-                "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Quit"),
-        ]),
+        Line::from("Visit https://app.hooklistener.com/device-codes and enter the code above"),
         Line::from(""),
         Line::from(vec![
-            Span::raw("Get your API key from "),
             Span::styled(
-                "https://hooklistener.com",
+                "r",
                 Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::UNDERLINED),
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
             ),
+            Span::raw(": Refresh | "),
+            Span::styled(
+                "Esc/q",
+                Style::default()
+                    .fg(colors::ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(": Quit"),
         ]),
     ];
 
     let help = Paragraph::new(help_text)
+        .style(Style::default().fg(colors::MUTED))
         .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::NONE));
 
-    frame.render_widget(help, chunks[2]);
+    frame.render_widget(help, chunks[4]);
 }
 
 fn draw_loading(frame: &mut Frame, app: &App, area: Rect) {
@@ -1031,19 +1072,33 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     // Build status text with shortcuts based on current state
     let (status_text, shortcuts) = match &app.state {
-        AppState::InputApiKey => ("🔑 Enter API Key".to_string(), "Enter: Submit | Esc: Quit"),
+        AppState::InitiatingDeviceFlow => {
+            ("🔄 Starting authentication...".to_string(), "Please wait")
+        }
+        AppState::DisplayingDeviceCode => (
+            "🔑 Authenticating...".to_string(),
+            "r: Refresh | Esc/q: Quit",
+        ),
         AppState::Loading => {
             let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
             let spinner = spinner_chars[app.loading_frame % spinner_chars.len()];
             (format!("{} Loading...", spinner), "Please wait")
         }
+        AppState::ShowOrganizations => (
+            format!(
+                "🏢 Organizations ({}/{})",
+                app.selected_organization_index + 1,
+                app.organizations.len()
+            ),
+            "↑/↓: Navigate | Enter: Select | R: Refresh | Q: Quit",
+        ),
         AppState::ShowEndpoints => (
             format!(
                 "📋 Endpoints ({}/{})",
                 app.selected_index + 1,
                 app.endpoints.len()
             ),
-            "↑/↓: Navigate | Enter: Details | R: Refresh | Q: Quit",
+            "↑/↓: Navigate | Enter: Details | O: Switch Org | L: Logout | R: Refresh | Q: Quit",
         ),
         AppState::ShowEndpointDetail => (
             "🔍 Endpoint Details".to_string(),
@@ -1100,7 +1155,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(status_paragraph, chunks[0]);
 
     // Right side: API connection status
-    let connection_status = if app.config.api_key.is_some() {
+    let connection_status = if app.config.access_token.is_some() && app.config.is_token_valid() {
         Span::styled(
             "🟢 Connected",
             Style::default()
@@ -1121,4 +1176,92 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         .alignment(Alignment::Center);
 
     frame.render_widget(connection_paragraph, chunks[1]);
+}
+
+fn draw_organizations_list(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(area);
+
+    // Main organizations list
+    let org_items: Vec<ListItem> = app
+        .organizations
+        .iter()
+        .enumerate()
+        .map(|(i, org)| {
+            let style = if i == app.selected_organization_index {
+                Style::default()
+                    .bg(colors::PRIMARY)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(colors::TEXT)
+            };
+
+            let content = vec![Line::from(vec![
+                Span::styled(&org.name, style),
+                if org.signing_secret_prefix.is_some() {
+                    Span::styled(" 🔐", Style::default().fg(colors::SUCCESS))
+                } else {
+                    Span::raw("")
+                },
+            ])];
+
+            ListItem::new(content).style(style)
+        })
+        .collect();
+
+    let orgs_list = List::new(org_items)
+        .block(
+            Block::default()
+                .title(" Select Organization ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::PRIMARY)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(colors::PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_widget(orgs_list, chunks[0]);
+
+    // Help text
+    let help_text = vec![Line::from(vec![
+        Span::styled(
+            "↑/↓",
+            Style::default()
+                .fg(colors::SECONDARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Navigate | "),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(colors::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Select | "),
+        Span::styled(
+            "r",
+            Style::default()
+                .fg(colors::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Refresh | "),
+        Span::styled(
+            "q",
+            Style::default()
+                .fg(colors::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Quit"),
+    ])];
+
+    let help = Paragraph::new(help_text)
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::TOP));
+
+    frame.render_widget(help, chunks[1]);
 }
