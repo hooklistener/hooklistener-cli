@@ -7,6 +7,8 @@
 
 A fast, terminal-based CLI for browsing and forwarding webhook requests from [Hooklistener](https://hooklistener.com) directly in your terminal. Built with Rust and Ratatui for a smooth, responsive TUI experience.
 
+![Hooklistener CLI Demo](docs/images/hooklistener-cli.gif)
+
 ## Features
 
 - 🚀 **Fast & Lightweight** - Built in Rust for maximum performance
