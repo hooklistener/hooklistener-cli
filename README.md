@@ -21,27 +21,68 @@ A fast, terminal-based CLI for browsing and forwarding webhook requests from [Ho
 
 ## Installation
 
-### From Binary (Recommended)
+### Quick Install (Recommended)
 
-Download the latest prebuilt binary for your platform from the [Releases](https://github.com/hooklistener/hooklistener-cli/releases) page.
+Download and extract the binary for your platform:
 
+#### macOS (Apple Silicon M1/M2/M3)
 ```bash
-# Linux/macOS
-curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-$(uname -s)-$(uname -m) -o hooklistener
-chmod +x hooklistener
-sudo mv hooklistener /usr/local/bin/
+curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-aarch64-apple-darwin.tar.gz -o hooklistener.tar.gz
+tar -xzf hooklistener.tar.gz
+./hooklistener-cli
 ```
 
-### From Source
+#### macOS (Intel)
+```bash
+curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-x86_64-apple-darwin.tar.gz -o hooklistener.tar.gz
+tar -xzf hooklistener.tar.gz
+./hooklistener-cli
+```
+
+#### Linux (x86_64)
+```bash
+curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-x86_64-unknown-linux-gnu.tar.gz -o hooklistener.tar.gz
+tar -xzf hooklistener.tar.gz
+./hooklistener-cli
+```
+
+#### Windows
+```bash
+# Download and extract the ZIP file
+curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli.exe-x86_64-pc-windows-msvc.zip -o hooklistener.zip
+# Extract using Windows Explorer or PowerShell:
+Expand-Archive -Path hooklistener.zip -DestinationPath .
+.\hooklistener-cli.exe
+```
+
+### Install System-Wide (Optional)
+
+After downloading and extracting, you can move the binary to make it available from anywhere:
 
 ```bash
-# Install from GitHub
-cargo install --git https://github.com/hooklistener/hooklistener-cli
+# macOS/Linux
+sudo mv hooklistener-cli /usr/local/bin/
+# Rename for convenience (optional)
+sudo mv /usr/local/bin/hooklistener-cli /usr/local/bin/hooklistener
 
-# Or clone and build locally
+# Now you can run from anywhere:
+hooklistener
+```
+
+### Alternative Installation Methods
+
+#### Using Cargo
+```bash
+# Install from GitHub (requires Rust toolchain)
+cargo install --git https://github.com/hooklistener/hooklistener-cli
+```
+
+#### Build from Source
+```bash
 git clone https://github.com/hooklistener/hooklistener-cli.git
 cd hooklistener-cli
 cargo build --release
+./target/release/hooklistener-cli
 ```
 
 ### Coming Soon
@@ -52,17 +93,20 @@ cargo build --release
 
 ## Quick Start
 
-1. **Start the CLI**:
+1. **Download and run** (takes less than 30 seconds):
    ```bash
-   hooklistener
+   # Example for macOS Apple Silicon
+   curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-aarch64-apple-darwin.tar.gz -o hooklistener.tar.gz
+   tar -xzf hooklistener.tar.gz
+   ./hooklistener-cli
    ```
 
-2. **Authenticate** using the device code flow:
+2. **Authenticate** (one-time setup):
    - The CLI will display a verification code and URL
    - Visit the URL in your browser and enter the code
-   - Once authenticated, you can browse your webhook requests
+   - Once authenticated, you're ready to go!
 
-3. **Browse your webhooks** through the terminal UI interface
+3. **Start receiving webhooks** - The terminal UI will show incoming requests in real-time
 
 ## Usage
 
@@ -169,6 +213,42 @@ Releases are automated via GitHub Actions:
    - Linux (x86_64, aarch64)
    - macOS (Intel, Apple Silicon)
    - Windows (x86_64)
+
+## Troubleshooting
+
+### Common Issues
+
+#### "Permission denied" on macOS/Linux
+```bash
+# Make the binary executable
+chmod +x hooklistener-cli
+```
+
+#### "Cannot be opened because it is from an unidentified developer" on macOS
+```bash
+# Remove quarantine attribute
+xattr -d com.apple.quarantine hooklistener-cli
+
+# Or allow in System Settings > Privacy & Security
+```
+
+#### "command not found" after installation
+```bash
+# Check if the binary is in your PATH
+which hooklistener-cli
+
+# If not, add to PATH or use full path:
+./hooklistener-cli
+
+# Or move to a directory in PATH:
+sudo mv hooklistener-cli /usr/local/bin/
+```
+
+#### "Device not configured" error
+This usually means the terminal is not properly configured. Try:
+- Running in a different terminal emulator
+- Ensuring your terminal supports TUI applications
+- Checking that your `TERM` environment variable is set correctly
 
 ## Contributing
 
