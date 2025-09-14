@@ -14,7 +14,9 @@ A fast, terminal-based CLI for browsing and forwarding webhook requests from [Ho
 - 🔄 **Real-time Updates** - Stream webhook requests as they arrive
 - 🔍 **Search & Filter** - Quickly find specific requests
 - 📋 **Request Details** - View headers, body, and metadata
-- 🔐 **Secure** - API key stored safely in your config directory
+- 🔐 **Secure OAuth** - Device code authentication flow (no API keys needed)
+- 📊 **Professional Logging** - Structured logging with file rotation and diagnostics
+- 🛠️ **Debug Tools** - Built-in diagnostic bundle generation for troubleshooting
 - 🎨 **Customizable** - Configure display preferences and shortcuts
 
 ## Installation
@@ -50,17 +52,17 @@ cargo build --release
 
 ## Quick Start
 
-1. **Get your API key** from [Hooklistener](https://hooklistener.com)
-
-2. **Configure the CLI**:
-   ```bash
-   hooklistener config --api-key YOUR_API_KEY
-   ```
-
-3. **Start browsing webhooks**:
+1. **Start the CLI**:
    ```bash
    hooklistener
    ```
+
+2. **Authenticate** using the device code flow:
+   - The CLI will display a verification code and URL
+   - Visit the URL in your browser and enter the code
+   - Once authenticated, you can browse your webhook requests
+
+3. **Browse your webhooks** through the terminal UI interface
 
 ## Usage
 
@@ -70,11 +72,17 @@ cargo build --release
 # Start the TUI
 hooklistener
 
-# Configure API key
-hooklistener config --api-key YOUR_API_KEY
+# Generate diagnostic bundle for troubleshooting
+hooklistener diagnostics --output ./diagnostics
+
+# Clean up old log files
+hooklistener clean-logs --keep 5
 
 # Show help
 hooklistener --help
+
+# Advanced logging options
+hooklistener --log-level debug --log-stdout
 ```
 
 ### Keyboard Shortcuts
@@ -92,18 +100,21 @@ hooklistener --help
 
 ## Configuration
 
-Configuration is stored in `~/.config/hooklistener/config.json`:
+Configuration is automatically managed and stored in `~/.config/hooklistener/config.json`. The config file contains:
 
 ```json
 {
-  "api_key": "your_api_key_here",
-  "theme": "dark",
-  "auto_refresh": true,
-  "refresh_interval": 5
+  "access_token": "your_oauth_token_here",
+  "token_expires_at": "2024-12-31T23:59:59Z",
+  "selected_organization_id": "org_123456789"
 }
 ```
 
-See [example.config.json](example.config.json) for all available options.
+- **access_token**: OAuth access token obtained through device code flow
+- **token_expires_at**: Token expiration timestamp
+- **selected_organization_id**: Last selected organization (for faster startup)
+
+The CLI automatically handles token refresh and manages this configuration for you.
 
 ## Development
 
@@ -133,15 +144,18 @@ cargo run
 
 ```bash
 # Run tests
-cargo test --all-targets --all-features --locked
+cargo test
+
+# Check code without building
+cargo check
 
 # Format code
-cargo fmt --all
+cargo fmt
 
 # Run linter
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy
 
-# Check for security vulnerabilities
+# Check for security vulnerabilities (requires cargo-audit)
 cargo audit
 ```
 
@@ -180,4 +194,8 @@ Built with:
 - [Ratatui](https://github.com/ratatui-org/ratatui) - Terminal UI framework
 - [Tokio](https://tokio.rs) - Async runtime
 - [Serde](https://serde.rs) - Serialization framework
+- [Reqwest](https://github.com/seanmonstar/reqwest) - HTTP client
+- [Tracing](https://github.com/tokio-rs/tracing) - Structured logging
+- [Clap](https://github.com/clap-rs/clap) - Command line argument parsing
+- [Crossterm](https://github.com/crossterm-rs/crossterm) - Cross-platform terminal manipulation
 

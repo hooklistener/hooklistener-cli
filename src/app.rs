@@ -1,12 +1,14 @@
 use crate::api::ApiClient;
 use crate::auth::DeviceCodeFlow;
 use crate::config::Config;
+use crate::logger::generate_request_id;
 use crate::models::{
     DebugEndpoint, DebugEndpointDetail, ForwardResponse, Organization, WebhookRequest,
 };
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub enum AppState {
@@ -87,46 +89,56 @@ impl App {
     }
 
     pub async fn load_organizations(&mut self) -> Result<()> {
-        log::info!("load_organizations: Starting");
+        info!("Starting load_organizations");
+        let operation_id = generate_request_id();
+
         if let Some(access_token) = &self.config.access_token {
             if self.config.is_token_valid() {
+                debug!(operation_id = %operation_id, "Token is valid, fetching organizations");
                 let client = ApiClient::new(access_token.clone());
 
                 match client.fetch_organizations().await {
                     Ok(organizations) => {
-                        log::info!(
-                            "load_organizations: Loaded {} organizations",
-                            organizations.len()
+                        info!(
+                            operation_id = %operation_id,
+                            count = organizations.len(),
+                            "Successfully loaded organizations"
                         );
                         self.organizations = organizations;
                         if self.config.selected_organization_id.is_some() {
-                            log::info!(
-                                "load_organizations: User has selected org, loading endpoints directly"
+                            info!(
+                                operation_id = %operation_id,
+                                org_id = ?self.config.selected_organization_id,
+                                "User has selected organization, loading endpoints directly"
                             );
-                            // User has a selected organization, load endpoints directly
                             self.load_endpoints().await?;
                         } else {
-                            log::info!(
-                                "load_organizations: No selected org, showing organization selection"
+                            info!(
+                                operation_id = %operation_id,
+                                "No selected organization, showing organization selection"
                             );
-                            // User needs to select an organization
                             self.state = AppState::ShowOrganizations;
                         }
                     }
-                    Err(_e) => {
-                        // Token might be invalid, trigger re-authentication
+                    Err(e) => {
+                        error!(
+                            operation_id = %operation_id,
+                            error = %e,
+                            "Failed to fetch organizations, clearing token"
+                        );
                         self.config.clear_token();
                         self.config.save()?;
                         self.state = AppState::InitiatingDeviceFlow;
                     }
                 }
             } else {
-                // Token expired, clear and re-authenticate
+                warn!(operation_id = %operation_id, "Token expired, re-authenticating");
                 self.config.clear_token();
                 self.config.save()?;
                 self.state = AppState::InitiatingDeviceFlow;
             }
         } else {
+            info!(operation_id = %operation_id, "No access token, initiating device flow");
             self.state = AppState::InitiatingDeviceFlow;
         }
 
@@ -134,9 +146,16 @@ impl App {
     }
 
     pub async fn load_endpoints(&mut self) -> Result<()> {
-        log::info!("load_endpoints: Starting");
+        info!("Starting load_endpoints");
+        let operation_id = generate_request_id();
+
         if let Some(access_token) = &self.config.access_token {
             if self.config.is_token_valid() {
+                debug!(
+                    operation_id = %operation_id,
+                    org_id = ?self.config.selected_organization_id,
+                    "Fetching debug endpoints"
+                );
                 let client = ApiClient::with_organization(
                     access_token.clone(),
                     self.config.selected_organization_id.clone(),
@@ -144,25 +163,34 @@ impl App {
 
                 match client.fetch_debug_endpoints().await {
                     Ok(endpoints) => {
-                        log::info!("load_endpoints: Loaded {} endpoints", endpoints.len());
+                        info!(
+                            operation_id = %operation_id,
+                            count = endpoints.len(),
+                            "Successfully loaded endpoints"
+                        );
                         self.endpoints = endpoints;
                         self.state = AppState::ShowEndpoints;
-                        log::info!("load_endpoints: State set to ShowEndpoints");
+                        debug!(operation_id = %operation_id, "State set to ShowEndpoints");
                     }
-                    Err(_e) => {
-                        // Token might be invalid, trigger re-authentication
+                    Err(e) => {
+                        error!(
+                            operation_id = %operation_id,
+                            error = %e,
+                            "Failed to fetch endpoints, clearing token"
+                        );
                         self.config.clear_token();
                         self.config.save()?;
                         self.state = AppState::InitiatingDeviceFlow;
                     }
                 }
             } else {
-                // Token expired, clear and re-authenticate
+                warn!(operation_id = %operation_id, "Token expired during endpoint load");
                 self.config.clear_token();
                 self.config.save()?;
                 self.state = AppState::InitiatingDeviceFlow;
             }
         } else {
+            info!(operation_id = %operation_id, "No access token during endpoint load");
             self.state = AppState::InitiatingDeviceFlow;
         }
 
@@ -170,6 +198,13 @@ impl App {
     }
 
     pub async fn load_endpoint_detail(&mut self, endpoint_id: &str) -> Result<()> {
+        let operation_id = generate_request_id();
+        info!(
+            operation_id = %operation_id,
+            endpoint_id = %endpoint_id,
+            "Loading endpoint detail"
+        );
+
         if let Some(access_token) = &self.config.access_token {
             let client = ApiClient::with_organization(
                 access_token.clone(),
@@ -178,24 +213,52 @@ impl App {
 
             match client.fetch_endpoint_detail(endpoint_id).await {
                 Ok(detail) => {
+                    info!(
+                        operation_id = %operation_id,
+                        endpoint_id = %endpoint_id,
+                        "Successfully loaded endpoint detail"
+                    );
                     self.selected_endpoint = Some(detail);
                     self.state = AppState::ShowEndpointDetail;
                 }
                 Err(e) => {
+                    error!(
+                        operation_id = %operation_id,
+                        endpoint_id = %endpoint_id,
+                        error = %e,
+                        "Failed to fetch endpoint detail"
+                    );
                     self.state = AppState::Error(format!("Failed to fetch endpoint detail: {}", e));
                 }
             }
+        } else {
+            warn!(
+                operation_id = %operation_id,
+                endpoint_id = %endpoint_id,
+                "No access token available for endpoint detail load"
+            );
+            self.state = AppState::InitiatingDeviceFlow;
         }
 
         Ok(())
     }
 
     pub async fn load_requests(&mut self, endpoint_id: &str) -> Result<()> {
+        let operation_id = generate_request_id();
+        info!(
+            operation_id = %operation_id,
+            endpoint_id = %endpoint_id,
+            page = self.current_page,
+            "Loading requests"
+        );
+
         if let Some(access_token) = &self.config.access_token {
             let client = ApiClient::with_organization(
                 access_token.clone(),
                 self.config.selected_organization_id.clone(),
             );
+
+            crate::log_performance!("load_requests_start", 0, &operation_id);
 
             match client
                 .fetch_endpoint_requests(endpoint_id, self.current_page, 50)
@@ -602,17 +665,24 @@ impl App {
     }
 
     pub async fn select_organization(&mut self) -> Result<()> {
-        log::info!("select_organization: Starting");
+        info!("Starting select_organization");
+        let operation_id = generate_request_id();
+
         if let Some(org_id) = self.get_selected_organization_id() {
-            log::info!("select_organization: Selected org ID: {}", org_id);
+            info!(
+                operation_id = %operation_id,
+                org_id = %org_id,
+                "Selected organization"
+            );
             self.config.set_selected_organization(org_id);
             self.config.save()?;
-            log::info!("select_organization: Config saved, loading endpoints");
-            // Now load endpoints with the selected organization
+            debug!(operation_id = %operation_id, "Config saved, loading endpoints");
+
+            crate::log_user_action!("organization_selected", &operation_id);
             self.load_endpoints().await?;
-            log::info!("select_organization: Endpoints loaded successfully");
+            info!(operation_id = %operation_id, "Endpoints loaded successfully");
         } else {
-            log::warn!("select_organization: No organization selected");
+            warn!(operation_id = %operation_id, "No organization selected");
         }
         Ok(())
     }
@@ -648,16 +718,29 @@ impl App {
     }
 
     pub async fn initiate_device_flow(&mut self) -> Result<()> {
+        let operation_id = generate_request_id();
+        info!(operation_id = %operation_id, "Initiating device flow authentication");
+
         let mut device_flow = DeviceCodeFlow::new("https://api.hooklistener.com".to_string());
 
         match device_flow.initiate_device_flow().await {
-            Ok(_user_code) => {
+            Ok(user_code) => {
+                info!(
+                    operation_id = %operation_id,
+                    user_code = %user_code,
+                    "Device flow initiated successfully"
+                );
+                crate::log_user_action!("device_flow_initiated", &operation_id);
                 self.device_flow = Some(device_flow);
                 self.state = AppState::DisplayingDeviceCode;
-                // Start polling immediately
                 self.auth_poll_counter = 0;
             }
             Err(e) => {
+                error!(
+                    operation_id = %operation_id,
+                    error = %e,
+                    "Failed to initiate device flow"
+                );
                 self.state = AppState::Error(format!("Failed to initiate device flow: {}", e));
             }
         }
@@ -670,9 +753,21 @@ impl App {
             // Only poll every 50 ticks (roughly every 5 seconds at 100ms tick rate)
             self.auth_poll_counter += 1;
             if self.auth_poll_counter % 50 == 0 {
+                let operation_id = generate_request_id();
+                debug!(
+                    operation_id = %operation_id,
+                    poll_counter = self.auth_poll_counter,
+                    "Polling for device authentication"
+                );
+
                 match device_flow.poll_for_authorization().await {
                     Ok(Some(access_token)) => {
-                        // Authentication successful!
+                        info!(
+                            operation_id = %operation_id,
+                            "Device authentication successful"
+                        );
+                        crate::log_user_action!("authentication_successful", &operation_id);
+
                         let expires_at = Utc::now() + Duration::hours(24);
                         self.config.set_access_token(access_token, expires_at);
                         self.config.save()?;
@@ -681,9 +776,18 @@ impl App {
                         self.just_authenticated = true;
                     }
                     Ok(None) => {
-                        // Still pending, keep waiting
+                        debug!(
+                            operation_id = %operation_id,
+                            "Authentication still pending"
+                        );
                     }
                     Err(e) => {
+                        error!(
+                            operation_id = %operation_id,
+                            error = %e,
+                            poll_counter = self.auth_poll_counter,
+                            "Authentication failed"
+                        );
                         self.state = AppState::Error(format!("Authentication failed: {}", e));
                     }
                 }
