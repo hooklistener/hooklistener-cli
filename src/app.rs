@@ -12,7 +12,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 pub enum AppState {
     InitiatingDeviceFlow,
     DisplayingDeviceCode,
-    WaitingForAuth,
     Loading,
     ShowOrganizations,
     ShowEndpoints,
@@ -47,6 +46,7 @@ pub struct App {
     pub body_scroll_offset: usize,
     pub should_quit: bool,
     pub loading_frame: usize,
+    pub just_authenticated: bool,
 }
 
 impl App {
@@ -82,6 +82,7 @@ impl App {
             body_scroll_offset: 0,
             should_quit: false,
             loading_frame: 0,
+            just_authenticated: false,
         })
     }
 
@@ -283,15 +284,6 @@ impl App {
                 _ => {}
             },
             AppState::DisplayingDeviceCode => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    self.should_quit = true;
-                }
-                KeyCode::Char('r') => {
-                    self.state = AppState::InitiatingDeviceFlow;
-                }
-                _ => {}
-            },
-            AppState::WaitingForAuth => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
                     self.should_quit = true;
                 }
@@ -662,6 +654,8 @@ impl App {
             Ok(_user_code) => {
                 self.device_flow = Some(device_flow);
                 self.state = AppState::DisplayingDeviceCode;
+                // Start polling immediately
+                self.auth_poll_counter = 0;
             }
             Err(e) => {
                 self.state = AppState::Error(format!("Failed to initiate device flow: {}", e));
@@ -669,13 +663,6 @@ impl App {
         }
 
         Ok(())
-    }
-
-    pub fn start_device_authentication(&mut self) {
-        if self.device_flow.is_some() {
-            self.state = AppState::WaitingForAuth;
-            self.auth_poll_counter = 0;
-        }
     }
 
     pub async fn poll_device_authentication(&mut self) -> Result<()> {
@@ -691,6 +678,7 @@ impl App {
                         self.config.save()?;
                         self.device_flow = None;
                         self.state = AppState::Loading;
+                        self.just_authenticated = true;
                     }
                     Ok(None) => {
                         // Still pending, keep waiting

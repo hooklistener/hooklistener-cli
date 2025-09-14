@@ -75,7 +75,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Handle non-blocking authentication polling
-        if matches!(app.state, AppState::WaitingForAuth) {
+        if matches!(app.state, AppState::DisplayingDeviceCode) {
             app.poll_device_authentication().await?;
         }
 
@@ -85,8 +85,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.forward_request().await?;
                 continue;
             }
+            AppState::Loading if app.just_authenticated => {
+                // Automatically load organizations after successful authentication
+                app.just_authenticated = false;
+                app.load_organizations().await?;
+                continue;
+            }
             AppState::DisplayingDeviceCode => {
-                // This state will transition to WaitingForAuth automatically
+                // This state will transition to Loading automatically after successful auth
             }
             _ => {}
         }
@@ -102,10 +108,6 @@ async fn run_app<B: ratatui::backend::Backend>(
             match app.state {
                 AppState::InitiatingDeviceFlow => {
                     app.initiate_device_flow().await?;
-                }
-                AppState::DisplayingDeviceCode => {
-                    // Start non-blocking authentication
-                    app.start_device_authentication();
                 }
                 AppState::Loading => {
                     log::info!("Handling Loading state, prev_state: {}", prev_state);

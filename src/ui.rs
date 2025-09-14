@@ -37,7 +37,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.state {
         AppState::InitiatingDeviceFlow => draw_loading(frame, app, chunks[0]),
         AppState::DisplayingDeviceCode => draw_device_code(frame, app, chunks[0]),
-        AppState::WaitingForAuth => draw_waiting_for_auth(frame, app, chunks[0]),
         AppState::Loading => draw_loading(frame, app, chunks[0]),
         AppState::ShowOrganizations => draw_organizations_list(frame, app, chunks[0]),
         AppState::ShowEndpoints => draw_endpoints_list(frame, app, chunks[0]),
@@ -61,6 +60,7 @@ fn draw_device_code(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(3),
             Constraint::Length(5),
             Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Min(0),
         ])
         .split(area);
@@ -113,6 +113,21 @@ fn draw_device_code(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(timer, chunks[2]);
     }
 
+    // Show polling status
+    let poll_status = if app.auth_poll_counter > 0 {
+        let dots = ".".repeat(((app.auth_poll_counter / 10) % 4) as usize);
+        format!("⏳ Checking for authorization{}", dots)
+    } else {
+        "⏳ Starting authentication...".to_string()
+    };
+
+    let status = Paragraph::new(poll_status)
+        .style(Style::default().fg(colors::INFO))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::NONE));
+
+    frame.render_widget(status, chunks[3]);
+
     let help_text = vec![
         Line::from(""),
         Line::from("Visit https://app.hooklistener.com/device-codes and enter the code above"),
@@ -141,83 +156,7 @@ fn draw_device_code(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: true })
         .block(Block::default().borders(Borders::NONE));
 
-    frame.render_widget(help, chunks[3]);
-}
-
-fn draw_waiting_for_auth(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(7),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    let title = Paragraph::new("Waiting for Authorization...")
-        .style(
-            Style::default()
-                .fg(colors::PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::NONE));
-
-    frame.render_widget(title, chunks[0]);
-
-    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
-    let spinner_char = spinner_chars[app.loading_frame % spinner_chars.len()];
-
-    let status_text = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("{} ", spinner_char),
-                Style::default().fg(colors::SUCCESS),
-            ),
-            Span::raw("Checking for authorization..."),
-        ]),
-        Line::from(""),
-        Line::from("Please complete the authorization in your web browser."),
-        Line::from("This may take a few moments."),
-    ];
-
-    let status = Paragraph::new(status_text)
-        .style(Style::default().fg(colors::TEXT))
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(colors::PRIMARY)),
-        );
-
-    frame.render_widget(status, chunks[1]);
-
-    let help_text = vec![Line::from(vec![
-        Span::styled(
-            "r",
-            Style::default()
-                .fg(colors::SUCCESS)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(": Restart authentication | "),
-        Span::styled(
-            "Esc/q",
-            Style::default()
-                .fg(colors::ERROR)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(": Quit"),
-    ])];
-
-    let help = Paragraph::new(help_text)
-        .style(Style::default().fg(colors::MUTED))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::NONE));
-
-    frame.render_widget(help, chunks[2]);
+    frame.render_widget(help, chunks[4]);
 }
 
 fn draw_loading(frame: &mut Frame, app: &App, area: Rect) {
@@ -1137,12 +1076,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             ("🔄 Starting authentication...".to_string(), "Please wait")
         }
         AppState::DisplayingDeviceCode => (
-            "🔑 Device Code Ready".to_string(),
+            "🔑 Authenticating...".to_string(),
             "r: Refresh | Esc/q: Quit",
-        ),
-        AppState::WaitingForAuth => (
-            "⏳ Waiting for authorization...".to_string(),
-            "r: Restart | Esc/q: Quit",
         ),
         AppState::Loading => {
             let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
