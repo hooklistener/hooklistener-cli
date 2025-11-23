@@ -23,7 +23,15 @@ pub enum AppState {
     InputForwardUrl,
     ForwardingRequest,
     ForwardResult,
+    Listening, // New state for the listen command
     Error(String),
+}
+
+#[derive(Default)]
+pub struct ListeningStats {
+    pub total_requests: u64,
+    pub successful_forwards: u64,
+    pub failed_forwards: u64,
 }
 
 pub struct App {
@@ -49,6 +57,14 @@ pub struct App {
     pub should_quit: bool,
     pub loading_frame: usize,
     pub just_authenticated: bool,
+
+    // Listening mode state
+    pub listening_requests: Vec<WebhookRequest>,
+    pub listening_stats: ListeningStats,
+    pub listening_connected: bool,
+    pub listening_error: Option<String>,
+    pub listening_endpoint: String,
+    pub listening_target: String,
 }
 
 impl App {
@@ -85,6 +101,12 @@ impl App {
             should_quit: false,
             loading_frame: 0,
             just_authenticated: false,
+            listening_requests: Vec::new(),
+            listening_stats: ListeningStats::default(),
+            listening_connected: false,
+            listening_error: None,
+            listening_endpoint: String::new(),
+            listening_target: String::new(),
         })
     }
 
@@ -452,7 +474,23 @@ impl App {
                         self.current_tab = 0;
                         self.headers_scroll_offset = 0;
                         self.body_scroll_offset = 0;
-                        self.state = AppState::ShowRequests;
+                        if matches!(self.state, AppState::Listening) {
+                            // If we came from listening view, go back to listening view
+                            // Wait, AppState::Listening is the main view.
+                            // Actually, we need to know if we are in "listening mode" to know where to go back.
+                            // But here we are in AppState::ShowRequestDetail.
+                            // Let's rely on context or a flag?
+                            // For simplicity, if we have `listening_connected` true, we likely want to go back to Listening.
+                            if self.listening_connected {
+                                self.state = AppState::Listening;
+                            } else {
+                                self.state = AppState::ShowRequests;
+                            }
+                        } else if self.listening_connected {
+                            self.state = AppState::Listening;
+                        } else {
+                            self.state = AppState::ShowRequests;
+                        }
                     }
                     KeyCode::Char('f') => {
                         self.forward_url_input.clear();
@@ -604,6 +642,33 @@ impl App {
                     _ => {}
                 }
             }
+            AppState::Listening => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.should_quit = true;
+                }
+                KeyCode::Up => {
+                    if self.selected_request_index > 0 {
+                        self.selected_request_index -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if self.selected_request_index < self.listening_requests.len().saturating_sub(1)
+                    {
+                        self.selected_request_index += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(request) = self.listening_requests.get(self.selected_request_index)
+                    {
+                        self.selected_request = Some(request.clone());
+                        self.current_tab = 0;
+                        self.headers_scroll_offset = 0;
+                        self.body_scroll_offset = 0;
+                        self.state = AppState::ShowRequestDetail;
+                    }
+                }
+                _ => {}
+            },
             AppState::InputForwardUrl => match key.code {
                 KeyCode::Enter => {
                     if !self.forward_url_input.is_empty()
@@ -721,7 +786,9 @@ impl App {
         let operation_id = generate_request_id();
         info!(operation_id = %operation_id, "Initiating device flow authentication");
 
-        let mut device_flow = DeviceCodeFlow::new("https://api.hooklistener.com".to_string());
+        let base_url = std::env::var("HOOKLISTENER_API_URL")
+            .unwrap_or_else(|_| "https://api.hooklistener.com".to_string());
+        let mut device_flow = DeviceCodeFlow::new(base_url);
 
         match device_flow.initiate_device_flow().await {
             Ok(user_code) => {
@@ -752,7 +819,7 @@ impl App {
         if let Some(device_flow) = &self.device_flow {
             // Only poll every 50 ticks (roughly every 5 seconds at 100ms tick rate)
             self.auth_poll_counter += 1;
-            if self.auth_poll_counter % 50 == 0 {
+            if self.auth_poll_counter.is_multiple_of(50) {
                 let operation_id = generate_request_id();
                 debug!(
                     operation_id = %operation_id,

@@ -162,6 +162,19 @@ Configuration is automatically managed and stored in `~/.config/hooklistener/con
 
 The CLI automatically handles token refresh and manages this configuration for you.
 
+### Environment Variables
+
+For local development or testing against a custom backend, you can override the default API and WebSocket URLs using environment variables:
+
+- `HOOKLISTENER_API_URL`: Sets the base URL for API requests.
+- `HOOKLISTENER_WS_URL`: Sets the base URL for WebSocket connections.
+
+**Example:**
+
+```bash
+HOOKLISTENER_API_URL="http://localhost:4000" HOOKLISTENER_WS_URL="ws://localhost:4000" hooklistener
+```
+
 ## Development
 
 ### Prerequisites
