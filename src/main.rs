@@ -258,7 +258,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
     }
 
     let base_url = std::env::var("HOOKLISTENER_API_URL")
-        .unwrap_or_else(|_| "https://api.hooklistener.com".to_string());
+        .unwrap_or_else(|_| "https://app.hooklistener.com".to_string());
     let mut device_flow = auth::DeviceCodeFlow::new(base_url);
 
     let user_code = device_flow.initiate_device_flow().await?;
