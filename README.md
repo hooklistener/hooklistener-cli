@@ -31,21 +31,21 @@ Download and extract the binary for your platform:
 ```bash
 curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-aarch64-apple-darwin.tar.gz -o hooklistener.tar.gz
 tar -xzf hooklistener.tar.gz
-./hooklistener-cli
+./hooklistener-cli tui
 ```
 
 #### macOS (Intel)
 ```bash
 curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-x86_64-apple-darwin.tar.gz -o hooklistener.tar.gz
 tar -xzf hooklistener.tar.gz
-./hooklistener-cli
+./hooklistener-cli tui
 ```
 
 #### Linux (x86_64)
 ```bash
 curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-x86_64-unknown-linux-gnu.tar.gz -o hooklistener.tar.gz
 tar -xzf hooklistener.tar.gz
-./hooklistener-cli
+./hooklistener-cli tui
 ```
 
 #### Windows
@@ -54,7 +54,7 @@ tar -xzf hooklistener.tar.gz
 curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli.exe-x86_64-pc-windows-msvc.zip -o hooklistener.zip
 # Extract using Windows Explorer or PowerShell:
 Expand-Archive -Path hooklistener.zip -DestinationPath .
-.\hooklistener-cli.exe
+.\hooklistener-cli.exe tui
 ```
 
 ### Install System-Wide (Optional)
@@ -68,7 +68,8 @@ sudo mv hooklistener-cli /usr/local/bin/
 sudo mv /usr/local/bin/hooklistener-cli /usr/local/bin/hooklistener
 
 # Now you can run from anywhere:
-hooklistener
+hooklistener tui
+# Run `hooklistener` with no command to view the help/command list
 ```
 
 ### Alternative Installation Methods
@@ -84,7 +85,7 @@ cargo install --git https://github.com/hooklistener/hooklistener-cli
 git clone https://github.com/hooklistener/hooklistener-cli.git
 cd hooklistener-cli
 cargo build --release
-./target/release/hooklistener-cli
+./target/release/hooklistener-cli tui
 ```
 
 ### Coming Soon
@@ -100,13 +101,14 @@ cargo build --release
    # Example for macOS Apple Silicon
    curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-aarch64-apple-darwin.tar.gz -o hooklistener.tar.gz
    tar -xzf hooklistener.tar.gz
-   ./hooklistener-cli
+   ./hooklistener-cli tui
    ```
 
 2. **Authenticate** (one-time setup):
    - The CLI will display a verification code and URL
    - Visit the URL in your browser and enter the code
    - Once authenticated, you're ready to go!
+   - You can also run `hooklistener login` any time to refresh your session without opening the TUI
 
 3. **Start receiving webhooks** - The terminal UI will show incoming requests in real-time
 
@@ -115,8 +117,20 @@ cargo build --release
 ### Basic Commands
 
 ```bash
-# Start the TUI
+# Show global help (also runs when no command is provided)
 hooklistener
+
+# Launch the TUI to browse requests
+hooklistener tui
+
+# Authenticate via the device flow without opening the TUI
+hooklistener login
+
+# Force re-authentication if you need to switch accounts
+hooklistener login --force
+
+# Listen to a specific endpoint and forward traffic to your local server
+hooklistener listen my-endpoint --target http://localhost:3000
 
 # Generate diagnostic bundle for troubleshooting
 hooklistener diagnostics --output ./diagnostics
@@ -168,11 +182,12 @@ For local development or testing against a custom backend, you can override the 
 
 - `HOOKLISTENER_API_URL`: Sets the base URL for API requests.
 - `HOOKLISTENER_WS_URL`: Sets the base URL for WebSocket connections.
+- `HOOKLISTENER_DEVICE_PORTAL_URL`: Overrides the browser URL shown during `hooklistener login` (defaults to `https://app.hooklistener.com/device-codes`).
 
 **Example:**
 
 ```bash
-HOOKLISTENER_API_URL="http://localhost:4000" HOOKLISTENER_WS_URL="ws://localhost:4000" hooklistener
+HOOKLISTENER_API_URL="http://localhost:4000" HOOKLISTENER_WS_URL="ws://localhost:4000" hooklistener tui
 ```
 
 ## Development
@@ -196,7 +211,7 @@ cargo build
 cargo build --release
 
 # Run directly
-cargo run
+cargo run -- tui
 ```
 
 ### Testing & Quality
@@ -253,7 +268,7 @@ xattr -d com.apple.quarantine hooklistener-cli
 which hooklistener-cli
 
 # If not, add to PATH or use full path:
-./hooklistener-cli
+./hooklistener-cli tui
 
 # Or move to a directory in PATH:
 sudo mv hooklistener-cli /usr/local/bin/
@@ -293,4 +308,3 @@ Built with:
 - [Tracing](https://github.com/tokio-rs/tracing) - Structured logging
 - [Clap](https://github.com/clap-rs/clap) - Command line argument parsing
 - [Crossterm](https://github.com/crossterm-rs/crossterm) - Cross-platform terminal manipulation
-

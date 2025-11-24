@@ -8,8 +8,9 @@ mod syntax;
 mod tunnel;
 mod ui;
 
-use anyhow::Result;
-use clap::{Parser, Subcommand};
+use anyhow::{Result, anyhow};
+use chrono::{Duration as ChronoDuration, Utc};
+use clap::{CommandFactory, Parser, Subcommand};
 use crossterm::{
     cursor::Show,
     event::{self, Event, KeyEventKind},
@@ -20,7 +21,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::sleep};
 use tracing::{debug, error, info};
 
 use app::{App, AppState};
@@ -50,6 +51,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Authenticate with Hooklistener via the device flow
+    Login {
+        /// Start a new authentication even if a valid token already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Launch the interactive TUI to browse and replay requests
+    #[command(alias = "ui")]
+    Tui,
     /// Start WebSocket tunnel to forward webhooks to local server
     Listen {
         /// Debug endpoint slug to listen to
@@ -89,131 +99,229 @@ fn validate_log_level(s: &str) -> Result<String, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let Cli {
+        command,
+        log_level,
+        log_dir,
+        log_stdout,
+    } = Cli::parse();
 
-    // Handle CLI subcommands first
-    if let Some(command) = cli.command {
-        match command {
-            Commands::Listen {
-                endpoint,
-                target,
-                ws_url,
-            } => {
-                // Initialize logging for tunnel
-                let log_config = LogConfig {
-                    level: cli.log_level.clone(),
-                    output_to_stdout: false, // Disable stdout logging for TUI
-                    directory: cli
-                        .log_dir
-                        .clone()
-                        .unwrap_or_else(|| LogConfig::default().directory),
-                    ..Default::default()
-                };
-                let _logger = Logger::new(log_config)?;
+    let Some(command) = command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
 
-                // Load config for auth token
-                let config = config::Config::load()?;
+    match command {
+        Commands::Login { force } => {
+            let log_config = LogConfig {
+                level: log_level.clone(),
+                output_to_stdout: log_stdout,
+                directory: log_dir
+                    .clone()
+                    .unwrap_or_else(|| LogConfig::default().directory),
+                ..Default::default()
+            };
+            let _logger = Logger::new(log_config)?;
+            run_login_flow(force).await?;
+        }
+        Commands::Tui => {
+            let log_config = LogConfig {
+                level: log_level.clone(),
+                output_to_stdout: log_stdout,
+                directory: log_dir
+                    .clone()
+                    .unwrap_or_else(|| LogConfig::default().directory),
+                ..Default::default()
+            };
 
-                // Check if authenticated
-                if !config.is_token_valid() {
-                    eprintln!(
-                        "❌ Not authenticated. Please run 'hooklistener' to authenticate first."
-                    );
-                    std::process::exit(1);
-                }
+            let _logger = Logger::new(log_config)?;
 
-                let access_token = config
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("No access token found"))?;
+            info!("HookListener CLI starting");
 
-                // Setup TUI for listen command
-                let mut terminal = setup_terminal()?;
-                let mut app = App::new()?;
+            let mut terminal = setup_terminal()?;
+            let mut app = App::new()?;
 
-                // Set app state to listening
-                app.state = AppState::Listening;
-                app.listening_endpoint = endpoint.clone();
-                app.listening_target = target.clone();
+            let res = run_app(&mut terminal, &mut app, None).await;
 
-                // Create channel for tunnel events
-                let (event_tx, event_rx) = mpsc::channel(100);
+            restore_terminal(&mut terminal)?;
 
-                // Create and spawn tunnel client
-                let tunnel_client = tunnel::TunnelClient::new(
-                    access_token,
-                    endpoint.clone(),
-                    target.clone(),
-                    ws_url,
-                    event_tx,
+            if let Err(err) = res {
+                error!(error = %err, "Application terminated with error");
+                eprintln!("Error: {}", err);
+            } else {
+                info!("HookListener CLI terminated successfully");
+            }
+        }
+        Commands::Listen {
+            endpoint,
+            target,
+            ws_url,
+        } => {
+            // Initialize logging for tunnel
+            let log_config = LogConfig {
+                level: log_level.clone(),
+                output_to_stdout: false, // Disable stdout logging for TUI
+                directory: log_dir
+                    .clone()
+                    .unwrap_or_else(|| LogConfig::default().directory),
+                ..Default::default()
+            };
+            let _logger = Logger::new(log_config)?;
+
+            // Load config for auth token
+            let config = config::Config::load()?;
+
+            // Check if authenticated
+            if !config.is_token_valid() {
+                eprintln!(
+                    "❌ Not authenticated. Please run 'hooklistener login' to authenticate first."
                 );
+                std::process::exit(1);
+            }
 
-                tokio::spawn(async move {
-                    if let Err(e) = tunnel_client.connect_and_listen().await {
-                        error!("Tunnel client error: {}", e);
+            let access_token = config
+                .access_token
+                .ok_or_else(|| anyhow::anyhow!("No access token found"))?;
+
+            // Setup TUI for listen command
+            let mut terminal = setup_terminal()?;
+            let mut app = App::new()?;
+
+            // Set app state to listening
+            app.state = AppState::Listening;
+            app.listening_endpoint = endpoint.clone();
+            app.listening_target = target.clone();
+
+            // Create channel for tunnel events
+            let (event_tx, event_rx) = mpsc::channel(100);
+
+            // Create and spawn tunnel client
+            let tunnel_client = tunnel::TunnelClient::new(
+                access_token,
+                endpoint.clone(),
+                target.clone(),
+                ws_url,
+                event_tx,
+            );
+
+            tokio::spawn(async move {
+                if let Err(e) = tunnel_client.connect_and_listen().await {
+                    error!("Tunnel client error: {}", e);
+                }
+            });
+
+            let res = run_app(&mut terminal, &mut app, Some(event_rx)).await;
+
+            restore_terminal(&mut terminal)?;
+
+            if let Err(err) = res {
+                error!(error = %err, "Application terminated with error");
+                eprintln!("Error: {}", err);
+            }
+        }
+        Commands::Diagnostics { output } => {
+            // Initialize minimal logging for diagnostics
+            let log_config = LogConfig {
+                level: "info".to_string(),
+                output_to_stdout: true,
+                ..Default::default()
+            };
+            let logger = Logger::new(log_config)?;
+            logger.create_diagnostic_bundle(&output)?;
+            println!("Diagnostic bundle created in: {}", output.display());
+        }
+        Commands::CleanLogs { keep } => {
+            println!("Cleaning up old log files, keeping {} most recent", keep);
+            // This is handled automatically by the logger initialization
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_login_flow(force_reauth: bool) -> Result<()> {
+    let mut config = config::Config::load()?;
+
+    if config.is_token_valid() && !force_reauth {
+        println!("✅ You're already authenticated.");
+        println!(
+            "Run `hooklistener listen <endpoint>` to start forwarding webhooks or `hooklistener` to open the TUI."
+        );
+        println!("Use `hooklistener login --force` if you need to re-authenticate.");
+        return Ok(());
+    }
+
+    if force_reauth {
+        config.clear_token();
+        config.save()?;
+    }
+
+    let base_url = std::env::var("HOOKLISTENER_API_URL")
+        .unwrap_or_else(|_| "https://api.hooklistener.com".to_string());
+    let mut device_flow = auth::DeviceCodeFlow::new(base_url);
+
+    let user_code = device_flow.initiate_device_flow().await?;
+    let display_code = device_flow
+        .format_user_code()
+        .unwrap_or_else(|| user_code.clone());
+    let portal_url = device_portal_url();
+
+    println!("🔐 Hooklistener Login");
+    println!("Visit {} and enter the code {}", portal_url, display_code);
+    println!("Waiting for you to approve the device...");
+
+    loop {
+        match device_flow.poll_for_authorization().await {
+            Ok(Some(access_token)) => {
+                let expires_at = Utc::now() + ChronoDuration::hours(24);
+                config.set_access_token(access_token, expires_at);
+                config.save()?;
+                println!("✅ Authentication successful!");
+                println!(
+                    "Run `hooklistener listen <endpoint>` to forward webhooks or `hooklistener` to browse them."
+                );
+                break;
+            }
+            Ok(None) => {
+                if let Some(remaining) = device_flow.time_remaining() {
+                    let minutes = remaining.num_minutes();
+                    let seconds = remaining.num_seconds() % 60;
+                    if minutes > 0 {
+                        println!(
+                            "Still waiting for confirmation... code expires in {}m {}s",
+                            minutes, seconds
+                        );
+                    } else {
+                        println!(
+                            "Still waiting for confirmation... code expires in {}s",
+                            seconds
+                        );
                     }
-                });
 
-                let res = run_app(&mut terminal, &mut app, Some(event_rx)).await;
-
-                restore_terminal(&mut terminal)?;
-
-                if let Err(err) = res {
-                    error!(error = %err, "Application terminated with error");
-                    eprintln!("Error: {}", err);
+                    if remaining == ChronoDuration::zero() {
+                        return Err(anyhow!(
+                            "Device code expired before authorization completed. Please run `hooklistener login` again."
+                        ));
+                    }
+                } else {
+                    println!("Still waiting for confirmation...");
                 }
 
-                return Ok(());
+                sleep(Duration::from_secs(5)).await;
             }
-            Commands::Diagnostics { output } => {
-                // Initialize minimal logging for diagnostics
-                let log_config = LogConfig {
-                    level: "info".to_string(),
-                    output_to_stdout: true,
-                    ..Default::default()
-                };
-                let logger = Logger::new(log_config)?;
-                logger.create_diagnostic_bundle(&output)?;
-                println!("Diagnostic bundle created in: {}", output.display());
-                return Ok(());
-            }
-            Commands::CleanLogs { keep } => {
-                println!("Cleaning up old log files, keeping {} most recent", keep);
-                // This is handled automatically by the logger initialization
-                return Ok(());
+            Err(err) => {
+                return Err(anyhow!("Authentication failed: {}", err));
             }
         }
     }
 
-    // Configure logging based on CLI arguments
-    let log_config = LogConfig {
-        level: cli.log_level,
-        output_to_stdout: cli.log_stdout,
-        directory: cli
-            .log_dir
-            .unwrap_or_else(|| LogConfig::default().directory),
-        ..Default::default()
-    };
-
-    // Initialize the professional logging system
-    let _logger = Logger::new(log_config)?;
-
-    info!("HookListener CLI starting");
-
-    let mut terminal = setup_terminal()?;
-    let mut app = App::new()?;
-
-    let res = run_app(&mut terminal, &mut app, None).await;
-
-    restore_terminal(&mut terminal)?;
-
-    if let Err(err) = res {
-        error!(error = %err, "Application terminated with error");
-        eprintln!("Error: {}", err);
-    } else {
-        info!("HookListener CLI terminated successfully");
-    }
-
     Ok(())
+}
+
+fn device_portal_url() -> String {
+    std::env::var("HOOKLISTENER_DEVICE_PORTAL_URL")
+        .unwrap_or_else(|_| "https://app.hooklistener.com/device-codes".to_string())
 }
 
 async fn run_app<B: ratatui::backend::Backend>(
