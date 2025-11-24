@@ -5,6 +5,7 @@ mod config;
 mod logger;
 mod models;
 mod syntax;
+mod tunnel;
 mod ui;
 
 use anyhow::Result;
@@ -19,10 +20,12 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use app::{App, AppState};
 use logger::{LogConfig, Logger};
+use tunnel::TunnelEvent;
 
 #[derive(Parser)]
 #[command(name = "hooklistener")]
@@ -47,6 +50,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start WebSocket tunnel to forward webhooks to local server
+    Listen {
+        /// Debug endpoint slug to listen to
+        endpoint: String,
+
+        /// Local URL to forward requests to
+        #[arg(short, long, default_value = "http://localhost:3000")]
+        target: String,
+
+        /// WebSocket server URL (defaults to production)
+        #[arg(long)]
+        ws_url: Option<String>,
+    },
     /// Generate a diagnostic bundle for support
     Diagnostics {
         /// Output directory for the diagnostic bundle
@@ -78,6 +94,76 @@ async fn main() -> Result<()> {
     // Handle CLI subcommands first
     if let Some(command) = cli.command {
         match command {
+            Commands::Listen {
+                endpoint,
+                target,
+                ws_url,
+            } => {
+                // Initialize logging for tunnel
+                let log_config = LogConfig {
+                    level: cli.log_level.clone(),
+                    output_to_stdout: false, // Disable stdout logging for TUI
+                    directory: cli
+                        .log_dir
+                        .clone()
+                        .unwrap_or_else(|| LogConfig::default().directory),
+                    ..Default::default()
+                };
+                let _logger = Logger::new(log_config)?;
+
+                // Load config for auth token
+                let config = config::Config::load()?;
+
+                // Check if authenticated
+                if !config.is_token_valid() {
+                    eprintln!(
+                        "❌ Not authenticated. Please run 'hooklistener' to authenticate first."
+                    );
+                    std::process::exit(1);
+                }
+
+                let access_token = config
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("No access token found"))?;
+
+                // Setup TUI for listen command
+                let mut terminal = setup_terminal()?;
+                let mut app = App::new()?;
+
+                // Set app state to listening
+                app.state = AppState::Listening;
+                app.listening_endpoint = endpoint.clone();
+                app.listening_target = target.clone();
+
+                // Create channel for tunnel events
+                let (event_tx, event_rx) = mpsc::channel(100);
+
+                // Create and spawn tunnel client
+                let tunnel_client = tunnel::TunnelClient::new(
+                    access_token,
+                    endpoint.clone(),
+                    target.clone(),
+                    ws_url,
+                    event_tx,
+                );
+
+                tokio::spawn(async move {
+                    if let Err(e) = tunnel_client.connect_and_listen().await {
+                        error!("Tunnel client error: {}", e);
+                    }
+                });
+
+                let res = run_app(&mut terminal, &mut app, Some(event_rx)).await;
+
+                restore_terminal(&mut terminal)?;
+
+                if let Err(err) = res {
+                    error!(error = %err, "Application terminated with error");
+                    eprintln!("Error: {}", err);
+                }
+
+                return Ok(());
+            }
             Commands::Diagnostics { output } => {
                 // Initialize minimal logging for diagnostics
                 let log_config = LogConfig {
@@ -116,7 +202,7 @@ async fn main() -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = App::new()?;
 
-    let res = run_app(&mut terminal, &mut app).await;
+    let res = run_app(&mut terminal, &mut app, None).await;
 
     restore_terminal(&mut terminal)?;
 
@@ -133,6 +219,7 @@ async fn main() -> Result<()> {
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    mut tunnel_rx: Option<mpsc::Receiver<TunnelEvent>>,
 ) -> Result<()> {
     // Ensure proper terminal cleanup on any exit
     let _cleanup = TerminalCleanup;
@@ -143,7 +230,10 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.initiate_device_flow().await?;
         }
         AppState::Loading => {
-            app.load_organizations().await?;
+            // Only load organizations if we are NOT in listening mode
+            if !matches!(app.state, AppState::Listening) {
+                app.load_organizations().await?;
+            }
         }
         _ => {}
     }
@@ -156,6 +246,36 @@ async fn run_app<B: ratatui::backend::Backend>(
 
         if app.should_quit {
             break;
+        }
+
+        // Handle tunnel events if receiver is present
+        if let Some(rx) = &mut tunnel_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    TunnelEvent::Connected => {
+                        app.listening_connected = true;
+                        app.listening_error = None;
+                    }
+                    TunnelEvent::ConnectionError(err) => {
+                        app.listening_connected = false;
+                        app.listening_error = Some(err);
+                    }
+                    TunnelEvent::WebhookReceived(request) => {
+                        app.listening_requests.push(*request);
+                        app.listening_stats.total_requests += 1;
+                        // Auto-select new request if user was at the bottom or list was empty?
+                        // Simple behavior: Update selection index if we want to follow.
+                        // But currently we don't auto-scroll unless we implement it.
+                        // For now, just adding to list is enough.
+                    }
+                    TunnelEvent::ForwardSuccess => {
+                        app.listening_stats.successful_forwards += 1;
+                    }
+                    TunnelEvent::ForwardError => {
+                        app.listening_stats.failed_forwards += 1;
+                    }
+                }
+            }
         }
 
         // Handle non-blocking authentication polling

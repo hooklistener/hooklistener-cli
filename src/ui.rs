@@ -46,11 +46,254 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppState::InputForwardUrl => draw_forward_url_input(frame, app, chunks[0]),
         AppState::ForwardingRequest => draw_forwarding(frame, app, chunks[0]),
         AppState::ForwardResult => draw_forward_result(frame, app, chunks[0]),
+        AppState::Listening => draw_listening(frame, app, chunks[0]),
         AppState::Error(msg) => draw_error(frame, msg, chunks[0]),
     }
 
     // Draw status bar
     draw_status_bar(frame, app, chunks[1]);
+}
+
+fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5), // Header & Stats
+            Constraint::Min(0),    // Requests List
+        ])
+        .split(area);
+
+    // Header & Stats
+    let header_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(60), // Connection Info
+            Constraint::Percentage(40), // Stats
+        ])
+        .split(chunks[0]);
+
+    // Connection Info Block
+    let connection_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::PRIMARY))
+        .title(" Tunnel Connection ");
+
+    let connection_status_text = if app.listening_connected {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "Endpoint: ",
+                    Style::default()
+                        .fg(colors::PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&app.listening_endpoint),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Target:   ",
+                    Style::default()
+                        .fg(colors::PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&app.listening_target),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Status:   ",
+                    Style::default()
+                        .fg(colors::PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "● Connected",
+                    Style::default()
+                        .fg(colors::SUCCESS)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ]
+    } else if let Some(err) = &app.listening_error {
+        vec![Line::from(vec![
+            Span::styled(
+                "Status: ",
+                Style::default()
+                    .fg(colors::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("✗ Error: {}", err),
+                Style::default()
+                    .fg(colors::ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])]
+    } else {
+        let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        let spinner = spinner_chars[app.loading_frame % spinner_chars.len()];
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "Endpoint: ",
+                    Style::default()
+                        .fg(colors::PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&app.listening_endpoint),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Target:   ",
+                    Style::default()
+                        .fg(colors::PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&app.listening_target),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Status:   ",
+                    Style::default()
+                        .fg(colors::PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} Connecting...", spinner),
+                    Style::default()
+                        .fg(colors::WARNING)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ]
+    };
+
+    let connection_info = Paragraph::new(connection_status_text).block(connection_block);
+    frame.render_widget(connection_info, header_chunks[0]);
+
+    // Stats Block
+    let stats_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::SECONDARY))
+        .title(" Statistics ");
+
+    let stats_text = vec![
+        Line::from(vec![
+            Span::styled("Total:   ", Style::default().fg(colors::TEXT)),
+            Span::styled(
+                app.listening_stats.total_requests.to_string(),
+                Style::default()
+                    .fg(colors::INFO)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Success: ", Style::default().fg(colors::TEXT)),
+            Span::styled(
+                app.listening_stats.successful_forwards.to_string(),
+                Style::default()
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Failed:  ", Style::default().fg(colors::TEXT)),
+            Span::styled(
+                app.listening_stats.failed_forwards.to_string(),
+                Style::default()
+                    .fg(colors::ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    let stats_info = Paragraph::new(stats_text).block(stats_block);
+    frame.render_widget(stats_info, header_chunks[1]);
+
+    // Requests List
+    if app.listening_requests.is_empty() {
+        let no_requests = Paragraph::new("Waiting for webhooks...")
+            .style(Style::default().fg(colors::MUTED))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Live Requests ")
+                    .border_style(Style::default().fg(colors::MUTED)),
+            );
+
+        frame.render_widget(no_requests, chunks[1]);
+    } else {
+        // Standard list behavior (oldest to newest), auto-selecting latest if user hasn't moved selection?
+        // Or just render list.
+
+        let rows: Vec<Row> = app
+            .listening_requests
+            .iter()
+            .enumerate()
+            .map(|(i, request)| {
+                let is_selected = i == app.selected_request_index;
+                let style = if is_selected {
+                    Style::default()
+                        .fg(colors::SECONDARY)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(colors::TEXT)
+                };
+
+                // Placeholder for time since WebhookRequest struct doesn't have it yet
+                let time_display = "Just now";
+
+                let (method_symbol, method_style) = match request.method.as_str() {
+                    "GET" => ("🔽", style.fg(colors::INFO)),
+                    "POST" => ("📝", style.fg(colors::SUCCESS)),
+                    "PUT" => ("📤", style.fg(colors::WARNING)),
+                    "DELETE" => ("🗑️", style.fg(colors::ERROR)),
+                    "PATCH" => ("✏️", style.fg(colors::ACCENT)),
+                    _ => ("❓", style.fg(colors::TEXT)),
+                };
+
+                Row::new(vec![
+                    Cell::from(time_display).style(style.fg(colors::MUTED)),
+                    Cell::from(format!("{} {}", method_symbol, request.method)).style(method_style),
+                    Cell::from(request.path.clone().unwrap_or(request.url.clone())).style(style),
+                    Cell::from(format!("{} headers", request.headers.len()))
+                        .style(style.fg(colors::MUTED)),
+                ])
+            })
+            .collect();
+
+        let headers = Row::new(vec!["Time", "Method", "Path", "Details"])
+            .style(
+                Style::default()
+                    .fg(colors::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .bottom_margin(1);
+
+        let requests_table = Table::new(
+            rows,
+            [
+                Constraint::Percentage(15), // Time
+                Constraint::Percentage(15), // Method
+                Constraint::Percentage(50), // Path
+                Constraint::Percentage(20), // Details
+            ],
+        )
+        .header(headers)
+        .block(
+            Block::default()
+                .title(" Live Requests ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::PRIMARY)),
+        )
+        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ");
+
+        let mut table_state = TableState::default();
+        table_state.select(Some(app.selected_request_index));
+
+        frame.render_stateful_widget(requests_table, chunks[1], &mut table_state);
+    }
 }
 
 fn draw_device_code(frame: &mut Frame, app: &App, area: Rect) {
@@ -1130,6 +1373,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             (format!("{} Forwarding...", spinner), "Please wait")
         }
         AppState::ForwardResult => ("✅ Forward Result".to_string(), "B/Esc: Back | Q: Quit"),
+        AppState::Listening => {
+            let total_requests = app.listening_requests.len();
+            (
+                format!("🎧 Listening ({})", total_requests),
+                "↑/↓: Navigate | Enter: Details | Q: Quit",
+            )
+        }
         AppState::Error(_) => (
             "❌ Error".to_string(),
             "R: Retry | C: Change API Key | Q: Quit",

@@ -23,10 +23,14 @@ impl ApiClient {
     }
 
     pub fn with_organization(access_token: String, organization_id: Option<String>) -> Self {
+        // Check environment variable for local development
+        let base_url = std::env::var("HOOKLISTENER_API_URL")
+            .unwrap_or_else(|_| "https://api.hooklistener.com".to_string());
+
         Self {
             client: Client::new(),
             access_token,
-            base_url: "https://api.hooklistener.com".to_string(),
+            base_url,
             organization_id,
         }
     }

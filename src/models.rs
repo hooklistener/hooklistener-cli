@@ -51,6 +51,8 @@ pub struct WebhookRequest {
     pub content_length: i64,
     pub method: String,
     pub url: String,
+    #[serde(default)]
+    pub path: Option<String>, // Added for compatibility with tunnel
     pub query_params: HashMap<String, String>,
     pub created_at: String,
     pub body_preview: Option<String>,
