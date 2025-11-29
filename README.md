@@ -25,6 +25,20 @@ A fast, terminal-based CLI for browsing and forwarding webhook requests from [Ho
 
 ### Quick Install (Recommended)
 
+Install with a single command:
+
+#### macOS / Linux
+```bash
+curl -fsSL https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.sh | sh
+```
+
+#### Windows (PowerShell)
+```powershell
+irm https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.ps1 | iex
+```
+
+### Manual Installation
+
 Download and extract the binary for your platform:
 
 #### macOS (Apple Silicon M1/M2/M3)
@@ -91,17 +105,13 @@ cargo build --release
 ### Coming Soon
 
 - 🍺 Homebrew tap
-- 📦 cargo-dist installers (shell/powershell)
 - 🐳 Docker image
 
 ## Quick Start
 
-1. **Download and run** (takes less than 30 seconds):
+1. **Install** (takes less than 30 seconds):
    ```bash
-   # Example for macOS Apple Silicon
-   curl -L https://github.com/hooklistener/hooklistener-cli/releases/latest/download/hooklistener-cli-aarch64-apple-darwin.tar.gz -o hooklistener.tar.gz
-   tar -xzf hooklistener.tar.gz
-   ./hooklistener-cli tui
+   curl -fsSL https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.sh | sh
    ```
 
 2. **Authenticate** (one-time setup):
