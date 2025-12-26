@@ -358,10 +358,7 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled("   ", Style::default()),
-            Span::styled(
-                "🌐  ",
-                Style::default().fg(colors::INFO),
-            ),
+            Span::styled("🌐  ", Style::default().fg(colors::INFO)),
             Span::styled(
                 tunnel_url,
                 Style::default()
@@ -519,9 +516,9 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
 
                 // Status display
                 let (status_display, status_color) = if let Some(status) = request.status {
-                    let color = if status >= 200 && status < 300 {
+                    let color = if (200..300).contains(&status) {
                         colors::SUCCESS
-                    } else if status >= 400 && status < 500 {
+                    } else if (400..500).contains(&status) {
                         colors::WARNING
                     } else if status >= 500 {
                         colors::ERROR

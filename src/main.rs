@@ -448,7 +448,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.tunnel_connected = true;
                         app.tunnel_connected_at = Some(std::time::Instant::now());
                     }
-                    TunnelEvent::TunnelEstablished { subdomain, tunnel_id } => {
+                    TunnelEvent::TunnelEstablished {
+                        subdomain,
+                        tunnel_id,
+                    } => {
                         app.tunnel_subdomain = Some(subdomain);
                         app.tunnel_id = Some(tunnel_id);
                         app.tunnel_connected = true;
@@ -468,7 +471,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.listening_requests.push(*request);
                         app.listening_stats.total_requests += 1;
                     }
-                    TunnelEvent::RequestReceived { request_id, method, path } => {
+                    TunnelEvent::RequestReceived {
+                        request_id,
+                        method,
+                        path,
+                    } => {
                         use std::time::Instant;
                         let tunnel_request = app::TunnelRequest {
                             request_id,
@@ -482,9 +489,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.tunnel_requests.push(tunnel_request);
                         app.tunnel_stats.total += 1;
                     }
-                    TunnelEvent::RequestForwarded { request_id, status, duration_ms } => {
+                    TunnelEvent::RequestForwarded {
+                        request_id,
+                        status,
+                        duration_ms,
+                    } => {
                         // Update the request in the list
-                        if let Some(req) = app.tunnel_requests.iter_mut()
+                        if let Some(req) = app
+                            .tunnel_requests
+                            .iter_mut()
                             .find(|r| r.request_id == request_id)
                         {
                             req.status = Some(status);
@@ -495,7 +508,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                     TunnelEvent::RequestFailed { request_id, error } => {
                         // Update the request in the list
-                        if let Some(req) = app.tunnel_requests.iter_mut()
+                        if let Some(req) = app
+                            .tunnel_requests
+                            .iter_mut()
                             .find(|r| r.request_id == request_id)
                         {
                             req.error = Some(error);

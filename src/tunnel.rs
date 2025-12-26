@@ -597,7 +597,10 @@ impl TunnelForwarder {
             Ok(stream) => stream,
             Err(e) => {
                 let msg = format!("Failed to connect to tunnel: {}", e);
-                let _ = self.event_tx.send(TunnelEvent::ConnectionError(msg.clone())).await;
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::ConnectionError(msg.clone()))
+                    .await;
                 return Err(anyhow!(msg));
             }
         };
@@ -639,49 +642,51 @@ impl TunnelForwarder {
                         let msg: ChannelMessage = serde_json::from_str(&text)?;
                         if msg.event == "phx_reply"
                             && msg.reference.as_deref() == Some("1")
+                            && let Some(status) = msg.payload.get("status")
                         {
-                            if let Some(status) = msg.payload.get("status") {
-                                if status == "ok" {
-                                    // Extract subdomain and tunnel_id from response
-                                    if let Some(response) = msg.payload.get("response") {
-                                        let subdomain = response
-                                            .get("subdomain")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let tunnel_id = response
-                                            .get("tunnel_id")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
+                            if status == "ok" {
+                                // Extract subdomain and tunnel_id from response
+                                if let Some(response) = msg.payload.get("response") {
+                                    let subdomain = response
+                                        .get("subdomain")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    let tunnel_id = response
+                                        .get("tunnel_id")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
 
-                                        info!(
-                                            subdomain = %subdomain,
-                                            tunnel_id = %tunnel_id,
-                                            "Tunnel established"
-                                        );
+                                    info!(
+                                        subdomain = %subdomain,
+                                        tunnel_id = %tunnel_id,
+                                        "Tunnel established"
+                                    );
 
-                                        let _ = self.event_tx.send(TunnelEvent::TunnelEstablished {
-                                            subdomain,
-                                            tunnel_id,
-                                        }).await;
-
-                                        tunnel_topic = msg.topic.clone();
-                                        joined = true;
-                                    }
-                                } else {
-                                    let reason = msg
-                                        .payload
-                                        .get("response")
-                                        .and_then(|r| r.get("reason"))
-                                        .and_then(|r| r.as_str())
-                                        .unwrap_or("Unknown error");
                                     let _ = self
                                         .event_tx
-                                        .send(TunnelEvent::ConnectionError(reason.to_string()))
+                                        .send(TunnelEvent::TunnelEstablished {
+                                            subdomain,
+                                            tunnel_id,
+                                        })
                                         .await;
-                                    return Err(anyhow!("Tunnel join failed: {}", reason));
+
+                                    tunnel_topic = msg.topic.clone();
+                                    joined = true;
                                 }
+                            } else {
+                                let reason = msg
+                                    .payload
+                                    .get("response")
+                                    .and_then(|r| r.get("reason"))
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or("Unknown error");
+                                let _ = self
+                                    .event_tx
+                                    .send(TunnelEvent::ConnectionError(reason.to_string()))
+                                    .await;
+                                return Err(anyhow!("Tunnel join failed: {}", reason));
                             }
                         }
                     }
@@ -729,7 +734,10 @@ impl TunnelForwarder {
             match tokio::time::timeout(Duration::from_millis(100), read.next()).await {
                 Ok(Some(msg)) => match msg {
                     Ok(Message::Text(text)) => {
-                        if let Err(e) = self.handle_tunnel_message(&text, &mut write, &tunnel_topic).await {
+                        if let Err(e) = self
+                            .handle_tunnel_message(&text, &mut write, &tunnel_topic)
+                            .await
+                        {
                             error!("Error handling tunnel message: {}", e);
                         }
                     }
@@ -750,7 +758,10 @@ impl TunnelForwarder {
                         error!("Tunnel WebSocket error: {}", e);
                         let _ = self
                             .event_tx
-                            .send(TunnelEvent::ConnectionError(format!("WebSocket error: {}", e)))
+                            .send(TunnelEvent::ConnectionError(format!(
+                                "WebSocket error: {}",
+                                e
+                            )))
                             .await;
                         break;
                     }
@@ -824,11 +835,14 @@ impl TunnelForwarder {
                         .map(|s| s.to_string());
 
                     // Notify UI about request
-                    let _ = self.event_tx.send(TunnelEvent::RequestReceived {
-                        request_id: request_id.clone(),
-                        method: method.clone(),
-                        path: path.clone(),
-                    }).await;
+                    let _ = self
+                        .event_tx
+                        .send(TunnelEvent::RequestReceived {
+                            request_id: request_id.clone(),
+                            method: method.clone(),
+                            path: path.clone(),
+                        })
+                        .await;
 
                     // Forward the request
                     self.forward_tunnel_request(
@@ -840,15 +854,19 @@ impl TunnelForwarder {
                         body,
                         write,
                         tunnel_topic,
-                    ).await?;
+                    )
+                    .await?;
                 }
             }
             "phx_reply" => {
                 // Handle ping replies
-                if let Some(response) = msg.payload.get("response") {
-                    if response.get("pong").and_then(|v| v.as_bool()).unwrap_or(false) {
-                        debug!("Received pong from server");
-                    }
+                if let Some(response) = msg.payload.get("response")
+                    && response
+                        .get("pong")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                {
+                    debug!("Received pong from server");
                 }
             }
             _ => {
@@ -859,6 +877,7 @@ impl TunnelForwarder {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn forward_tunnel_request(
         &self,
         request_id: String,
@@ -887,7 +906,7 @@ impl TunnelForwarder {
         // Build target URL
         let mut target = format!("http://{}:{}{}", self.local_host, self.local_port, path);
         if !query_string.is_empty() {
-            target.push_str("?");
+            target.push('?');
             target.push_str(&query_string);
         }
 
@@ -907,12 +926,14 @@ impl TunnelForwarder {
             "OPTIONS" => client.request(reqwest::Method::OPTIONS, &target),
             _ => {
                 warn!("Unsupported HTTP method: {}", method);
-                let _ = self.send_tunnel_error(
-                    &request_id,
-                    &format!("Unsupported method: {}", method),
-                    write,
-                    tunnel_topic,
-                ).await;
+                let _ = self
+                    .send_tunnel_error(
+                        &request_id,
+                        &format!("Unsupported method: {}", method),
+                        write,
+                        tunnel_topic,
+                    )
+                    .await;
                 return Ok(());
             }
         };
@@ -924,10 +945,10 @@ impl TunnelForwarder {
                     serde_json::Value::String(s) => s,
                     _ => value.to_string(),
                 };
-                if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
-                    if let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value_str) {
-                        req_builder = req_builder.header(header_name, header_value);
-                    }
+                if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                    && let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value_str)
+                {
+                    req_builder = req_builder.header(header_name, header_value);
                 }
             }
         }
@@ -944,12 +965,7 @@ impl TunnelForwarder {
                 let response_headers: HashMap<String, String> = response
                     .headers()
                     .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.as_str().to_string(),
-                            v.to_str().unwrap_or("").to_string(),
-                        )
-                    })
+                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
                 let response_body = response.text().await.unwrap_or_default();
 
@@ -963,11 +979,14 @@ impl TunnelForwarder {
                 );
 
                 // Notify UI
-                let _ = self.event_tx.send(TunnelEvent::RequestForwarded {
-                    request_id: request_id.clone(),
-                    status,
-                    duration_ms,
-                }).await;
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::RequestForwarded {
+                        request_id: request_id.clone(),
+                        status,
+                        duration_ms,
+                    })
+                    .await;
 
                 // Send tunnel_response back to server
                 let response_message = ChannelMessage {
@@ -997,13 +1016,17 @@ impl TunnelForwarder {
                 );
 
                 // Notify UI
-                let _ = self.event_tx.send(TunnelEvent::RequestFailed {
-                    request_id: request_id.clone(),
-                    error: error_msg.clone(),
-                }).await;
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::RequestFailed {
+                        request_id: request_id.clone(),
+                        error: error_msg.clone(),
+                    })
+                    .await;
 
                 // Send tunnel_error back to server
-                self.send_tunnel_error(&request_id, &error_msg, write, tunnel_topic).await?;
+                self.send_tunnel_error(&request_id, &error_msg, write, tunnel_topic)
+                    .await?;
             }
         }
 

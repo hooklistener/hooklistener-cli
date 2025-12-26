@@ -41,7 +41,9 @@ pub struct TunnelStats {
     pub success: u64,
     pub failed: u64,
     pub total_duration_ms: u64,
+    #[allow(dead_code)]
     pub bytes_in: u64,
+    #[allow(dead_code)]
     pub bytes_out: u64,
 }
 
