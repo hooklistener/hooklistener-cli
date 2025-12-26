@@ -47,6 +47,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppState::ForwardingRequest => draw_forwarding(frame, app, chunks[0]),
         AppState::ForwardResult => draw_forward_result(frame, app, chunks[0]),
         AppState::Listening => draw_listening(frame, app, chunks[0]),
+        AppState::Tunneling => draw_tunneling(frame, app, chunks[0]),
         AppState::Error(msg) => draw_error(frame, msg, chunks[0]),
     }
 
@@ -293,6 +294,305 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
         table_state.select(Some(app.selected_request_index));
 
         frame.render_stateful_widget(requests_table, chunks[1], &mut table_state);
+    }
+}
+
+fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7), // Header with URL and status
+            Constraint::Length(5), // Statistics
+            Constraint::Min(0),    // Requests table
+        ])
+        .split(area);
+
+    // Header with tunnel URL and status
+    let tunnel_url = if let Some(subdomain) = &app.tunnel_subdomain {
+        format!("https://{}", subdomain)
+    } else {
+        "Connecting...".to_string()
+    };
+
+    let target_url = format!("{}:{}", app.tunnel_local_host, app.tunnel_local_port);
+
+    let status_symbol = if app.tunnel_connected {
+        "●"
+    } else if app.tunnel_error.is_some() {
+        "✗"
+    } else {
+        let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        spinner_chars[app.loading_frame % spinner_chars.len()]
+    };
+
+    let status_color = if app.tunnel_connected {
+        colors::SUCCESS
+    } else if app.tunnel_error.is_some() {
+        colors::ERROR
+    } else {
+        colors::WARNING
+    };
+
+    let status_text = if app.tunnel_connected {
+        "Connected"
+    } else if let Some(err) = &app.tunnel_error {
+        err.as_str()
+    } else {
+        "Connecting..."
+    };
+
+    let uptime_text = if let Some(connected_at) = app.tunnel_connected_at {
+        let elapsed = connected_at.elapsed();
+        let minutes = elapsed.as_secs() / 60;
+        let seconds = elapsed.as_secs() % 60;
+        if minutes > 0 {
+            format!("Uptime: {}m {}s", minutes, seconds)
+        } else {
+            format!("Uptime: {}s", seconds)
+        }
+    } else {
+        String::new()
+    };
+
+    let header_text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled(
+                "🌐  ",
+                Style::default().fg(colors::INFO),
+            ),
+            Span::styled(
+                tunnel_url,
+                Style::default()
+                    .fg(colors::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  →  ", Style::default().fg(colors::MUTED)),
+            Span::styled(
+                target_url,
+                Style::default()
+                    .fg(colors::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("   Status: ", Style::default().fg(colors::TEXT)),
+            Span::styled(
+                format!("{} {}", status_symbol, status_text),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            if !uptime_text.is_empty() {
+                Span::styled(
+                    format!("     {}", uptime_text),
+                    Style::default().fg(colors::MUTED),
+                )
+            } else {
+                Span::raw("")
+            },
+        ]),
+    ];
+
+    let header = Paragraph::new(header_text).block(
+        Block::default()
+            .title(" HTTP Tunnel ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::PRIMARY)),
+    );
+
+    frame.render_widget(header, chunks[0]);
+
+    // Statistics
+    let avg_duration = if app.tunnel_stats.success > 0 {
+        app.tunnel_stats.total_duration_ms / app.tunnel_stats.success
+    } else {
+        0
+    };
+
+    let success_rate = if app.tunnel_stats.total > 0 {
+        (app.tunnel_stats.success * 100) / app.tunnel_stats.total
+    } else {
+        0
+    };
+
+    let failed_rate = if app.tunnel_stats.total > 0 {
+        (app.tunnel_stats.failed * 100) / app.tunnel_stats.total
+    } else {
+        0
+    };
+
+    let stats_text = vec![
+        Line::from(vec![
+            Span::styled("Total Requests: ", Style::default().fg(colors::TEXT)),
+            Span::styled(
+                app.tunnel_stats.total.to_string(),
+                Style::default()
+                    .fg(colors::INFO)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("     Success: ", Style::default().fg(colors::TEXT)),
+            Span::styled(
+                format!("{} ({}%)", app.tunnel_stats.success, success_rate),
+                Style::default()
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("     Failed: ", Style::default().fg(colors::TEXT)),
+            Span::styled(
+                format!("{} ({}%)", app.tunnel_stats.failed, failed_rate),
+                Style::default()
+                    .fg(colors::ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Avg Response: ", Style::default().fg(colors::TEXT)),
+            Span::styled(
+                format!("{}ms", avg_duration),
+                Style::default()
+                    .fg(colors::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    let stats = Paragraph::new(stats_text).block(
+        Block::default()
+            .title(" Statistics ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::SECONDARY)),
+    );
+
+    frame.render_widget(stats, chunks[1]);
+
+    // Live Requests table
+    if app.tunnel_requests.is_empty() {
+        let no_requests = Paragraph::new("Waiting for requests...")
+            .style(Style::default().fg(colors::MUTED))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Live Requests ")
+                    .border_style(Style::default().fg(colors::MUTED)),
+            );
+
+        frame.render_widget(no_requests, chunks[2]);
+    } else {
+        // Calculate visible window
+        let available_rows = chunks[2].height.saturating_sub(3) as usize; // Subtract header and borders
+        let start_idx = app.tunnel_scroll_offset;
+        let end_idx = (start_idx + available_rows).min(app.tunnel_requests.len());
+
+        // Reverse to show newest first
+        let mut visible_requests: Vec<_> = app.tunnel_requests.iter().collect();
+        visible_requests.reverse();
+        let visible_requests = &visible_requests[start_idx..end_idx];
+
+        let rows: Vec<Row> = visible_requests
+            .iter()
+            .map(|request| {
+                // Calculate time since received
+                let elapsed = request.received_at.elapsed();
+                let time_display = if elapsed.as_secs() < 1 {
+                    "now".to_string()
+                } else if elapsed.as_secs() < 60 {
+                    format!("{}s", elapsed.as_secs())
+                } else {
+                    format!("{}m", elapsed.as_secs() / 60)
+                };
+
+                // Get method symbol and color
+                let (method_symbol, method_color) = match request.method.as_str() {
+                    "GET" => ("🔽", colors::INFO),
+                    "POST" => ("📝", colors::SUCCESS),
+                    "PUT" => ("📤", colors::WARNING),
+                    "DELETE" => ("🗑️", colors::ERROR),
+                    "PATCH" => ("✏️", colors::ACCENT),
+                    "HEAD" => ("👤", colors::MUTED),
+                    "OPTIONS" => ("⚙️", colors::PRIMARY),
+                    _ => ("❓", colors::TEXT),
+                };
+
+                // Status display
+                let (status_display, status_color) = if let Some(status) = request.status {
+                    let color = if status >= 200 && status < 300 {
+                        colors::SUCCESS
+                    } else if status >= 400 && status < 500 {
+                        colors::WARNING
+                    } else if status >= 500 {
+                        colors::ERROR
+                    } else {
+                        colors::INFO
+                    };
+                    (status.to_string(), color)
+                } else if request.error.is_some() {
+                    ("Error".to_string(), colors::ERROR)
+                } else {
+                    let spinner_chars = ["⏳", "⏳", "⏳", "⏳"];
+                    (spinner_chars[0].to_string(), colors::WARNING)
+                };
+
+                // Duration display
+                let duration_display = if let Some(completed_at) = request.completed_at {
+                    let duration = completed_at.duration_since(request.received_at);
+                    format!("{}ms", duration.as_millis())
+                } else {
+                    "-".to_string()
+                };
+
+                Row::new(vec![
+                    Cell::from(time_display).style(Style::default().fg(colors::MUTED)),
+                    Cell::from(format!("{} {}", method_symbol, request.method))
+                        .style(Style::default().fg(method_color)),
+                    Cell::from(request.path.clone()).style(Style::default().fg(colors::TEXT)),
+                    Cell::from(status_display).style(Style::default().fg(status_color)),
+                    Cell::from(duration_display).style(Style::default().fg(colors::MUTED)),
+                ])
+            })
+            .collect();
+
+        let headers = Row::new(vec!["Time", "Method", "Path", "Status", "Duration"])
+            .style(
+                Style::default()
+                    .fg(colors::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .bottom_margin(1);
+
+        let title = if app.tunnel_requests.len() > available_rows {
+            format!(
+                " Live Requests ({}-{}/{}) ",
+                start_idx + 1,
+                end_idx,
+                app.tunnel_requests.len()
+            )
+        } else {
+            format!(" Live Requests ({}) ", app.tunnel_requests.len())
+        };
+
+        let requests_table = Table::new(
+            rows,
+            [
+                Constraint::Percentage(10), // Time
+                Constraint::Percentage(15), // Method
+                Constraint::Percentage(50), // Path
+                Constraint::Percentage(12), // Status
+                Constraint::Percentage(13), // Duration
+            ],
+        )
+        .header(headers)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::PRIMARY)),
+        );
+
+        frame.render_widget(requests_table, chunks[2]);
     }
 }
 
@@ -1378,6 +1678,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             (
                 format!("🎧 Listening ({})", total_requests),
                 "↑/↓: Navigate | Enter: Details | Q: Quit",
+            )
+        }
+        AppState::Tunneling => {
+            let total_requests = app.tunnel_requests.len();
+            (
+                format!("🌐 Tunnel ({})", total_requests),
+                "↑/↓/j/k: Scroll | PgUp/PgDn: Page | Home/End | Q: Quit",
             )
         }
         AppState::Error(_) => (

@@ -85,6 +85,20 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         keep: usize,
     },
+    /// Start HTTP tunnel to forward requests to local server
+    Tunnel {
+        /// Local port to forward requests to
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+
+        /// Local host to forward to
+        #[arg(long, default_value = "localhost")]
+        host: String,
+
+        /// Organization ID (optional, uses default)
+        #[arg(short, long)]
+        org: Option<String>,
+    },
 }
 
 fn validate_log_level(s: &str) -> Result<String, String> {
@@ -235,6 +249,71 @@ async fn main() -> Result<()> {
             println!("Cleaning up old log files, keeping {} most recent", keep);
             // This is handled automatically by the logger initialization
         }
+        Commands::Tunnel { port, host, org } => {
+            // Initialize logging for tunnel
+            let log_config = LogConfig {
+                level: log_level.clone(),
+                output_to_stdout: false, // Disable stdout logging for TUI
+                directory: log_dir
+                    .clone()
+                    .unwrap_or_else(|| LogConfig::default().directory),
+                ..Default::default()
+            };
+            let _logger = Logger::new(log_config)?;
+
+            // Load config for auth token
+            let config = config::Config::load()?;
+
+            // Check if authenticated
+            if !config.is_token_valid() {
+                eprintln!(
+                    "❌ Not authenticated. Please run 'hooklistener login' to authenticate first."
+                );
+                std::process::exit(1);
+            }
+
+            let access_token = config
+                .access_token
+                .ok_or_else(|| anyhow::anyhow!("No access token found"))?;
+
+            // Setup TUI for tunnel command
+            let mut terminal = setup_terminal()?;
+            let mut app = App::new()?;
+
+            // Set app state to tunneling
+            app.state = AppState::Tunneling;
+            app.tunnel_local_host = host.clone();
+            app.tunnel_local_port = port;
+            // Only use org from command line; let server pick default if not specified
+            app.tunnel_org_id = org;
+
+            // Create channel for tunnel events
+            let (event_tx, event_rx) = mpsc::channel(100);
+
+            // Create and spawn tunnel forwarder
+            let tunnel_forwarder = tunnel::TunnelForwarder::new(
+                access_token,
+                host,
+                port,
+                app.tunnel_org_id.clone(),
+                event_tx,
+            );
+
+            tokio::spawn(async move {
+                if let Err(e) = tunnel_forwarder.connect_and_forward().await {
+                    error!("Tunnel forwarder error: {}", e);
+                }
+            });
+
+            let res = run_app(&mut terminal, &mut app, Some(event_rx)).await;
+
+            restore_terminal(&mut terminal)?;
+
+            if let Err(err) = res {
+                error!(error = %err, "Application terminated with error");
+                eprintln!("Error: {}", err);
+            }
+        }
     }
 
     Ok(())
@@ -360,21 +439,69 @@ async fn run_app<B: ratatui::backend::Backend>(
         if let Some(rx) = &mut tunnel_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    TunnelEvent::Connecting => {
+                        // Update UI to show connecting state
+                    }
                     TunnelEvent::Connected => {
                         app.listening_connected = true;
                         app.listening_error = None;
+                        app.tunnel_connected = true;
+                        app.tunnel_connected_at = Some(std::time::Instant::now());
+                    }
+                    TunnelEvent::TunnelEstablished { subdomain, tunnel_id } => {
+                        app.tunnel_subdomain = Some(subdomain);
+                        app.tunnel_id = Some(tunnel_id);
+                        app.tunnel_connected = true;
+                        app.tunnel_connected_at = Some(std::time::Instant::now());
                     }
                     TunnelEvent::ConnectionError(err) => {
                         app.listening_connected = false;
-                        app.listening_error = Some(err);
+                        app.listening_error = Some(err.clone());
+                        app.tunnel_connected = false;
+                        app.tunnel_error = Some(err);
+                    }
+                    TunnelEvent::Disconnected => {
+                        app.listening_connected = false;
+                        app.tunnel_connected = false;
                     }
                     TunnelEvent::WebhookReceived(request) => {
                         app.listening_requests.push(*request);
                         app.listening_stats.total_requests += 1;
-                        // Auto-select new request if user was at the bottom or list was empty?
-                        // Simple behavior: Update selection index if we want to follow.
-                        // But currently we don't auto-scroll unless we implement it.
-                        // For now, just adding to list is enough.
+                    }
+                    TunnelEvent::RequestReceived { request_id, method, path } => {
+                        use std::time::Instant;
+                        let tunnel_request = app::TunnelRequest {
+                            request_id,
+                            method,
+                            path,
+                            received_at: Instant::now(),
+                            status: None,
+                            completed_at: None,
+                            error: None,
+                        };
+                        app.tunnel_requests.push(tunnel_request);
+                        app.tunnel_stats.total += 1;
+                    }
+                    TunnelEvent::RequestForwarded { request_id, status, duration_ms } => {
+                        // Update the request in the list
+                        if let Some(req) = app.tunnel_requests.iter_mut()
+                            .find(|r| r.request_id == request_id)
+                        {
+                            req.status = Some(status);
+                            req.completed_at = Some(std::time::Instant::now());
+                        }
+                        app.tunnel_stats.success += 1;
+                        app.tunnel_stats.total_duration_ms += duration_ms;
+                    }
+                    TunnelEvent::RequestFailed { request_id, error } => {
+                        // Update the request in the list
+                        if let Some(req) = app.tunnel_requests.iter_mut()
+                            .find(|r| r.request_id == request_id)
+                        {
+                            req.error = Some(error);
+                            req.completed_at = Some(std::time::Instant::now());
+                        }
+                        app.tunnel_stats.failed += 1;
                     }
                     TunnelEvent::ForwardSuccess => {
                         app.listening_stats.successful_forwards += 1;

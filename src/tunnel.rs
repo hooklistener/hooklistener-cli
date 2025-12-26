@@ -35,8 +35,28 @@ pub struct TunnelWebhookRequest {
 
 #[derive(Debug)]
 pub enum TunnelEvent {
+    Connecting,
     Connected,
+    TunnelEstablished {
+        subdomain: String,
+        tunnel_id: String,
+    },
     ConnectionError(String),
+    Disconnected,
+    RequestReceived {
+        request_id: String,
+        method: String,
+        path: String,
+    },
+    RequestForwarded {
+        request_id: String,
+        status: u16,
+        duration_ms: u64,
+    },
+    RequestFailed {
+        request_id: String,
+        error: String,
+    },
     WebhookReceived(Box<crate::models::WebhookRequest>),
     ForwardSuccess,
     ForwardError,
@@ -517,6 +537,503 @@ impl TunnelClient {
             }
         }
 
+        Ok(())
+    }
+}
+
+/// HTTP Tunnel forwarder - connects to /tunnel endpoint and forwards HTTP requests
+pub struct TunnelForwarder {
+    access_token: String,
+    local_host: String,
+    local_port: u16,
+    org_id: Option<String>,
+    base_url: String,
+    event_tx: mpsc::Sender<TunnelEvent>,
+}
+
+impl TunnelForwarder {
+    pub fn new(
+        access_token: String,
+        local_host: String,
+        local_port: u16,
+        org_id: Option<String>,
+        event_tx: mpsc::Sender<TunnelEvent>,
+    ) -> Self {
+        let base_url = std::env::var("HOOKLISTENER_API_URL")
+            .unwrap_or_else(|_| "https://app.hooklistener.com".to_string());
+
+        Self {
+            access_token,
+            local_host,
+            local_port,
+            org_id,
+            base_url,
+            event_tx,
+        }
+    }
+
+    pub async fn connect_and_forward(&self) -> Result<()> {
+        info!(
+            local_host = %self.local_host,
+            local_port = %self.local_port,
+            "Starting HTTP tunnel"
+        );
+
+        let _ = self.event_tx.send(TunnelEvent::Connecting).await;
+
+        // Build WebSocket URL - connect to /tunnel/websocket endpoint (Phoenix default)
+        let ws_url = format!(
+            "{}/tunnel/websocket?token={}",
+            self.base_url
+                .replace("https://", "wss://")
+                .replace("http://", "ws://"),
+            self.access_token
+        );
+
+        debug!("Tunnel WebSocket URL: {}", ws_url);
+
+        // Connect to WebSocket
+        let (ws_stream, _) = match connect_async(&ws_url).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let msg = format!("Failed to connect to tunnel: {}", e);
+                let _ = self.event_tx.send(TunnelEvent::ConnectionError(msg.clone())).await;
+                return Err(anyhow!(msg));
+            }
+        };
+
+        info!("Tunnel WebSocket connected successfully");
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Join the tunnel:connect channel with local_port and organization_id
+        let mut join_payload = serde_json::json!({
+            "local_port": self.local_port,
+        });
+
+        if let Some(org_id) = &self.org_id {
+            join_payload["organization_id"] = serde_json::Value::String(org_id.clone());
+        }
+
+        let join_message = ChannelMessage {
+            topic: "tunnel:connect".to_string(),
+            event: "phx_join".to_string(),
+            payload: join_payload,
+            reference: Some("1".to_string()),
+        };
+
+        let join_json = serde_json::to_string(&join_message)?;
+        write
+            .send(Message::Text(join_json.into()))
+            .await
+            .context("Failed to send join message")?;
+
+        // Wait for join confirmation
+        let mut joined = false;
+        let mut tunnel_topic = String::new();
+
+        while !joined {
+            match tokio::time::timeout(Duration::from_secs(10), read.next()).await {
+                Ok(Some(msg_result)) => match msg_result {
+                    Ok(Message::Text(text)) => {
+                        let msg: ChannelMessage = serde_json::from_str(&text)?;
+                        if msg.event == "phx_reply"
+                            && msg.reference.as_deref() == Some("1")
+                        {
+                            if let Some(status) = msg.payload.get("status") {
+                                if status == "ok" {
+                                    // Extract subdomain and tunnel_id from response
+                                    if let Some(response) = msg.payload.get("response") {
+                                        let subdomain = response
+                                            .get("subdomain")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or("unknown")
+                                            .to_string();
+                                        let tunnel_id = response
+                                            .get("tunnel_id")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or("unknown")
+                                            .to_string();
+
+                                        info!(
+                                            subdomain = %subdomain,
+                                            tunnel_id = %tunnel_id,
+                                            "Tunnel established"
+                                        );
+
+                                        let _ = self.event_tx.send(TunnelEvent::TunnelEstablished {
+                                            subdomain,
+                                            tunnel_id,
+                                        }).await;
+
+                                        tunnel_topic = msg.topic.clone();
+                                        joined = true;
+                                    }
+                                } else {
+                                    let reason = msg
+                                        .payload
+                                        .get("response")
+                                        .and_then(|r| r.get("reason"))
+                                        .and_then(|r| r.as_str())
+                                        .unwrap_or("Unknown error");
+                                    let _ = self
+                                        .event_tx
+                                        .send(TunnelEvent::ConnectionError(reason.to_string()))
+                                        .await;
+                                    return Err(anyhow!("Tunnel join failed: {}", reason));
+                                }
+                            }
+                        }
+                    }
+                    Ok(Message::Ping(data)) => {
+                        write.send(Message::Pong(data)).await?;
+                    }
+                    Ok(Message::Close(frame)) => {
+                        return Err(anyhow!("WebSocket closed during join: {:?}", frame));
+                    }
+                    Err(e) => return Err(anyhow!("WebSocket error during join: {}", e)),
+                    _ => {}
+                },
+                Ok(None) => return Err(anyhow!("WebSocket stream ended during join")),
+                Err(_) => return Err(anyhow!("Timeout waiting for tunnel join response")),
+            }
+        }
+
+        // Track last ping time
+        let mut last_ping = tokio::time::Instant::now();
+        let ping_interval = Duration::from_secs(30);
+        let mut ping_counter = 2;
+
+        // Listen for tunnel_request events
+        loop {
+            // Check if we need to send a ping
+            if last_ping.elapsed() >= ping_interval {
+                let ping_msg = ChannelMessage {
+                    topic: tunnel_topic.clone(),
+                    event: "ping".to_string(),
+                    payload: serde_json::json!({}),
+                    reference: Some(ping_counter.to_string()),
+                };
+                ping_counter += 1;
+
+                if let Ok(json) = serde_json::to_string(&ping_msg)
+                    && let Err(e) = write.send(Message::Text(json.into())).await
+                {
+                    error!("Failed to send ping: {}", e);
+                    break;
+                }
+                last_ping = tokio::time::Instant::now();
+            }
+
+            // Use timeout to allow ping checks
+            match tokio::time::timeout(Duration::from_millis(100), read.next()).await {
+                Ok(Some(msg)) => match msg {
+                    Ok(Message::Text(text)) => {
+                        if let Err(e) = self.handle_tunnel_message(&text, &mut write, &tunnel_topic).await {
+                            error!("Error handling tunnel message: {}", e);
+                        }
+                    }
+                    Ok(Message::Close(frame)) => {
+                        info!("Tunnel WebSocket closed: {:?}", frame);
+                        let _ = self.event_tx.send(TunnelEvent::Disconnected).await;
+                        break;
+                    }
+                    Ok(Message::Ping(data)) => {
+                        debug!("Received ping, sending pong");
+                        if let Err(e) = write.send(Message::Pong(data)).await {
+                            error!("Failed to send pong: {}", e);
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("Tunnel WebSocket error: {}", e);
+                        let _ = self
+                            .event_tx
+                            .send(TunnelEvent::ConnectionError(format!("WebSocket error: {}", e)))
+                            .await;
+                        break;
+                    }
+                },
+                Ok(None) => {
+                    warn!("Tunnel WebSocket stream ended");
+                    let _ = self.event_tx.send(TunnelEvent::Disconnected).await;
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - continue to check ping
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_tunnel_message(
+        &self,
+        text: &str,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        tunnel_topic: &str,
+    ) -> Result<()> {
+        let msg: ChannelMessage = serde_json::from_str(text)?;
+
+        debug!(
+            topic = %msg.topic,
+            event = %msg.event,
+            "Received tunnel message"
+        );
+
+        match msg.event.as_str() {
+            "tunnel_request" => {
+                // Extract request details
+                if let Some(payload) = msg.payload.as_object() {
+                    let request_id = payload
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let method = payload
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("GET")
+                        .to_string();
+                    let path = payload
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("/")
+                        .to_string();
+                    let query_string = payload
+                        .get("query_string")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let headers = payload
+                        .get("headers")
+                        .and_then(|v| v.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    let body = payload
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // Notify UI about request
+                    let _ = self.event_tx.send(TunnelEvent::RequestReceived {
+                        request_id: request_id.clone(),
+                        method: method.clone(),
+                        path: path.clone(),
+                    }).await;
+
+                    // Forward the request
+                    self.forward_tunnel_request(
+                        request_id,
+                        method,
+                        path,
+                        query_string,
+                        headers,
+                        body,
+                        write,
+                        tunnel_topic,
+                    ).await?;
+                }
+            }
+            "phx_reply" => {
+                // Handle ping replies
+                if let Some(response) = msg.payload.get("response") {
+                    if response.get("pong").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        debug!("Received pong from server");
+                    }
+                }
+            }
+            _ => {
+                debug!("Unhandled tunnel event: {}", msg.event);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn forward_tunnel_request(
+        &self,
+        request_id: String,
+        method: String,
+        path: String,
+        query_string: String,
+        headers: serde_json::Map<String, serde_json::Value>,
+        body: Option<String>,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        tunnel_topic: &str,
+    ) -> Result<()> {
+        let start_time = tokio::time::Instant::now();
+
+        info!(
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            "Forwarding tunnel request to local server"
+        );
+
+        // Build target URL
+        let mut target = format!("http://{}:{}{}", self.local_host, self.local_port, path);
+        if !query_string.is_empty() {
+            target.push_str("?");
+            target.push_str(&query_string);
+        }
+
+        // Create HTTP client with timeout
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
+        // Build request
+        let mut req_builder = match method.as_str() {
+            "GET" => client.get(&target),
+            "POST" => client.post(&target),
+            "PUT" => client.put(&target),
+            "DELETE" => client.delete(&target),
+            "PATCH" => client.patch(&target),
+            "HEAD" => client.head(&target),
+            "OPTIONS" => client.request(reqwest::Method::OPTIONS, &target),
+            _ => {
+                warn!("Unsupported HTTP method: {}", method);
+                let _ = self.send_tunnel_error(
+                    &request_id,
+                    &format!("Unsupported method: {}", method),
+                    write,
+                    tunnel_topic,
+                ).await;
+                return Ok(());
+            }
+        };
+
+        // Add headers
+        for (key, value) in headers {
+            if key.to_lowercase() != "host" {
+                let value_str = match value {
+                    serde_json::Value::String(s) => s,
+                    _ => value.to_string(),
+                };
+                if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
+                    if let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value_str) {
+                        req_builder = req_builder.header(header_name, header_value);
+                    }
+                }
+            }
+        }
+
+        // Add body if present
+        if let Some(body_content) = body {
+            req_builder = req_builder.body(body_content);
+        }
+
+        // Send request and handle response
+        match req_builder.send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let response_headers: HashMap<String, String> = response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            v.to_str().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect();
+                let response_body = response.text().await.unwrap_or_default();
+
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+
+                info!(
+                    request_id = %request_id,
+                    status = %status,
+                    duration_ms = %duration_ms,
+                    "Request forwarded successfully"
+                );
+
+                // Notify UI
+                let _ = self.event_tx.send(TunnelEvent::RequestForwarded {
+                    request_id: request_id.clone(),
+                    status,
+                    duration_ms,
+                }).await;
+
+                // Send tunnel_response back to server
+                let response_message = ChannelMessage {
+                    topic: tunnel_topic.to_string(),
+                    event: "tunnel_response".to_string(),
+                    payload: serde_json::json!({
+                        "request_id": request_id,
+                        "status": status,
+                        "headers": response_headers,
+                        "body": response_body,
+                    }),
+                    reference: None,
+                };
+
+                let response_json = serde_json::to_string(&response_message)?;
+                write.send(Message::Text(response_json.into())).await?;
+            }
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let error_msg = format!("Failed to forward request: {}", e);
+
+                error!(
+                    request_id = %request_id,
+                    error = %error_msg,
+                    duration_ms = %duration_ms,
+                    "Request forwarding failed"
+                );
+
+                // Notify UI
+                let _ = self.event_tx.send(TunnelEvent::RequestFailed {
+                    request_id: request_id.clone(),
+                    error: error_msg.clone(),
+                }).await;
+
+                // Send tunnel_error back to server
+                self.send_tunnel_error(&request_id, &error_msg, write, tunnel_topic).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_tunnel_error(
+        &self,
+        request_id: &str,
+        error: &str,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        tunnel_topic: &str,
+    ) -> Result<()> {
+        let error_message = ChannelMessage {
+            topic: tunnel_topic.to_string(),
+            event: "tunnel_error".to_string(),
+            payload: serde_json::json!({
+                "request_id": request_id,
+                "error": error,
+            }),
+            reference: None,
+        };
+
+        let error_json = serde_json::to_string(&error_message)?;
+        write.send(Message::Text(error_json.into())).await?;
         Ok(())
     }
 }

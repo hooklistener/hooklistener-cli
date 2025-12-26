@@ -23,7 +23,8 @@ pub enum AppState {
     InputForwardUrl,
     ForwardingRequest,
     ForwardResult,
-    Listening, // New state for the listen command
+    Listening, // State for the listen command (debug endpoints)
+    Tunneling, // State for HTTP tunnel command
     Error(String),
 }
 
@@ -32,6 +33,27 @@ pub struct ListeningStats {
     pub total_requests: u64,
     pub successful_forwards: u64,
     pub failed_forwards: u64,
+}
+
+#[derive(Default, Debug)]
+pub struct TunnelStats {
+    pub total: u64,
+    pub success: u64,
+    pub failed: u64,
+    pub total_duration_ms: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TunnelRequest {
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub received_at: std::time::Instant,
+    pub status: Option<u16>,
+    pub completed_at: Option<std::time::Instant>,
+    pub error: Option<String>,
 }
 
 pub struct App {
@@ -58,13 +80,26 @@ pub struct App {
     pub loading_frame: usize,
     pub just_authenticated: bool,
 
-    // Listening mode state
+    // Listening mode state (debug endpoints)
     pub listening_requests: Vec<WebhookRequest>,
     pub listening_stats: ListeningStats,
     pub listening_connected: bool,
     pub listening_error: Option<String>,
     pub listening_endpoint: String,
     pub listening_target: String,
+
+    // Tunneling mode state (HTTP tunnel)
+    pub tunnel_subdomain: Option<String>,
+    pub tunnel_id: Option<String>,
+    pub tunnel_connected: bool,
+    pub tunnel_connected_at: Option<std::time::Instant>,
+    pub tunnel_requests: Vec<TunnelRequest>,
+    pub tunnel_stats: TunnelStats,
+    pub tunnel_scroll_offset: usize,
+    pub tunnel_local_host: String,
+    pub tunnel_local_port: u16,
+    pub tunnel_org_id: Option<String>,
+    pub tunnel_error: Option<String>,
 }
 
 impl App {
@@ -107,6 +142,17 @@ impl App {
             listening_error: None,
             listening_endpoint: String::new(),
             listening_target: String::new(),
+            tunnel_subdomain: None,
+            tunnel_id: None,
+            tunnel_connected: false,
+            tunnel_connected_at: None,
+            tunnel_requests: Vec::new(),
+            tunnel_stats: TunnelStats::default(),
+            tunnel_scroll_offset: 0,
+            tunnel_local_host: String::from("localhost"),
+            tunnel_local_port: 3000,
+            tunnel_org_id: None,
+            tunnel_error: None,
         })
     }
 
@@ -666,6 +712,44 @@ impl App {
                         self.body_scroll_offset = 0;
                         self.state = AppState::ShowRequestDetail;
                     }
+                }
+                _ => {}
+            },
+            AppState::Tunneling => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.should_quit = true;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.tunnel_scroll_offset > 0 {
+                        self.tunnel_scroll_offset -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max_scroll = self.tunnel_requests.len().saturating_sub(10);
+                    if self.tunnel_scroll_offset < max_scroll {
+                        self.tunnel_scroll_offset += 1;
+                    }
+                }
+                KeyCode::PageUp => {
+                    self.tunnel_scroll_offset = self.tunnel_scroll_offset.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    let max_scroll = self.tunnel_requests.len().saturating_sub(10);
+                    self.tunnel_scroll_offset = (self.tunnel_scroll_offset + 10).min(max_scroll);
+                }
+                KeyCode::Home => {
+                    self.tunnel_scroll_offset = 0;
+                }
+                KeyCode::End => {
+                    let max_scroll = self.tunnel_requests.len().saturating_sub(10);
+                    self.tunnel_scroll_offset = max_scroll;
+                }
+                KeyCode::Char('c') => {
+                    // TODO: Copy tunnel URL to clipboard if available
+                    // This would require a clipboard library like arboard
+                }
+                KeyCode::Char('r') => {
+                    // TODO: Implement reconnection logic
                 }
                 _ => {}
             },
