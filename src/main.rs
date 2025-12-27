@@ -253,7 +253,12 @@ async fn main() -> Result<()> {
             println!("Cleaning up old log files, keeping {} most recent", keep);
             // This is handled automatically by the logger initialization
         }
-        Commands::Tunnel { port, host, org, slug } => {
+        Commands::Tunnel {
+            port,
+            host,
+            org,
+            slug,
+        } => {
             // Initialize logging for tunnel
             let log_config = LogConfig {
                 level: log_level.clone(),

@@ -671,7 +671,8 @@ impl TunnelForwarder {
                                         .and_then(|s| s.as_bool())
                                         .unwrap_or(false);
 
-                                    let tunnel_type = if is_static { "static" } else { "ephemeral" };
+                                    let tunnel_type =
+                                        if is_static { "static" } else { "ephemeral" };
                                     info!(
                                         subdomain = %subdomain,
                                         tunnel_id = %tunnel_id,
