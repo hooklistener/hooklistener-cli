@@ -161,8 +161,9 @@ function Install-HooklistenerCli {
             Write-Host "  Location: $DestBinary"
             Write-Host ""
             Write-Host "Get started:" -ForegroundColor White
-            Write-Host "  hooklistener tui      # Launch the terminal UI"
             Write-Host "  hooklistener login    # Authenticate with your account"
+            Write-Host "  hooklistener tui      # Launch the terminal UI to browse webhooks"
+            Write-Host "  hooklistener tunnel   # Expose your local server to the internet"
             Write-Host "  hooklistener --help   # View all commands"
             Write-Host ""
 

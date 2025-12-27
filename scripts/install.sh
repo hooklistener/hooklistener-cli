@@ -216,8 +216,9 @@ main() {
         printf "  ${BOLD}Location${NC}: %s\n" "${INSTALL_DIR}/${BINARY_NAME}"
         printf "\n"
         printf "${BOLD}Get started:${NC}\n"
-        printf "  hooklistener tui      # Launch the terminal UI\n"
         printf "  hooklistener login    # Authenticate with your account\n"
+        printf "  hooklistener tui      # Launch the terminal UI to browse webhooks\n"
+        printf "  hooklistener tunnel   # Expose your local server to the internet\n"
         printf "  hooklistener --help   # View all commands\n"
         printf "\n"
 
