@@ -98,6 +98,10 @@ enum Commands {
         /// Organization ID (optional, uses default)
         #[arg(short, long)]
         org: Option<String>,
+
+        /// Static tunnel slug (paid plans only, creates persistent subdomain)
+        #[arg(short, long)]
+        slug: Option<String>,
     },
 }
 
@@ -249,7 +253,7 @@ async fn main() -> Result<()> {
             println!("Cleaning up old log files, keeping {} most recent", keep);
             // This is handled automatically by the logger initialization
         }
-        Commands::Tunnel { port, host, org } => {
+        Commands::Tunnel { port, host, org, slug } => {
             // Initialize logging for tunnel
             let log_config = LogConfig {
                 level: log_level.clone(),
@@ -286,6 +290,7 @@ async fn main() -> Result<()> {
             app.tunnel_local_port = port;
             // Only use org from command line; let server pick default if not specified
             app.tunnel_org_id = org;
+            app.tunnel_requested_slug = slug.clone();
 
             // Create channel for tunnel events
             let (event_tx, event_rx) = mpsc::channel(100);
@@ -296,6 +301,7 @@ async fn main() -> Result<()> {
                 host,
                 port,
                 app.tunnel_org_id.clone(),
+                slug,
                 event_tx,
             );
 
@@ -451,9 +457,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                     TunnelEvent::TunnelEstablished {
                         subdomain,
                         tunnel_id,
+                        is_static,
                     } => {
                         app.tunnel_subdomain = Some(subdomain);
                         app.tunnel_id = Some(tunnel_id);
+                        app.tunnel_is_static = is_static;
                         app.tunnel_connected = true;
                         app.tunnel_connected_at = Some(std::time::Instant::now());
                     }

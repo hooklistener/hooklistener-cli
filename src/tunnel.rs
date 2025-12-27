@@ -40,6 +40,7 @@ pub enum TunnelEvent {
     TunnelEstablished {
         subdomain: String,
         tunnel_id: String,
+        is_static: bool,
     },
     ConnectionError(String),
     Disconnected,
@@ -547,6 +548,7 @@ pub struct TunnelForwarder {
     local_host: String,
     local_port: u16,
     org_id: Option<String>,
+    slug: Option<String>,
     base_url: String,
     event_tx: mpsc::Sender<TunnelEvent>,
 }
@@ -557,6 +559,7 @@ impl TunnelForwarder {
         local_host: String,
         local_port: u16,
         org_id: Option<String>,
+        slug: Option<String>,
         event_tx: mpsc::Sender<TunnelEvent>,
     ) -> Self {
         let base_url = std::env::var("HOOKLISTENER_API_URL")
@@ -567,6 +570,7 @@ impl TunnelForwarder {
             local_host,
             local_port,
             org_id,
+            slug,
             base_url,
             event_tx,
         }
@@ -609,13 +613,18 @@ impl TunnelForwarder {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Join the tunnel:connect channel with local_port and organization_id
+        // Join the tunnel:connect channel with local_port, organization_id, and optional slug
         let mut join_payload = serde_json::json!({
             "local_port": self.local_port,
         });
 
         if let Some(org_id) = &self.org_id {
             join_payload["organization_id"] = serde_json::Value::String(org_id.clone());
+        }
+
+        if let Some(slug) = &self.slug {
+            join_payload["slug"] = serde_json::Value::String(slug.clone());
+            info!(slug = %slug, "Requesting static tunnel");
         }
 
         let join_message = ChannelMessage {
@@ -645,7 +654,7 @@ impl TunnelForwarder {
                             && let Some(status) = msg.payload.get("status")
                         {
                             if status == "ok" {
-                                // Extract subdomain and tunnel_id from response
+                                // Extract subdomain, tunnel_id, and static flag from response
                                 if let Some(response) = msg.payload.get("response") {
                                     let subdomain = response
                                         .get("subdomain")
@@ -657,10 +666,16 @@ impl TunnelForwarder {
                                         .and_then(|s| s.as_str())
                                         .unwrap_or("unknown")
                                         .to_string();
+                                    let is_static = response
+                                        .get("static")
+                                        .and_then(|s| s.as_bool())
+                                        .unwrap_or(false);
 
+                                    let tunnel_type = if is_static { "static" } else { "ephemeral" };
                                     info!(
                                         subdomain = %subdomain,
                                         tunnel_id = %tunnel_id,
+                                        tunnel_type = %tunnel_type,
                                         "Tunnel established"
                                     );
 
@@ -669,6 +684,7 @@ impl TunnelForwarder {
                                         .send(TunnelEvent::TunnelEstablished {
                                             subdomain,
                                             tunnel_id,
+                                            is_static,
                                         })
                                         .await;
 

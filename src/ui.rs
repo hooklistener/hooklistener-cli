@@ -334,7 +334,11 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let status_text = if app.tunnel_connected {
-        "Connected"
+        if app.tunnel_is_static {
+            "Connected (Static)"
+        } else {
+            "Connected (Ephemeral)"
+        }
     } else if let Some(err) = &app.tunnel_error {
         err.as_str()
     } else {

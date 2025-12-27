@@ -102,6 +102,8 @@ pub struct App {
     pub tunnel_local_port: u16,
     pub tunnel_org_id: Option<String>,
     pub tunnel_error: Option<String>,
+    pub tunnel_requested_slug: Option<String>,
+    pub tunnel_is_static: bool,
 }
 
 impl App {
@@ -155,6 +157,8 @@ impl App {
             tunnel_local_port: 3000,
             tunnel_org_id: None,
             tunnel_error: None,
+            tunnel_requested_slug: None,
+            tunnel_is_static: false,
         })
     }
 
