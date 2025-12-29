@@ -853,10 +853,7 @@ impl TunnelForwarder {
                         .get("body_encoding")
                         .and_then(|v| v.as_str())
                         .unwrap_or("raw");
-                    let raw_body = payload
-                        .get("body")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let raw_body = payload.get("body").and_then(|v| v.as_str()).unwrap_or("");
                     let body: Vec<u8> = if body_encoding == "base64" {
                         // Decode base64 body
                         URL_SAFE_NO_PAD.decode(raw_body).unwrap_or_else(|e| {
