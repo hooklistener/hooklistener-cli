@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -846,10 +847,26 @@ impl TunnelForwarder {
                         .and_then(|v| v.as_object())
                         .cloned()
                         .unwrap_or_default();
-                    let body = payload
+
+                    // Decode body based on body_encoding field
+                    let body_encoding = payload
+                        .get("body_encoding")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("raw");
+                    let raw_body = payload
                         .get("body")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+                        .unwrap_or("");
+                    let body: Vec<u8> = if body_encoding == "base64" {
+                        // Decode base64 body
+                        URL_SAFE_NO_PAD.decode(raw_body).unwrap_or_else(|e| {
+                            warn!("Failed to decode base64 body: {}", e);
+                            raw_body.as_bytes().to_vec()
+                        })
+                    } else {
+                        // Use body as-is (raw UTF-8)
+                        raw_body.as_bytes().to_vec()
+                    };
 
                     // Notify UI about request
                     let _ = self
@@ -902,7 +919,7 @@ impl TunnelForwarder {
         path: String,
         query_string: String,
         headers: serde_json::Map<String, serde_json::Value>,
-        body: Option<String>,
+        body: Vec<u8>,
         write: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -971,8 +988,8 @@ impl TunnelForwarder {
         }
 
         // Add body if present
-        if let Some(body_content) = body {
-            req_builder = req_builder.body(body_content);
+        if !body.is_empty() {
+            req_builder = req_builder.body(body);
         }
 
         // Send request and handle response
@@ -984,7 +1001,19 @@ impl TunnelForwarder {
                     .iter()
                     .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
-                let response_body = response.text().await.unwrap_or_default();
+
+                // Get response as bytes to handle binary content properly
+                let response_bytes = response.bytes().await.unwrap_or_default();
+
+                // Check if the response is valid UTF-8 (text) or binary
+                let (response_body, body_encoding) =
+                    if let Ok(text) = std::str::from_utf8(&response_bytes) {
+                        // Valid UTF-8, send as raw
+                        (text.to_string(), "raw")
+                    } else {
+                        // Binary content, encode as base64
+                        (URL_SAFE_NO_PAD.encode(&response_bytes), "base64")
+                    };
 
                 let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -992,6 +1021,7 @@ impl TunnelForwarder {
                     request_id = %request_id,
                     status = %status,
                     duration_ms = %duration_ms,
+                    body_encoding = %body_encoding,
                     "Request forwarded successfully"
                 );
 
@@ -1005,7 +1035,7 @@ impl TunnelForwarder {
                     })
                     .await;
 
-                // Send tunnel_response back to server
+                // Send tunnel_response back to server with body_encoding
                 let response_message = ChannelMessage {
                     topic: tunnel_topic.to_string(),
                     event: "tunnel_response".to_string(),
@@ -1014,6 +1044,7 @@ impl TunnelForwarder {
                         "status": status,
                         "headers": response_headers,
                         "body": response_body,
+                        "body_encoding": body_encoding,
                     }),
                     reference: None,
                 };
