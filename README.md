@@ -22,7 +22,14 @@ A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposin
 
 ## Installation
 
-### Quick Install (Recommended)
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap hooklistener/tap
+brew install hooklistener
+```
+
+### Quick Install Script
 
 Install with a single command:
 
