@@ -1,6 +1,7 @@
 use crate::api::ApiClient;
 use crate::auth::DeviceCodeFlow;
 use crate::config::Config;
+use crate::errors::ApiError;
 use crate::logger::generate_request_id;
 use crate::models::{
     DebugEndpoint, DebugEndpointDetail, ForwardResponse, Organization, WebhookRequest,
@@ -25,7 +26,10 @@ pub enum AppState {
     ForwardResult,
     Listening, // State for the listen command (debug endpoints)
     Tunneling, // State for HTTP tunnel command
-    Error(String),
+    Error {
+        message: String,
+        hint: Option<String>,
+    },
 }
 
 #[derive(Default)]
@@ -109,7 +113,10 @@ pub struct App {
 impl App {
     pub fn new() -> Result<Self> {
         let config = Config::load()?;
+        Ok(Self::with_config(config))
+    }
 
+    pub fn with_config(config: Config) -> Self {
         let state = if config.is_token_valid() {
             // Start by loading organizations
             AppState::Loading
@@ -117,7 +124,7 @@ impl App {
             AppState::InitiatingDeviceFlow
         };
 
-        Ok(Self {
+        Self {
             state,
             config,
             device_flow: None,
@@ -159,7 +166,7 @@ impl App {
             tunnel_error: None,
             tunnel_requested_slug: None,
             tunnel_is_static: false,
-        })
+        }
     }
 
     pub async fn load_organizations(&mut self) -> Result<()> {
@@ -302,7 +309,13 @@ impl App {
                         error = %e,
                         "Failed to fetch endpoint detail"
                     );
-                    self.state = AppState::Error(format!("Failed to fetch endpoint detail: {}", e));
+                    let hint = e
+                        .downcast_ref::<ApiError>()
+                        .and_then(|ae| ae.hint().map(String::from));
+                    self.state = AppState::Error {
+                        message: format!("Failed to fetch endpoint detail: {}", e),
+                        hint,
+                    };
                 }
             }
         } else {
@@ -345,7 +358,13 @@ impl App {
                     self.state = AppState::ShowRequests;
                 }
                 Err(e) => {
-                    self.state = AppState::Error(format!("Failed to fetch requests: {}", e));
+                    let hint = e
+                        .downcast_ref::<ApiError>()
+                        .and_then(|ae| ae.hint().map(String::from));
+                    self.state = AppState::Error {
+                        message: format!("Failed to fetch requests: {}", e),
+                        hint,
+                    };
                 }
             }
         }
@@ -381,8 +400,10 @@ impl App {
                         self.body_scroll_offset = 0;
                         self.state = AppState::ShowRequestDetail;
                     } else {
-                        self.state =
-                            AppState::Error("Request not found in the current list".to_string());
+                        self.state = AppState::Error {
+                            message: "Request not found in the current list".to_string(),
+                            hint: None,
+                        };
                     }
                 }
             }
@@ -787,7 +808,7 @@ impl App {
                 }
                 _ => {}
             },
-            AppState::Error(_) => match key.code {
+            AppState::Error { .. } => match key.code {
                 KeyCode::Char('q') => {
                     self.should_quit = true;
                 }
@@ -864,7 +885,13 @@ impl App {
                     self.state = AppState::ForwardResult;
                 }
                 Err(e) => {
-                    self.state = AppState::Error(format!("Failed to forward request: {}", e));
+                    let hint = e
+                        .downcast_ref::<ApiError>()
+                        .and_then(|ae| ae.hint().map(String::from));
+                    self.state = AppState::Error {
+                        message: format!("Failed to forward request: {}", e),
+                        hint,
+                    };
                 }
             }
         }
@@ -898,7 +925,10 @@ impl App {
                     error = %e,
                     "Failed to initiate device flow"
                 );
-                self.state = AppState::Error(format!("Failed to initiate device flow: {}", e));
+                self.state = AppState::Error {
+                    message: format!("Failed to initiate device flow: {}", e),
+                    hint: Some("Check your internet connection and try again.".to_string()),
+                };
             }
         }
 
@@ -945,7 +975,10 @@ impl App {
                             poll_counter = self.auth_poll_counter,
                             "Authentication failed"
                         );
-                        self.state = AppState::Error(format!("Authentication failed: {}", e));
+                        self.state = AppState::Error {
+                            message: format!("Authentication failed: {}", e),
+                            hint: Some("Run `hooklistener login` to try again.".to_string()),
+                        };
                     }
                 }
             }
@@ -978,5 +1011,306 @@ impl App {
         self.selected_index = 0;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn make_config(valid_token: bool) -> Config {
+        if valid_token {
+            Config {
+                access_token: Some("test-token".to_string()),
+                token_expires_at: Some(Utc::now() + ChronoDuration::hours(24)),
+                selected_organization_id: None,
+            }
+        } else {
+            Config {
+                access_token: None,
+                token_expires_at: None,
+                selected_organization_id: None,
+            }
+        }
+    }
+
+    fn key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn make_app_with_state(state: AppState) -> App {
+        let mut app = App::with_config(make_config(true));
+        app.state = state;
+        app
+    }
+
+    // is_valid_url tests
+    #[test]
+    fn test_is_valid_url_http() {
+        let app = App::with_config(make_config(false));
+        assert!(app.is_valid_url("http://localhost:3000"));
+    }
+
+    #[test]
+    fn test_is_valid_url_https() {
+        let app = App::with_config(make_config(false));
+        assert!(app.is_valid_url("https://example.com/webhook"));
+    }
+
+    #[test]
+    fn test_is_valid_url_ftp_invalid() {
+        let app = App::with_config(make_config(false));
+        assert!(!app.is_valid_url("ftp://example.com"));
+    }
+
+    #[test]
+    fn test_is_valid_url_empty() {
+        let app = App::with_config(make_config(false));
+        assert!(!app.is_valid_url(""));
+    }
+
+    #[test]
+    fn test_is_valid_url_garbage() {
+        let app = App::with_config(make_config(false));
+        assert!(!app.is_valid_url("not a url"));
+    }
+
+    // tick tests
+    #[test]
+    fn test_tick_advances_loading_frame() {
+        let mut app = App::with_config(make_config(false));
+        assert_eq!(app.loading_frame, 0);
+        app.tick();
+        assert_eq!(app.loading_frame, 1);
+    }
+
+    #[test]
+    fn test_tick_wraps_at_8() {
+        let mut app = App::with_config(make_config(false));
+        app.loading_frame = 7;
+        app.tick();
+        assert_eq!(app.loading_frame, 0);
+    }
+
+    // with_config tests
+    #[test]
+    fn test_with_config_valid_token_starts_loading() {
+        let app = App::with_config(make_config(true));
+        assert!(matches!(app.state, AppState::Loading));
+    }
+
+    #[test]
+    fn test_with_config_no_token_starts_device_flow() {
+        let app = App::with_config(make_config(false));
+        assert!(matches!(app.state, AppState::InitiatingDeviceFlow));
+    }
+
+    // handle_key_event state transitions
+    #[test]
+    fn test_q_from_show_organizations_quits() {
+        let mut app = make_app_with_state(AppState::ShowOrganizations);
+        app.handle_key_event(key_event(KeyCode::Char('q'))).unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_down_navigation_in_organizations() {
+        let mut app = make_app_with_state(AppState::ShowOrganizations);
+        app.organizations = vec![
+            Organization {
+                id: "1".to_string(),
+                name: "Org 1".to_string(),
+                updated_at: "".to_string(),
+                created_at: "".to_string(),
+                signing_secret_prefix: None,
+            },
+            Organization {
+                id: "2".to_string(),
+                name: "Org 2".to_string(),
+                updated_at: "".to_string(),
+                created_at: "".to_string(),
+                signing_secret_prefix: None,
+            },
+        ];
+        assert_eq!(app.selected_organization_index, 0);
+        app.handle_key_event(key_event(KeyCode::Down)).unwrap();
+        assert_eq!(app.selected_organization_index, 1);
+        // Should not go past the end
+        app.handle_key_event(key_event(KeyCode::Down)).unwrap();
+        assert_eq!(app.selected_organization_index, 1);
+    }
+
+    #[test]
+    fn test_up_navigation_in_organizations() {
+        let mut app = make_app_with_state(AppState::ShowOrganizations);
+        app.selected_organization_index = 0;
+        // Up at 0 should stay at 0
+        app.handle_key_event(key_event(KeyCode::Up)).unwrap();
+        assert_eq!(app.selected_organization_index, 0);
+    }
+
+    #[test]
+    fn test_enter_from_show_organizations_transitions_to_loading() {
+        let mut app = make_app_with_state(AppState::ShowOrganizations);
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.state, AppState::Loading));
+    }
+
+    #[test]
+    fn test_enter_from_show_endpoints_with_endpoint() {
+        let mut app = make_app_with_state(AppState::ShowEndpoints);
+        app.endpoints = vec![DebugEndpoint {
+            id: "ep-1".to_string(),
+            name: "Test".to_string(),
+            status: "active".to_string(),
+            updated_at: "".to_string(),
+            created_at: "".to_string(),
+            slug: "test".to_string(),
+            webhook_url: "".to_string(),
+        }];
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.state, AppState::Loading));
+    }
+
+    #[test]
+    fn test_o_from_show_endpoints_goes_to_organizations() {
+        let mut app = make_app_with_state(AppState::ShowEndpoints);
+        app.handle_key_event(key_event(KeyCode::Char('o'))).unwrap();
+        assert!(matches!(app.state, AppState::ShowOrganizations));
+    }
+
+    #[test]
+    fn test_error_state_r_retries() {
+        let mut app = make_app_with_state(AppState::Error {
+            message: "test".to_string(),
+            hint: None,
+        });
+        app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
+        assert!(matches!(app.state, AppState::Loading));
+    }
+
+    #[test]
+    fn test_error_state_c_initiates_device_flow() {
+        let mut app = make_app_with_state(AppState::Error {
+            message: "test".to_string(),
+            hint: None,
+        });
+        app.handle_key_event(key_event(KeyCode::Char('c'))).unwrap();
+        assert!(matches!(app.state, AppState::InitiatingDeviceFlow));
+    }
+
+    #[test]
+    fn test_esc_from_input_forward_url_goes_to_request_detail() {
+        let mut app = make_app_with_state(AppState::InputForwardUrl);
+        app.handle_key_event(key_event(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.state, AppState::ShowRequestDetail));
+    }
+
+    #[test]
+    fn test_char_input_in_forward_url() {
+        let mut app = make_app_with_state(AppState::InputForwardUrl);
+        app.handle_key_event(key_event(KeyCode::Char('h'))).unwrap();
+        app.handle_key_event(key_event(KeyCode::Char('t'))).unwrap();
+        assert_eq!(app.forward_url_input, "ht");
+    }
+
+    #[test]
+    fn test_backspace_in_forward_url() {
+        let mut app = make_app_with_state(AppState::InputForwardUrl);
+        app.forward_url_input = "http".to_string();
+        app.handle_key_event(key_event(KeyCode::Backspace)).unwrap();
+        assert_eq!(app.forward_url_input, "htt");
+    }
+
+    #[test]
+    fn test_tab_cycling_in_request_detail() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        app.selected_request = Some(WebhookRequest {
+            id: "r1".to_string(),
+            timestamp: 0,
+            remote_addr: "".to_string(),
+            headers: std::collections::HashMap::new(),
+            content_length: 0,
+            method: "GET".to_string(),
+            url: "/".to_string(),
+            path: None,
+            query_params: std::collections::HashMap::new(),
+            created_at: "".to_string(),
+            body_preview: None,
+            body: None,
+        });
+        assert_eq!(app.current_tab, 0);
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+        assert_eq!(app.current_tab, 1);
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+        assert_eq!(app.current_tab, 2);
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+        assert_eq!(app.current_tab, 0);
+    }
+
+    #[test]
+    fn test_q_from_listening_quits() {
+        let mut app = make_app_with_state(AppState::Listening);
+        app.handle_key_event(key_event(KeyCode::Char('q'))).unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_q_from_tunneling_quits() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.handle_key_event(key_event(KeyCode::Char('q'))).unwrap();
+        assert!(app.should_quit);
+    }
+
+    // get_selected_endpoint_id tests
+    #[test]
+    fn test_get_selected_endpoint_id_empty_list() {
+        let app = App::with_config(make_config(false));
+        assert!(app.get_selected_endpoint_id().is_none());
+    }
+
+    #[test]
+    fn test_get_selected_endpoint_id_valid_index() {
+        let mut app = App::with_config(make_config(false));
+        app.endpoints = vec![DebugEndpoint {
+            id: "ep-1".to_string(),
+            name: "Test".to_string(),
+            status: "active".to_string(),
+            updated_at: "".to_string(),
+            created_at: "".to_string(),
+            slug: "test".to_string(),
+            webhook_url: "".to_string(),
+        }];
+        assert_eq!(app.get_selected_endpoint_id(), Some("ep-1".to_string()));
+    }
+
+    // get_selected_organization_id tests
+    #[test]
+    fn test_get_selected_organization_id_empty_list() {
+        let app = App::with_config(make_config(false));
+        assert!(app.get_selected_organization_id().is_none());
+    }
+
+    #[test]
+    fn test_get_selected_organization_id_valid_index() {
+        let mut app = App::with_config(make_config(false));
+        app.organizations = vec![Organization {
+            id: "org-1".to_string(),
+            name: "Test Org".to_string(),
+            updated_at: "".to_string(),
+            created_at: "".to_string(),
+            signing_secret_prefix: None,
+        }];
+        assert_eq!(
+            app.get_selected_organization_id(),
+            Some("org-1".to_string())
+        );
     }
 }

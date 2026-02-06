@@ -48,7 +48,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppState::ForwardResult => draw_forward_result(frame, app, chunks[0]),
         AppState::Listening => draw_listening(frame, app, chunks[0]),
         AppState::Tunneling => draw_tunneling(frame, app, chunks[0]),
-        AppState::Error(msg) => draw_error(frame, msg, chunks[0]),
+        AppState::Error { message, hint } => draw_error(frame, message, hint.as_deref(), chunks[0]),
     }
 
     // Draw status bar
@@ -115,6 +115,11 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
             ]),
         ]
     } else if let Some(err) = &app.listening_error {
+        let (symbol, color) = if err.starts_with("Reconnecting") {
+            ("⟳", colors::WARNING)
+        } else {
+            ("✗", colors::ERROR)
+        };
         vec![Line::from(vec![
             Span::styled(
                 "Status: ",
@@ -123,10 +128,8 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("✗ Error: {}", err),
-                Style::default()
-                    .fg(colors::ERROR)
-                    .add_modifier(Modifier::BOLD),
+                format!("{} {}", symbol, err),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ])]
     } else {
@@ -316,17 +319,25 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
 
     let target_url = format!("{}:{}", app.tunnel_local_host, app.tunnel_local_port);
 
+    let is_reconnecting = app
+        .tunnel_error
+        .as_ref()
+        .is_some_and(|e| e.starts_with("Reconnecting"));
+
     let status_symbol = if app.tunnel_connected {
         "●"
+    } else if is_reconnecting {
+        "⟳"
     } else if app.tunnel_error.is_some() {
         "✗"
     } else {
         let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
         spinner_chars[app.loading_frame % spinner_chars.len()]
     };
-
     let status_color = if app.tunnel_connected {
         colors::SUCCESS
+    } else if is_reconnecting {
+        colors::WARNING
     } else if app.tunnel_error.is_some() {
         colors::ERROR
     } else {
@@ -1286,14 +1297,26 @@ fn draw_body_tab(
     }
 }
 
-fn draw_error(frame: &mut Frame, error_msg: &str, area: Rect) {
+fn draw_error(frame: &mut Frame, error_msg: &str, hint: Option<&str>, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
-    let error = Paragraph::new(error_msg)
-        .style(Style::default().fg(Color::Red))
+    let mut lines = vec![Line::from(Span::styled(
+        error_msg,
+        Style::default().fg(Color::Red),
+    ))];
+
+    if let Some(hint_text) = hint {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("💡 {}", hint_text),
+            Style::default().fg(colors::WARNING),
+        )));
+    }
+
+    let error = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
         .block(
@@ -1688,7 +1711,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 "↑/↓/j/k: Scroll | PgUp/PgDn: Page | Home/End | Q: Quit",
             )
         }
-        AppState::Error(_) => (
+        AppState::Error { .. } => (
             "❌ Error".to_string(),
             "R: Retry | C: Change API Key | Q: Quit",
         ),

@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -14,9 +14,12 @@ pub struct Config {
 impl Config {
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path()?;
+        Self::load_from(&config_path)
+    }
 
-        if config_path.exists() {
-            let content = fs::read_to_string(config_path)?;
+    pub fn load_from(path: &Path) -> Result<Self> {
+        if path.exists() {
+            let content = fs::read_to_string(path)?;
             let config: Config = serde_json::from_str(&content)?;
             Ok(config)
         } else {
@@ -30,13 +33,16 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_path()?;
+        self.save_to(&config_path)
+    }
 
-        if let Some(parent) = config_path.parent() {
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(config_path, content)?;
+        fs::write(path, content)?;
 
         Ok(())
     }
@@ -74,5 +80,147 @@ impl Config {
         self.access_token = None;
         self.token_expires_at = None;
         self.selected_organization_id = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use tempfile::TempDir;
+
+    fn config_path_in(dir: &TempDir) -> PathBuf {
+        dir.path().join("config.json")
+    }
+
+    #[test]
+    fn test_no_token_is_invalid() {
+        let config = Config {
+            access_token: None,
+            token_expires_at: None,
+            selected_organization_id: None,
+        };
+        assert!(!config.is_token_valid());
+    }
+
+    #[test]
+    fn test_token_without_expiry_is_invalid() {
+        let config = Config {
+            access_token: Some("tok".to_string()),
+            token_expires_at: None,
+            selected_organization_id: None,
+        };
+        assert!(!config.is_token_valid());
+    }
+
+    #[test]
+    fn test_expired_token_is_invalid() {
+        let config = Config {
+            access_token: Some("tok".to_string()),
+            token_expires_at: Some(Utc::now() - Duration::hours(1)),
+            selected_organization_id: None,
+        };
+        assert!(!config.is_token_valid());
+    }
+
+    #[test]
+    fn test_valid_token() {
+        let config = Config {
+            access_token: Some("tok".to_string()),
+            token_expires_at: Some(Utc::now() + Duration::hours(1)),
+            selected_organization_id: None,
+        };
+        assert!(config.is_token_valid());
+    }
+
+    #[test]
+    fn test_set_access_token() {
+        let mut config = Config {
+            access_token: None,
+            token_expires_at: None,
+            selected_organization_id: None,
+        };
+        let expires = Utc::now() + Duration::hours(24);
+        config.set_access_token("my_token".to_string(), expires);
+        assert_eq!(config.access_token.as_deref(), Some("my_token"));
+        assert_eq!(config.token_expires_at, Some(expires));
+    }
+
+    #[test]
+    fn test_clear_token_preserves_org() {
+        let mut config = Config {
+            access_token: Some("tok".to_string()),
+            token_expires_at: Some(Utc::now()),
+            selected_organization_id: Some("org-1".to_string()),
+        };
+        config.clear_token();
+        assert!(config.access_token.is_none());
+        assert!(config.token_expires_at.is_none());
+        assert_eq!(config.selected_organization_id.as_deref(), Some("org-1"));
+    }
+
+    #[test]
+    fn test_clear_all() {
+        let mut config = Config {
+            access_token: Some("tok".to_string()),
+            token_expires_at: Some(Utc::now()),
+            selected_organization_id: Some("org-1".to_string()),
+        };
+        config.clear_all();
+        assert!(config.access_token.is_none());
+        assert!(config.token_expires_at.is_none());
+        assert!(config.selected_organization_id.is_none());
+    }
+
+    #[test]
+    fn test_set_selected_organization() {
+        let mut config = Config {
+            access_token: None,
+            token_expires_at: None,
+            selected_organization_id: None,
+        };
+        config.set_selected_organization("org-42".to_string());
+        assert_eq!(config.selected_organization_id.as_deref(), Some("org-42"));
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = config_path_in(&dir);
+
+        let expires = Utc::now() + Duration::hours(24);
+        let config = Config {
+            access_token: Some("roundtrip_token".to_string()),
+            token_expires_at: Some(expires),
+            selected_organization_id: Some("org-rt".to_string()),
+        };
+        config.save_to(&path).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.access_token.as_deref(), Some("roundtrip_token"));
+        assert_eq!(loaded.selected_organization_id.as_deref(), Some("org-rt"));
+        assert!(loaded.is_token_valid());
+    }
+
+    #[test]
+    fn test_load_missing_file_returns_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.json");
+
+        let config = Config::load_from(&path).unwrap();
+        assert!(config.access_token.is_none());
+        assert!(config.token_expires_at.is_none());
+        assert!(config.selected_organization_id.is_none());
+    }
+
+    #[test]
+    fn test_load_corrupted_json_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let path = config_path_in(&dir);
+
+        fs::write(&path, "not valid json {{{").unwrap();
+
+        let result = Config::load_from(&path);
+        assert!(result.is_err());
     }
 }

@@ -121,3 +121,146 @@ impl DeviceCodeFlow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_initiate_device_flow_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v1/device")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"device_code":"dev123","user_code":"ABCD1234","expires_in":600}"#)
+            .create_async()
+            .await;
+
+        let mut flow = DeviceCodeFlow::new(server.url());
+        let user_code = flow.initiate_device_flow().await.unwrap();
+        assert_eq!(user_code, "ABCD1234");
+        assert_eq!(flow.device_code.as_deref(), Some("dev123"));
+        assert!(flow.expires_at.is_some());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_initiate_device_flow_server_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v1/device")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let mut flow = DeviceCodeFlow::new(server.url());
+        let result = flow.initiate_device_flow().await;
+        assert!(result.is_err());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_poll_for_authorization_pending() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/device?device_code=dev123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"authorization_pending"}"#)
+            .create_async()
+            .await;
+
+        let mut flow = DeviceCodeFlow::new(server.url());
+        flow.device_code = Some("dev123".to_string());
+        let result = flow.poll_for_authorization().await.unwrap();
+        assert!(result.is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_poll_for_authorization_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/device?device_code=dev123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token":"tok_secret_abc"}"#)
+            .create_async()
+            .await;
+
+        let mut flow = DeviceCodeFlow::new(server.url());
+        flow.device_code = Some("dev123".to_string());
+        let result = flow.poll_for_authorization().await.unwrap();
+        assert_eq!(result, Some("tok_secret_abc".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_poll_for_authorization_expired() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/device?device_code=dev123")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let mut flow = DeviceCodeFlow::new(server.url());
+        flow.device_code = Some("dev123".to_string());
+        let result = flow.poll_for_authorization().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expired"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_poll_without_device_code_errors() {
+        let server = mockito::Server::new_async().await;
+        let flow = DeviceCodeFlow::new(server.url());
+        let result = flow.poll_for_authorization().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No device code"));
+    }
+
+    #[test]
+    fn test_format_user_code_8_chars() {
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        flow.user_code = Some("ABCD1234".to_string());
+        assert_eq!(flow.format_user_code(), Some("ABCD-1234".to_string()));
+    }
+
+    #[test]
+    fn test_format_user_code_other_length() {
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        flow.user_code = Some("ABC".to_string());
+        assert_eq!(flow.format_user_code(), Some("ABC".to_string()));
+    }
+
+    #[test]
+    fn test_format_user_code_none() {
+        let flow = DeviceCodeFlow::new("http://localhost".to_string());
+        assert_eq!(flow.format_user_code(), None);
+    }
+
+    #[test]
+    fn test_time_remaining_future() {
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        flow.expires_at = Some(Utc::now() + Duration::minutes(5));
+        let remaining = flow.time_remaining().unwrap();
+        assert!(remaining > Duration::zero());
+    }
+
+    #[test]
+    fn test_time_remaining_past() {
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        flow.expires_at = Some(Utc::now() - Duration::minutes(5));
+        let remaining = flow.time_remaining().unwrap();
+        assert_eq!(remaining, Duration::zero());
+    }
+
+    #[test]
+    fn test_time_remaining_not_set() {
+        let flow = DeviceCodeFlow::new("http://localhost".to_string());
+        assert!(flow.time_remaining().is_none());
+    }
+}

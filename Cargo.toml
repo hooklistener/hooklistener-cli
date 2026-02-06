@@ -22,6 +22,11 @@ clap = { version = "4.5", features = ["derive"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 url = "2.5"
 base64 = "0.22"
+thiserror = "2.0"
+
+[dev-dependencies]
+mockito = "1.7"
+tempfile = "3.15"
 
 [workspace.metadata.dist]
 # Configuration for cargo-dist release automation

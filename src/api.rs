@@ -1,3 +1,4 @@
+use crate::errors::{ApiError, classify_http_error};
 use crate::logger::generate_request_id;
 use crate::models::{
     DebugEndpoint, DebugEndpointDetail, DebugEndpointDetailResponse, DebugEndpointsResponse,
@@ -35,6 +36,20 @@ impl ApiClient {
         }
     }
 
+    #[cfg(test)]
+    pub fn with_base_url(
+        access_token: String,
+        base_url: String,
+        organization_id: Option<String>,
+    ) -> Self {
+        Self {
+            client: Client::new(),
+            access_token,
+            base_url,
+            organization_id,
+        }
+    }
+
     fn add_headers(&self, mut request_builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request_builder =
             request_builder.header("Authorization", format!("Bearer {}", self.access_token));
@@ -64,16 +79,14 @@ impl ApiClient {
                 crate::log_api_response!(&request_id, status, duration_ms);
 
                 if !response.status().is_success() {
+                    let api_err = classify_http_error(status, "Organizations");
                     error!(
                         request_id = %request_id,
                         status = status,
                         url = %url,
                         "API request failed with non-success status"
                     );
-                    return Err(anyhow::anyhow!(
-                        "Failed to fetch organizations: {}",
-                        response.status()
-                    ));
+                    return Err(api_err.into());
                 }
 
                 match response.json::<Vec<Organization>>().await {
@@ -91,13 +104,13 @@ impl ApiClient {
                             error = %e,
                             "Failed to parse organizations response"
                         );
-                        Err(e.into())
+                        Err(ApiError::ParseError(e.to_string()).into())
                     }
                 }
             }
             Err(e) => {
                 crate::log_api_error!(&request_id, &e, duration_ms);
-                Err(e.into())
+                Err(ApiError::NetworkError(e.to_string()).into())
             }
         }
     }
@@ -120,16 +133,14 @@ impl ApiClient {
                 crate::log_api_response!(&request_id, status, duration_ms);
 
                 if !response.status().is_success() {
+                    let api_err = classify_http_error(status, "Debug endpoints");
                     error!(
                         request_id = %request_id,
                         status = status,
                         url = %url,
                         "Failed to fetch debug endpoints"
                     );
-                    return Err(anyhow::anyhow!(
-                        "Failed to fetch debug endpoints: {}",
-                        response.status()
-                    ));
+                    return Err(api_err.into());
                 }
 
                 match response.json::<DebugEndpointsResponse>().await {
@@ -147,13 +158,13 @@ impl ApiClient {
                             error = %e,
                             "Failed to parse debug endpoints response"
                         );
-                        Err(e.into())
+                        Err(ApiError::ParseError(e.to_string()).into())
                     }
                 }
             }
             Err(e) => {
                 crate::log_api_error!(&request_id, &e, duration_ms);
-                Err(e.into())
+                Err(ApiError::NetworkError(e.to_string()).into())
             }
         }
     }
@@ -177,6 +188,7 @@ impl ApiClient {
                 crate::log_api_response!(&request_id, status, duration_ms);
 
                 if !response.status().is_success() {
+                    let api_err = classify_http_error(status, "Endpoint detail");
                     error!(
                         request_id = %request_id,
                         endpoint_id = %endpoint_id,
@@ -184,10 +196,7 @@ impl ApiClient {
                         url = %url,
                         "Failed to fetch endpoint detail"
                     );
-                    return Err(anyhow::anyhow!(
-                        "Failed to fetch endpoint detail: {}",
-                        response.status()
-                    ));
+                    return Err(api_err.into());
                 }
 
                 match response.json::<DebugEndpointDetailResponse>().await {
@@ -206,13 +215,13 @@ impl ApiClient {
                             error = %e,
                             "Failed to parse endpoint detail response"
                         );
-                        Err(e.into())
+                        Err(ApiError::ParseError(e.to_string()).into())
                     }
                 }
             }
             Err(e) => {
                 crate::log_api_error!(&request_id, &e, duration_ms);
-                Err(e.into())
+                Err(ApiError::NetworkError(e.to_string()).into())
             }
         }
     }
@@ -229,17 +238,21 @@ impl ApiClient {
         );
 
         let request_builder = self.client.get(&url);
-        let response = self.add_headers(request_builder).send().await?;
+        let response = self.add_headers(request_builder).send().await;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch endpoint requests: {}",
-                response.status()
-            ));
+        match response {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    let api_err =
+                        classify_http_error(response.status().as_u16(), "Endpoint requests");
+                    return Err(api_err.into());
+                }
+
+                let requests_response: WebhookRequestsResponse = response.json().await?;
+                Ok(requests_response)
+            }
+            Err(e) => Err(ApiError::NetworkError(e.to_string()).into()),
         }
-
-        let requests_response: WebhookRequestsResponse = response.json().await?;
-        Ok(requests_response)
     }
 
     pub async fn fetch_request_details(
@@ -253,24 +266,22 @@ impl ApiClient {
         );
 
         let request_builder = self.client.get(&url);
-        let response = self.add_headers(request_builder).send().await?;
+        let response = self.add_headers(request_builder).send().await;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "API endpoint returned status: {}. This endpoint may not be supported by the API.",
-                response.status()
-            ));
-        }
+        match response {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    let api_err = classify_http_error(response.status().as_u16(), "Request detail");
+                    return Err(api_err.into());
+                }
 
-        // Try to parse as wrapped response first (consistent with other endpoints)
-        match response.json::<WebhookRequestDetailResponse>().await {
-            Ok(wrapped_response) => Ok(wrapped_response.data),
-            Err(_) => {
-                // If that fails, the endpoint might not exist or return different format
-                Err(anyhow::anyhow!(
-                    "Unable to parse response. The API may not support individual request details."
-                ))
+                // Try to parse as wrapped response first (consistent with other endpoints)
+                match response.json::<WebhookRequestDetailResponse>().await {
+                    Ok(wrapped_response) => Ok(wrapped_response.data),
+                    Err(e) => Err(ApiError::ParseError(e.to_string()).into()),
+                }
             }
+            Err(e) => Err(ApiError::NetworkError(e.to_string()).into()),
         }
     }
 
@@ -371,5 +382,183 @@ impl ApiClient {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fetch_organizations_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/organizations")
+            .match_header("Authorization", "Bearer test-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id":"org-1","name":"Test Org","updated_at":"2024-01-01","created_at":"2024-01-01","signing_secret_prefix":null}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url("test-token".to_string(), server.url(), None);
+        let orgs = client.fetch_organizations().await.unwrap();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].name, "Test Org");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_organizations_unauthorized() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/organizations")
+            .with_status(401)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url("bad-token".to_string(), server.url(), None);
+        let result = client.fetch_organizations().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.downcast_ref::<ApiError>().is_some());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_organizations_server_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/organizations")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url("test-token".to_string(), server.url(), None);
+        let result = client.fetch_organizations().await;
+        assert!(result.is_err());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_debug_endpoints_with_org_header() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/debug-endpoints")
+            .match_header("x-organization-id", "org-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[]}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url(
+            "test-token".to_string(),
+            server.url(),
+            Some("org-1".to_string()),
+        );
+        let endpoints = client.fetch_debug_endpoints().await.unwrap();
+        assert!(endpoints.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_endpoint_requests_pagination() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/debug-endpoints/ep-1/requests?page=2&page_size=10")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[],"pagination":{"page":2,"total_count":15,"page_size":10,"total_pages":2}}"#)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url("test-token".to_string(), server.url(), None);
+        let response = client.fetch_endpoint_requests("ep-1", 2, 10).await.unwrap();
+        assert_eq!(response.pagination.page, 2);
+        assert_eq!(response.pagination.total_pages, 2);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_request_details_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/debug-endpoints/ep-1/requests/req-1")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url("test-token".to_string(), server.url(), None);
+        let result = client.fetch_request_details("ep-1", "req-1").await;
+        assert!(result.is_err());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_forward_request_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/webhook")
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+
+        let client = ApiClient::with_base_url("test-token".to_string(), server.url(), None);
+
+        let request = WebhookRequest {
+            id: "req-1".to_string(),
+            timestamp: 0,
+            remote_addr: "127.0.0.1".to_string(),
+            headers: HashMap::new(),
+            content_length: 0,
+            method: "POST".to_string(),
+            url: "/webhook".to_string(),
+            path: Some("/webhook".to_string()),
+            query_params: HashMap::new(),
+            created_at: "2024-01-01".to_string(),
+            body_preview: Some("{}".to_string()),
+            body: Some("{}".to_string()),
+        };
+
+        let target_url = format!("{}/webhook", server.url());
+        let result = client.forward_request(&request, &target_url).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.status_code, Some(200));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_forward_request_connection_refused() {
+        let client = ApiClient::with_base_url(
+            "test-token".to_string(),
+            "http://localhost:1".to_string(),
+            None,
+        );
+
+        let request = WebhookRequest {
+            id: "req-1".to_string(),
+            timestamp: 0,
+            remote_addr: "127.0.0.1".to_string(),
+            headers: HashMap::new(),
+            content_length: 0,
+            method: "POST".to_string(),
+            url: "/webhook".to_string(),
+            path: Some("/webhook".to_string()),
+            query_params: HashMap::new(),
+            created_at: "2024-01-01".to_string(),
+            body_preview: None,
+            body: None,
+        };
+
+        let result = client
+            .forward_request(&request, "http://localhost:1/webhook")
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error_message.is_some());
     }
 }

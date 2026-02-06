@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod auth;
 mod config;
+mod errors;
 mod logger;
 mod models;
 mod syntax;
@@ -166,7 +167,7 @@ async fn main() -> Result<()> {
 
             if let Err(err) = res {
                 error!(error = %err, "Application terminated with error");
-                eprintln!("Error: {}", err);
+                display_error(&err);
             } else {
                 info!("HookListener CLI terminated successfully");
             }
@@ -224,7 +225,10 @@ async fn main() -> Result<()> {
             );
 
             tokio::spawn(async move {
-                if let Err(e) = tunnel_client.connect_and_listen().await {
+                if let Err(e) = tunnel_client
+                    .connect_with_reconnect(tunnel::ReconnectConfig::default())
+                    .await
+                {
                     error!("Tunnel client error: {}", e);
                 }
             });
@@ -235,7 +239,7 @@ async fn main() -> Result<()> {
 
             if let Err(err) = res {
                 error!(error = %err, "Application terminated with error");
-                eprintln!("Error: {}", err);
+                display_error(&err);
             }
         }
         Commands::Diagnostics { output } => {
@@ -311,7 +315,10 @@ async fn main() -> Result<()> {
             );
 
             tokio::spawn(async move {
-                if let Err(e) = tunnel_forwarder.connect_and_forward().await {
+                if let Err(e) = tunnel_forwarder
+                    .connect_with_reconnect(tunnel::ReconnectConfig::default())
+                    .await
+                {
                     error!("Tunnel forwarder error: {}", e);
                 }
             });
@@ -322,7 +329,7 @@ async fn main() -> Result<()> {
 
             if let Err(err) = res {
                 error!(error = %err, "Application terminated with error");
-                eprintln!("Error: {}", err);
+                display_error(&err);
             }
         }
     }
@@ -537,6 +544,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                     TunnelEvent::ForwardError => {
                         app.listening_stats.failed_forwards += 1;
                     }
+                    TunnelEvent::Reconnecting {
+                        attempt,
+                        max_attempts,
+                        next_retry_in_secs,
+                    } => {
+                        let msg = format!(
+                            "Reconnecting (attempt {}/{})... next retry in {}s",
+                            attempt, max_attempts, next_retry_in_secs
+                        );
+                        app.listening_connected = false;
+                        app.listening_error = Some(msg.clone());
+                        app.tunnel_connected = false;
+                        app.tunnel_error = Some(msg);
+                    }
+                    TunnelEvent::ReconnectFailed { reason } => {
+                        let msg = format!("Connection lost: {}", reason);
+                        app.listening_connected = false;
+                        app.listening_error = Some(msg.clone());
+                        app.tunnel_connected = false;
+                        app.tunnel_error = Some(msg);
+                    }
                 }
             }
         }
@@ -638,6 +666,27 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 
     Ok(())
+}
+
+fn display_error(err: &anyhow::Error) {
+    eprintln!("Error: {}", err);
+    if let Some(api_err) = err.downcast_ref::<errors::ApiError>()
+        && let Some(hint) = api_err.hint()
+    {
+        eprintln!("Hint: {}", hint);
+    } else if let Some(tunnel_err) = err.downcast_ref::<errors::TunnelError>()
+        && let Some(hint) = tunnel_err.hint()
+    {
+        eprintln!("Hint: {}", hint);
+    } else if let Some(config_err) = err.downcast_ref::<errors::ConfigError>()
+        && let Some(hint) = config_err.hint()
+    {
+        eprintln!("Hint: {}", hint);
+    }
+    // Print the error chain
+    for cause in err.chain().skip(1) {
+        eprintln!("Caused by: {}", cause);
+    }
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

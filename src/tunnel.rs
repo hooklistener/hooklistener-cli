@@ -3,7 +3,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async,
@@ -62,6 +62,103 @@ pub enum TunnelEvent {
     WebhookReceived(Box<crate::models::WebhookRequest>),
     ForwardSuccess,
     ForwardError,
+    Reconnecting {
+        attempt: u32,
+        max_attempts: u32,
+        next_retry_in_secs: u64,
+    },
+    ReconnectFailed {
+        reason: String,
+    },
+}
+
+/// Configuration for reconnection behavior
+pub struct ReconnectConfig {
+    pub max_retries: u32,
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub jitter_factor: f64,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 10,
+            initial_delay_ms: 1000,
+            max_delay_ms: 60000,
+            jitter_factor: 0.3,
+        }
+    }
+}
+
+/// Build a WebSocket URL from a base HTTP(S) URL
+#[cfg(test)]
+pub fn build_ws_url(base_url: &str, token: &str, path: &str) -> String {
+    format!(
+        "{}/{}?token={}",
+        base_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://"),
+        path.trim_start_matches('/'),
+        token
+    )
+}
+
+/// Build a target URL for forwarding, appending path and optional query params
+#[cfg(test)]
+pub fn build_forward_target(
+    target_url: &str,
+    path: &str,
+    query_params: &HashMap<String, serde_json::Value>,
+) -> String {
+    let base = format!("{}{}", target_url, path);
+    if query_params.is_empty() {
+        base
+    } else {
+        let query_string: Vec<String> = query_params
+            .iter()
+            .map(|(k, v)| {
+                let value_str = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    _ => v.to_string(),
+                };
+                format!("{}={}", k, value_str)
+            })
+            .collect();
+        format!("{}?{}", base, query_string.join("&"))
+    }
+}
+
+/// Determine if an error message represents a fatal (non-retryable) error
+pub fn is_fatal_error(error_msg: &str) -> bool {
+    let lower = error_msg.to_lowercase();
+    lower.contains("authentication failed")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("endpoint not found")
+        || lower.contains("channel join failed")
+        || lower.contains("tunnel join failed")
+}
+
+/// Calculate backoff duration with exponential backoff and jitter
+pub fn calculate_backoff(attempt: u32, config: &ReconnectConfig) -> Duration {
+    let base_delay = config.initial_delay_ms as f64 * 2_f64.powi(attempt.saturating_sub(1) as i32);
+    let capped_delay = base_delay.min(config.max_delay_ms as f64);
+
+    // Simple jitter using SystemTime nanos
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let jitter_range = capped_delay * config.jitter_factor;
+    let jitter = (nanos as f64 / u32::MAX as f64) * jitter_range * 2.0 - jitter_range;
+
+    let final_delay = (capped_delay + jitter).max(100.0);
+    Duration::from_millis(final_delay as u64)
 }
 
 /// Tunnel client for WebSocket connection to Hooklistener server
@@ -540,6 +637,72 @@ impl TunnelClient {
         }
 
         Ok(())
+    }
+
+    /// Connect with automatic reconnection on recoverable errors
+    pub async fn connect_with_reconnect(&self, config: ReconnectConfig) -> Result<()> {
+        let mut attempt: u32 = 0;
+
+        loop {
+            let start = tokio::time::Instant::now();
+            let result = self.connect_and_listen().await;
+
+            match result {
+                Ok(()) => {
+                    // Clean disconnect, try reconnecting
+                    if start.elapsed() > Duration::from_secs(5) {
+                        attempt = 0; // Reset if connection lasted > 5s
+                    }
+                }
+                Err(ref e) => {
+                    let err_msg = e.to_string();
+                    if is_fatal_error(&err_msg) {
+                        let _ = self
+                            .event_tx
+                            .send(TunnelEvent::ReconnectFailed { reason: err_msg })
+                            .await;
+                        return result;
+                    }
+
+                    if start.elapsed() > Duration::from_secs(5) {
+                        attempt = 0;
+                    }
+                }
+            }
+
+            attempt += 1;
+            if attempt > config.max_retries {
+                let reason = "Maximum reconnection attempts exceeded".to_string();
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::ReconnectFailed {
+                        reason: reason.clone(),
+                    })
+                    .await;
+                return Err(anyhow!(reason));
+            }
+
+            let backoff = calculate_backoff(attempt, &config);
+            let next_retry_secs = backoff.as_secs();
+
+            info!(
+                attempt = attempt,
+                max_attempts = config.max_retries,
+                next_retry_in_secs = next_retry_secs,
+                "Reconnecting..."
+            );
+
+            let _ = self
+                .event_tx
+                .send(TunnelEvent::Reconnecting {
+                    attempt,
+                    max_attempts: config.max_retries,
+                    next_retry_in_secs: next_retry_secs,
+                })
+                .await;
+
+            tokio::time::sleep(backoff).await;
+        }
     }
 }
 
@@ -1103,5 +1266,242 @@ impl TunnelForwarder {
         let error_json = serde_json::to_string(&error_message)?;
         write.send(Message::Text(error_json.into())).await?;
         Ok(())
+    }
+
+    /// Connect with automatic reconnection on recoverable errors
+    pub async fn connect_with_reconnect(&self, config: ReconnectConfig) -> Result<()> {
+        let mut attempt: u32 = 0;
+
+        loop {
+            let start = tokio::time::Instant::now();
+            let result = self.connect_and_forward().await;
+
+            match result {
+                Ok(()) => {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        attempt = 0;
+                    }
+                }
+                Err(ref e) => {
+                    let err_msg = e.to_string();
+                    if is_fatal_error(&err_msg) {
+                        let _ = self
+                            .event_tx
+                            .send(TunnelEvent::ReconnectFailed { reason: err_msg })
+                            .await;
+                        return result;
+                    }
+
+                    if start.elapsed() > Duration::from_secs(5) {
+                        attempt = 0;
+                    }
+                }
+            }
+
+            attempt += 1;
+            if attempt > config.max_retries {
+                let reason = "Maximum reconnection attempts exceeded".to_string();
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::ReconnectFailed {
+                        reason: reason.clone(),
+                    })
+                    .await;
+                return Err(anyhow!(reason));
+            }
+
+            let backoff = calculate_backoff(attempt, &config);
+            let next_retry_secs = backoff.as_secs();
+
+            info!(
+                attempt = attempt,
+                max_attempts = config.max_retries,
+                next_retry_in_secs = next_retry_secs,
+                "Reconnecting tunnel..."
+            );
+
+            let _ = self
+                .event_tx
+                .send(TunnelEvent::Reconnecting {
+                    attempt,
+                    max_attempts: config.max_retries,
+                    next_retry_in_secs: next_retry_secs,
+                })
+                .await;
+
+            tokio::time::sleep(backoff).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ChannelMessage serialization tests
+    #[test]
+    fn test_channel_message_serialization_with_ref() {
+        let msg = ChannelMessage {
+            topic: "test:topic".to_string(),
+            event: "phx_join".to_string(),
+            payload: serde_json::json!({"key": "value"}),
+            reference: Some("1".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"ref\":\"1\""));
+        assert!(json.contains("\"topic\":\"test:topic\""));
+    }
+
+    #[test]
+    fn test_channel_message_deserialization_with_ref() {
+        let json = r#"{"topic":"t","event":"e","payload":{},"ref":"42"}"#;
+        let msg: ChannelMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.topic, "t");
+        assert_eq!(msg.event, "e");
+        assert_eq!(msg.reference, Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_channel_message_deserialization_without_ref() {
+        let json = r#"{"topic":"t","event":"e","payload":{}}"#;
+        let msg: ChannelMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.reference.is_none());
+    }
+
+    // TunnelWebhookRequest tests
+    #[test]
+    fn test_tunnel_webhook_request_full_payload() {
+        let json = r#"{
+            "id": "req-1",
+            "method": "POST",
+            "path": "/webhook",
+            "query_params": {"foo": "bar"},
+            "headers": {"content-type": "application/json"},
+            "body": "{\"data\":1}"
+        }"#;
+        let req: TunnelWebhookRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.id, "req-1");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/webhook");
+        assert!(req.body.is_some());
+    }
+
+    #[test]
+    fn test_tunnel_webhook_request_minimal() {
+        let json = r#"{"id":"req-2","method":"GET","path":"/"}"#;
+        let req: TunnelWebhookRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.id, "req-2");
+        assert!(req.body.is_none());
+        assert!(req.headers.is_empty());
+        assert!(req.query_params.is_empty());
+    }
+
+    // build_ws_url tests
+    #[test]
+    fn test_build_ws_url_https_to_wss() {
+        let url = build_ws_url("https://api.example.com", "tok123", "socket/websocket");
+        assert_eq!(url, "wss://api.example.com/socket/websocket?token=tok123");
+    }
+
+    #[test]
+    fn test_build_ws_url_http_to_ws() {
+        let url = build_ws_url("http://localhost:4000", "tok", "tunnel/websocket");
+        assert_eq!(url, "ws://localhost:4000/tunnel/websocket?token=tok");
+    }
+
+    // build_forward_target tests
+    #[test]
+    fn test_build_forward_target_no_query_params() {
+        let target = build_forward_target("http://localhost:3000", "/api/hook", &HashMap::new());
+        assert_eq!(target, "http://localhost:3000/api/hook");
+    }
+
+    #[test]
+    fn test_build_forward_target_with_query_params() {
+        let mut params = HashMap::new();
+        params.insert(
+            "key".to_string(),
+            serde_json::Value::String("val".to_string()),
+        );
+        let target = build_forward_target("http://localhost:3000", "/hook", &params);
+        assert!(target.starts_with("http://localhost:3000/hook?"));
+        assert!(target.contains("key=val"));
+    }
+
+    // is_fatal_error tests
+    #[test]
+    fn test_is_fatal_error_auth() {
+        assert!(is_fatal_error(
+            "Authentication failed: The token is invalid or expired."
+        ));
+    }
+
+    #[test]
+    fn test_is_fatal_error_not_found() {
+        assert!(is_fatal_error("Endpoint not found: 'my-slug'."));
+    }
+
+    #[test]
+    fn test_is_fatal_error_join_failed() {
+        assert!(is_fatal_error("Channel join failed: unknown"));
+    }
+
+    #[test]
+    fn test_is_not_fatal_error_connection_refused() {
+        assert!(!is_fatal_error("Connection refused: connection reset"));
+    }
+
+    #[test]
+    fn test_is_not_fatal_error_ws_error() {
+        assert!(!is_fatal_error("WebSocket error: broken pipe"));
+    }
+
+    #[test]
+    fn test_is_not_fatal_error_stream_ended() {
+        assert!(!is_fatal_error("WebSocket stream ended"));
+    }
+
+    // calculate_backoff tests
+    #[test]
+    fn test_calculate_backoff_first_attempt() {
+        let config = ReconnectConfig {
+            max_retries: 10,
+            initial_delay_ms: 1000,
+            max_delay_ms: 60000,
+            jitter_factor: 0.0, // No jitter for deterministic test
+        };
+        let backoff = calculate_backoff(1, &config);
+        assert_eq!(backoff.as_millis(), 1000);
+    }
+
+    #[test]
+    fn test_calculate_backoff_capped_at_max() {
+        let config = ReconnectConfig {
+            max_retries: 20,
+            initial_delay_ms: 1000,
+            max_delay_ms: 5000,
+            jitter_factor: 0.0,
+        };
+        let backoff = calculate_backoff(15, &config);
+        assert_eq!(backoff.as_millis(), 5000);
+    }
+
+    // ReconnectConfig default tests
+    #[test]
+    fn test_reconnect_config_default_values() {
+        let config = ReconnectConfig::default();
+        assert_eq!(config.max_retries, 10);
+        assert_eq!(config.initial_delay_ms, 1000);
+        assert_eq!(config.max_delay_ms, 60000);
+        assert!((config.jitter_factor - 0.3).abs() < f64::EPSILON);
+    }
+
+    // Base64 decode roundtrip
+    #[test]
+    fn test_base64_body_decode_roundtrip() {
+        let original = b"Hello, World!";
+        let encoded = URL_SAFE_NO_PAD.encode(original);
+        let decoded = URL_SAFE_NO_PAD.decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
     }
 }
