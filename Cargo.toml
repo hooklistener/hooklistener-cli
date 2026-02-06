@@ -23,6 +23,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 url = "2.5"
 base64 = "0.22"
 thiserror = "2.0"
+arboard = "3.4"
 
 [dev-dependencies]
 mockito = "1.7"

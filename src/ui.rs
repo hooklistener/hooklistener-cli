@@ -48,6 +48,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppState::ForwardResult => draw_forward_result(frame, app, chunks[0]),
         AppState::Listening => draw_listening(frame, app, chunks[0]),
         AppState::Tunneling => draw_tunneling(frame, app, chunks[0]),
+        AppState::ExportMenu => draw_export_menu(frame, app, chunks[0]),
         AppState::Error { message, hint } => draw_error(frame, message, hint.as_deref(), chunks[0]),
     }
 
@@ -56,12 +57,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
+    let show_search = app.search_active || !app.search_query.is_empty();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5), // Header & Stats
-            Constraint::Min(0),    // Requests List
-        ])
+        .constraints(if show_search {
+            vec![
+                Constraint::Length(5), // Header & Stats
+                Constraint::Length(3), // Search bar
+                Constraint::Min(0),    // Requests List
+            ]
+        } else {
+            vec![
+                Constraint::Length(5), // Header & Stats
+                Constraint::Length(0), // No search bar
+                Constraint::Min(0),    // Requests List
+            ]
+        })
         .split(area);
 
     // Header & Stats
@@ -213,9 +224,39 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
     let stats_info = Paragraph::new(stats_text).block(stats_block);
     frame.render_widget(stats_info, header_chunks[1]);
 
+    // Search bar
+    if show_search {
+        let search_border_color = if app.search_active {
+            colors::PRIMARY
+        } else {
+            colors::MUTED
+        };
+        let search_text = format!("/{}", app.search_query);
+        let cursor = if app.search_active { "▎" } else { "" };
+        let search = Paragraph::new(format!("{}{}", search_text, cursor))
+            .style(Style::default().fg(colors::TEXT))
+            .block(
+                Block::default()
+                    .title(" Search ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(search_border_color)),
+            );
+        frame.render_widget(search, chunks[1]);
+    }
+
+    let requests_area = chunks[2];
+
+    let filtered_indices =
+        crate::app::App::filter_requests(&app.listening_requests, &app.search_query);
+
     // Requests List
-    if app.listening_requests.is_empty() {
-        let no_requests = Paragraph::new("Waiting for webhooks...")
+    if filtered_indices.is_empty() {
+        let msg = if app.listening_requests.is_empty() {
+            "Waiting for webhooks..."
+        } else {
+            "No matching requests"
+        };
+        let no_requests = Paragraph::new(msg)
             .style(Style::default().fg(colors::MUTED))
             .alignment(Alignment::Center)
             .block(
@@ -225,17 +266,14 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
                     .border_style(Style::default().fg(colors::MUTED)),
             );
 
-        frame.render_widget(no_requests, chunks[1]);
+        frame.render_widget(no_requests, requests_area);
     } else {
-        // Standard list behavior (oldest to newest), auto-selecting latest if user hasn't moved selection?
-        // Or just render list.
-
-        let rows: Vec<Row> = app
-            .listening_requests
+        let rows: Vec<Row> = filtered_indices
             .iter()
             .enumerate()
-            .map(|(i, request)| {
-                let is_selected = i == app.selected_request_index;
+            .map(|(display_idx, &real_idx)| {
+                let request = &app.listening_requests[real_idx];
+                let is_selected = display_idx == app.selected_request_index;
                 let style = if is_selected {
                     Style::default()
                         .fg(colors::SECONDARY)
@@ -244,7 +282,6 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(colors::TEXT)
                 };
 
-                // Placeholder for time since WebhookRequest struct doesn't have it yet
                 let time_display = "Just now";
 
                 let (method_symbol, method_style) = match request.method.as_str() {
@@ -296,7 +333,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
         let mut table_state = TableState::default();
         table_state.select(Some(app.selected_request_index));
 
-        frame.render_stateful_widget(requests_table, chunks[1], &mut table_state);
+        frame.render_stateful_widget(requests_table, requests_area, &mut table_state);
     }
 }
 
@@ -369,7 +406,7 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
 
-    let header_text = vec![
+    let mut header_text = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("   ", Style::default()),
@@ -407,6 +444,16 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
             },
         ]),
     ];
+
+    // Show tunnel status message (e.g. "URL copied to clipboard!")
+    if let Some((msg, _)) = &app.tunnel_status_message {
+        header_text.push(Line::from(Span::styled(
+            format!("   {}", msg),
+            Style::default()
+                .fg(colors::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
 
     let header = Paragraph::new(header_text).block(
         Block::default()
@@ -913,9 +960,24 @@ fn draw_endpoint_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_requests_list(frame: &mut Frame, app: &App, area: Rect) {
+    let show_search = app.search_active || !app.search_query.is_empty();
+    let constraints = if show_search {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(0),
+            Constraint::Min(0),
+        ]
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints(constraints)
         .split(area);
 
     if let Some(endpoint) = &app.selected_endpoint {
@@ -931,8 +993,37 @@ fn draw_requests_list(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(header, chunks[0]);
     }
 
-    if app.requests.is_empty() {
-        let no_requests = Paragraph::new("No requests found")
+    // Search bar
+    if show_search {
+        let search_border_color = if app.search_active {
+            colors::PRIMARY
+        } else {
+            colors::MUTED
+        };
+        let search_text = format!("/{}", app.search_query);
+        let cursor = if app.search_active { "▎" } else { "" };
+        let search = Paragraph::new(format!("{}{}", search_text, cursor))
+            .style(Style::default().fg(colors::TEXT))
+            .block(
+                Block::default()
+                    .title(" Search ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(search_border_color)),
+            );
+        frame.render_widget(search, chunks[1]);
+    }
+
+    let table_area = chunks[2];
+
+    let filtered_indices = crate::app::App::filter_requests(&app.requests, &app.search_query);
+
+    if filtered_indices.is_empty() {
+        let msg = if app.requests.is_empty() {
+            "No requests found"
+        } else {
+            "No matching requests"
+        };
+        let no_requests = Paragraph::new(msg)
             .style(Style::default().fg(Color::Gray))
             .alignment(Alignment::Center)
             .block(
@@ -941,14 +1032,14 @@ fn draw_requests_list(frame: &mut Frame, app: &App, area: Rect) {
                     .border_style(Style::default().fg(Color::Gray)),
             );
 
-        frame.render_widget(no_requests, chunks[1]);
+        frame.render_widget(no_requests, table_area);
     } else {
-        let rows: Vec<Row> = app
-            .requests
+        let rows: Vec<Row> = filtered_indices
             .iter()
             .enumerate()
-            .map(|(i, request)| {
-                let style = if i == app.selected_request_index {
+            .map(|(display_idx, &real_idx)| {
+                let request = &app.requests[real_idx];
+                let style = if display_idx == app.selected_request_index {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
@@ -956,7 +1047,6 @@ fn draw_requests_list(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::White)
                 };
 
-                // Format time to shorter format (just time, not date)
                 let time_part = request
                     .created_at
                     .split('T')
@@ -964,14 +1054,12 @@ fn draw_requests_list(frame: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or(&request.created_at);
                 let time_short = time_part.split('.').next().unwrap_or(time_part);
 
-                // Format content length to human readable
                 let size_str = if request.content_length > 1024 {
                     format!("{:.1}KB", request.content_length as f64 / 1024.0)
                 } else {
                     format!("{}B", request.content_length)
                 };
 
-                // Get method symbol and color
                 let (method_symbol, method_style) = match request.method.as_str() {
                     "GET" => ("🔽", style.fg(colors::INFO)),
                     "POST" => ("📝", style.fg(colors::SUCCESS)),
@@ -1013,11 +1101,11 @@ fn draw_requests_list(frame: &mut Frame, app: &App, area: Rect) {
         let requests_table = Table::new(
             rows,
             [
-                Constraint::Percentage(12), // Method (wider for symbols)
-                Constraint::Percentage(16), // Time
-                Constraint::Percentage(15), // From
-                Constraint::Percentage(8),  // Size
-                Constraint::Percentage(49), // Preview (adjusted)
+                Constraint::Percentage(12),
+                Constraint::Percentage(16),
+                Constraint::Percentage(15),
+                Constraint::Percentage(8),
+                Constraint::Percentage(49),
             ],
         )
         .header(headers)
@@ -1031,7 +1119,7 @@ fn draw_requests_list(frame: &mut Frame, app: &App, area: Rect) {
 
         let mut table_state = TableState::default();
         table_state.select(Some(app.selected_request_index));
-        frame.render_stateful_widget(requests_table, chunks[1], &mut table_state);
+        frame.render_stateful_widget(requests_table, table_area, &mut table_state);
     }
 }
 
@@ -1066,7 +1154,7 @@ fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
 
         // Tab content
         match app.current_tab {
-            0 => draw_info_tab(frame, request, chunks[1]),
+            0 => draw_info_tab(frame, app, request, chunks[1]),
             1 => draw_headers_tab(frame, app, request, chunks[1]),
             2 => draw_body_tab(frame, app, request, chunks[1]),
             _ => {}
@@ -1074,8 +1162,13 @@ fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_info_tab(frame: &mut Frame, request: &crate::models::WebhookRequest, area: Rect) {
-    let info_text = vec![
+fn draw_info_tab(
+    frame: &mut Frame,
+    app: &App,
+    request: &crate::models::WebhookRequest,
+    area: Rect,
+) {
+    let mut info_text = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -1142,6 +1235,32 @@ fn draw_info_tab(frame: &mut Frame, request: &crate::models::WebhookRequest, are
             Span::raw(&request.id),
         ]),
     ];
+
+    // Show last forward URL with replay hint
+    if !app.forward_url_input.is_empty() {
+        info_text.push(Line::from(""));
+        info_text.push(Line::from(vec![
+            Span::styled(
+                "Last Forward URL: ",
+                Style::default()
+                    .fg(colors::SECONDARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&app.forward_url_input, Style::default().fg(colors::PRIMARY)),
+            Span::styled(" (press r to replay)", Style::default().fg(colors::MUTED)),
+        ]));
+    }
+
+    // Show status message if present
+    if let Some((msg, _)) = &app.status_message {
+        info_text.push(Line::from(""));
+        info_text.push(Line::from(Span::styled(
+            msg.as_str(),
+            Style::default()
+                .fg(colors::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
 
     let info = Paragraph::new(info_text)
         .block(
@@ -1628,6 +1747,60 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(help, chunks[3]);
 }
 
+fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let popup_width = (area.width * percent_x / 100).max(1);
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, popup_width, height.min(area.height))
+}
+
+fn draw_export_menu(frame: &mut Frame, app: &App, area: Rect) {
+    // Draw the request detail as background
+    draw_request_detail(frame, app, area);
+
+    // Overlay the export popup
+    let popup_area = centered_rect(30, 7, area);
+
+    // Clear the popup area
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+
+    let menu_text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  1/c  ",
+                Style::default()
+                    .fg(colors::SECONDARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("cURL command", Style::default().fg(colors::TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  2/j  ",
+                Style::default()
+                    .fg(colors::SECONDARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("JSON export", Style::default().fg(colors::TEXT)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Esc  Cancel",
+            Style::default().fg(colors::MUTED),
+        )),
+    ];
+
+    let popup = Paragraph::new(menu_text).block(
+        Block::default()
+            .title(" Export Request ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::PRIMARY)),
+    );
+
+    frame.render_widget(popup, popup_area);
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1672,20 +1845,21 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "R: View Requests | B/Esc: Back | Q: Quit",
         ),
         AppState::ShowRequests => {
-            let total_requests = app.requests.len();
-            let current_req = if total_requests > 0 {
+            let filtered = crate::app::App::filter_requests(&app.requests, &app.search_query);
+            let total_filtered = filtered.len();
+            let current_req = if total_filtered > 0 {
                 app.selected_request_index + 1
             } else {
                 0
             };
             (
-                format!("📨 Requests ({}/{})", current_req, total_requests),
-                "↑/↓: Navigate | Enter: Details | ←/→: Pages | B/Esc: Back | Q: Quit",
+                format!("📨 Requests ({}/{})", current_req, total_filtered),
+                "↑/↓: Navigate | Enter: Details | /: Search | ←/→: Pages | B/Esc: Back | Q: Quit",
             )
         }
         AppState::ShowRequestDetail => (
             "📄 Request Details".to_string(),
-            "Tab/←→: Switch Tabs | ↑/↓: Scroll | F: Forward | B/Esc: Back | Q: Quit",
+            "Tab/←→: Tabs | ↑/↓: Scroll | F: Forward | R: Replay | E: Export | B/Esc: Back | Q: Quit",
         ),
         AppState::InputForwardUrl => (
             "🚀 Forward Request".to_string(),
@@ -1697,18 +1871,22 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             (format!("{} Forwarding...", spinner), "Please wait")
         }
         AppState::ForwardResult => ("✅ Forward Result".to_string(), "B/Esc: Back | Q: Quit"),
+        AppState::ExportMenu => (
+            "📤 Export Request".to_string(),
+            "1/c: cURL | 2/j: JSON | Esc: Cancel",
+        ),
         AppState::Listening => {
             let total_requests = app.listening_requests.len();
             (
                 format!("🎧 Listening ({})", total_requests),
-                "↑/↓: Navigate | Enter: Details | Q: Quit",
+                "↑/↓: Navigate | Enter: Details | /: Search | Q: Quit",
             )
         }
         AppState::Tunneling => {
             let total_requests = app.tunnel_requests.len();
             (
                 format!("🌐 Tunnel ({})", total_requests),
-                "↑/↓/j/k: Scroll | PgUp/PgDn: Page | Home/End | Q: Quit",
+                "↑/↓/j/k: Scroll | PgUp/PgDn: Page | C: Copy URL | Q: Quit",
             )
         }
         AppState::Error { .. } => (

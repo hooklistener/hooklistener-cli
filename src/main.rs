@@ -86,6 +86,11 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         keep: usize,
     },
+    /// Manage CLI configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Start HTTP tunnel to forward requests to local server
     Tunnel {
         /// Local port to forward requests to
@@ -103,6 +108,19 @@ enum Commands {
         /// Static tunnel slug (paid plans only, creates persistent subdomain)
         #[arg(short, long)]
         slug: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Display current configuration
+    Show,
+    /// Set a configuration value
+    Set {
+        /// Configuration key (selected_organization_id)
+        key: String,
+        /// New value
+        value: String,
     },
 }
 
@@ -257,6 +275,58 @@ async fn main() -> Result<()> {
             println!("Cleaning up old log files, keeping {} most recent", keep);
             // This is handled automatically by the logger initialization
         }
+        Commands::Config { action } => match action {
+            ConfigAction::Show => {
+                let config = config::Config::load()?;
+                let config_path = config::Config::config_path()?;
+                println!("Config file: {}", config_path.display());
+                println!();
+                match &config.access_token {
+                    Some(token) => {
+                        let truncated = if token.len() > 8 {
+                            format!("{}...", &token[..8])
+                        } else {
+                            token.clone()
+                        };
+                        let status = if config.is_token_valid() {
+                            "valid"
+                        } else {
+                            "expired"
+                        };
+                        println!("Token: {} ({})", truncated, status);
+                    }
+                    None => println!("Token: (none)"),
+                }
+                match &config.selected_organization_id {
+                    Some(org_id) => println!("Organization: {}", org_id),
+                    None => println!("Organization: (none)"),
+                }
+            }
+            ConfigAction::Set { key, value } => match key.as_str() {
+                "selected_organization_id" => {
+                    let mut config = config::Config::load()?;
+                    if value == "none" {
+                        config.selected_organization_id = None;
+                        config.save()?;
+                        println!("Cleared selected_organization_id");
+                    } else {
+                        config.selected_organization_id = Some(value);
+                        config.save()?;
+                        println!(
+                            "Set selected_organization_id to {}",
+                            config.selected_organization_id.as_deref().unwrap()
+                        );
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "Unknown config key: {}. Available keys: selected_organization_id",
+                        key
+                    );
+                    std::process::exit(1);
+                }
+            },
+        },
         Commands::Tunnel {
             port,
             host,
