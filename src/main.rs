@@ -23,7 +23,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::{sync::mpsc, time::sleep};
-use tracing::{debug, error, info};
+use tracing::error;
 
 use app::{App, AppState};
 use logger::{LogConfig, Logger};
@@ -58,9 +58,6 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Launch the interactive TUI to browse and replay requests
-    #[command(alias = "ui")]
-    Tui,
     /// Start WebSocket tunnel to forward webhooks to local server
     Listen {
         /// Debug endpoint slug to listen to
@@ -162,34 +159,6 @@ async fn main() -> Result<()> {
             let _logger = Logger::new(log_config)?;
             run_login_flow(force).await?;
         }
-        Commands::Tui => {
-            let log_config = LogConfig {
-                level: log_level.clone(),
-                output_to_stdout: log_stdout,
-                directory: log_dir
-                    .clone()
-                    .unwrap_or_else(|| LogConfig::default().directory),
-                ..Default::default()
-            };
-
-            let _logger = Logger::new(log_config)?;
-
-            info!("HookListener CLI starting");
-
-            let mut terminal = setup_terminal()?;
-            let mut app = App::new()?;
-
-            let res = run_app(&mut terminal, &mut app, None).await;
-
-            restore_terminal(&mut terminal)?;
-
-            if let Err(err) = res {
-                error!(error = %err, "Application terminated with error");
-                display_error(&err);
-            } else {
-                info!("HookListener CLI terminated successfully");
-            }
-        }
         Commands::Listen {
             endpoint,
             target,
@@ -251,7 +220,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let res = run_app(&mut terminal, &mut app, Some(event_rx)).await;
+            let res = run_app(&mut terminal, &mut app, event_rx).await;
 
             restore_terminal(&mut terminal)?;
 
@@ -393,7 +362,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let res = run_app(&mut terminal, &mut app, Some(event_rx)).await;
+            let res = run_app(&mut terminal, &mut app, event_rx).await;
 
             restore_terminal(&mut terminal)?;
 
@@ -412,9 +381,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
 
     if config.is_token_valid() && !force_reauth {
         println!("✅ You're already authenticated.");
-        println!(
-            "Run `hooklistener listen <endpoint>` to start forwarding webhooks or `hooklistener` to open the TUI."
-        );
+        println!("Run `hooklistener listen <endpoint>` to start forwarding webhooks.");
         println!("Use `hooklistener login --force` if you need to re-authenticate.");
         return Ok(());
     }
@@ -445,9 +412,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
                 config.set_access_token(access_token, expires_at);
                 config.save()?;
                 println!("✅ Authentication successful!");
-                println!(
-                    "Run `hooklistener listen <endpoint>` to forward webhooks or `hooklistener` to browse them."
-                );
+                println!("Run `hooklistener listen <endpoint>` to forward webhooks.");
                 break;
             }
             Ok(None) => {
@@ -494,24 +459,10 @@ fn device_portal_url() -> String {
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    mut tunnel_rx: Option<mpsc::Receiver<TunnelEvent>>,
+    mut tunnel_rx: mpsc::Receiver<TunnelEvent>,
 ) -> Result<()> {
     // Ensure proper terminal cleanup on any exit
     let _cleanup = TerminalCleanup;
-
-    // Handle initial states
-    match app.state {
-        AppState::InitiatingDeviceFlow => {
-            app.initiate_device_flow().await?;
-        }
-        AppState::Loading => {
-            // Only load organizations if we are NOT in listening mode
-            if !matches!(app.state, AppState::Listening) {
-                app.load_organizations().await?;
-            }
-        }
-        _ => {}
-    }
 
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
@@ -523,214 +474,134 @@ async fn run_app<B: ratatui::backend::Backend>(
             break;
         }
 
-        // Handle tunnel events if receiver is present
-        if let Some(rx) = &mut tunnel_rx {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    TunnelEvent::Connecting => {
-                        // Update UI to show connecting state
-                    }
-                    TunnelEvent::Connected => {
-                        app.listening_connected = true;
-                        app.listening_error = None;
-                        app.tunnel_connected = true;
-                        app.tunnel_connected_at = Some(std::time::Instant::now());
-                    }
-                    TunnelEvent::TunnelEstablished {
-                        subdomain,
-                        tunnel_id,
-                        is_static,
-                    } => {
-                        app.tunnel_subdomain = Some(subdomain);
-                        app.tunnel_id = Some(tunnel_id);
-                        app.tunnel_is_static = is_static;
-                        app.tunnel_connected = true;
-                        app.tunnel_connected_at = Some(std::time::Instant::now());
-                    }
-                    TunnelEvent::ConnectionError(err) => {
-                        app.listening_connected = false;
-                        app.listening_error = Some(err.clone());
-                        app.tunnel_connected = false;
-                        app.tunnel_error = Some(err);
-                    }
-                    TunnelEvent::Disconnected => {
-                        app.listening_connected = false;
-                        app.tunnel_connected = false;
-                    }
-                    TunnelEvent::WebhookReceived(request) => {
-                        app.listening_requests.push(*request);
-                        app.listening_stats.total_requests += 1;
-                    }
-                    TunnelEvent::RequestReceived {
+        // Handle tunnel events
+        while let Ok(event) = tunnel_rx.try_recv() {
+            match event {
+                TunnelEvent::Connecting => {
+                    // Update UI to show connecting state
+                }
+                TunnelEvent::Connected => {
+                    app.listening_connected = true;
+                    app.listening_error = None;
+                    app.tunnel_connected = true;
+                    app.tunnel_connected_at = Some(std::time::Instant::now());
+                }
+                TunnelEvent::TunnelEstablished {
+                    subdomain,
+                    tunnel_id,
+                    is_static,
+                } => {
+                    app.tunnel_subdomain = Some(subdomain);
+                    app.tunnel_id = Some(tunnel_id);
+                    app.tunnel_is_static = is_static;
+                    app.tunnel_connected = true;
+                    app.tunnel_connected_at = Some(std::time::Instant::now());
+                }
+                TunnelEvent::ConnectionError(err) => {
+                    app.listening_connected = false;
+                    app.listening_error = Some(err.clone());
+                    app.tunnel_connected = false;
+                    app.tunnel_error = Some(err);
+                }
+                TunnelEvent::Disconnected => {
+                    app.listening_connected = false;
+                    app.tunnel_connected = false;
+                }
+                TunnelEvent::WebhookReceived(request) => {
+                    app.listening_requests.push(*request);
+                    app.listening_stats.total_requests += 1;
+                }
+                TunnelEvent::RequestReceived {
+                    request_id,
+                    method,
+                    path,
+                } => {
+                    use std::time::Instant;
+                    let tunnel_request = app::TunnelRequest {
                         request_id,
                         method,
                         path,
-                    } => {
-                        use std::time::Instant;
-                        let tunnel_request = app::TunnelRequest {
-                            request_id,
-                            method,
-                            path,
-                            received_at: Instant::now(),
-                            status: None,
-                            completed_at: None,
-                            error: None,
-                        };
-                        app.tunnel_requests.push(tunnel_request);
-                        app.tunnel_stats.total += 1;
+                        received_at: Instant::now(),
+                        status: None,
+                        completed_at: None,
+                        error: None,
+                    };
+                    app.tunnel_requests.push(tunnel_request);
+                    app.tunnel_stats.total += 1;
+                }
+                TunnelEvent::RequestForwarded {
+                    request_id,
+                    status,
+                    duration_ms,
+                } => {
+                    // Update the request in the list
+                    if let Some(req) = app
+                        .tunnel_requests
+                        .iter_mut()
+                        .find(|r| r.request_id == request_id)
+                    {
+                        req.status = Some(status);
+                        req.completed_at = Some(std::time::Instant::now());
                     }
-                    TunnelEvent::RequestForwarded {
-                        request_id,
-                        status,
-                        duration_ms,
-                    } => {
-                        // Update the request in the list
-                        if let Some(req) = app
-                            .tunnel_requests
-                            .iter_mut()
-                            .find(|r| r.request_id == request_id)
-                        {
-                            req.status = Some(status);
-                            req.completed_at = Some(std::time::Instant::now());
-                        }
-                        app.tunnel_stats.success += 1;
-                        app.tunnel_stats.total_duration_ms += duration_ms;
+                    app.tunnel_stats.success += 1;
+                    app.tunnel_stats.total_duration_ms += duration_ms;
+                }
+                TunnelEvent::RequestFailed { request_id, error } => {
+                    // Update the request in the list
+                    if let Some(req) = app
+                        .tunnel_requests
+                        .iter_mut()
+                        .find(|r| r.request_id == request_id)
+                    {
+                        req.error = Some(error);
+                        req.completed_at = Some(std::time::Instant::now());
                     }
-                    TunnelEvent::RequestFailed { request_id, error } => {
-                        // Update the request in the list
-                        if let Some(req) = app
-                            .tunnel_requests
-                            .iter_mut()
-                            .find(|r| r.request_id == request_id)
-                        {
-                            req.error = Some(error);
-                            req.completed_at = Some(std::time::Instant::now());
-                        }
-                        app.tunnel_stats.failed += 1;
-                    }
-                    TunnelEvent::ForwardSuccess => {
-                        app.listening_stats.successful_forwards += 1;
-                    }
-                    TunnelEvent::ForwardError => {
-                        app.listening_stats.failed_forwards += 1;
-                    }
-                    TunnelEvent::Reconnecting {
-                        attempt,
-                        max_attempts,
-                        next_retry_in_secs,
-                    } => {
-                        let msg = format!(
-                            "Reconnecting (attempt {}/{})... next retry in {}s",
-                            attempt, max_attempts, next_retry_in_secs
-                        );
-                        app.listening_connected = false;
-                        app.listening_error = Some(msg.clone());
-                        app.tunnel_connected = false;
-                        app.tunnel_error = Some(msg);
-                    }
-                    TunnelEvent::ReconnectFailed { reason } => {
-                        let msg = format!("Connection lost: {}", reason);
-                        app.listening_connected = false;
-                        app.listening_error = Some(msg.clone());
-                        app.tunnel_connected = false;
-                        app.tunnel_error = Some(msg);
-                    }
+                    app.tunnel_stats.failed += 1;
+                }
+                TunnelEvent::ForwardSuccess => {
+                    app.listening_stats.successful_forwards += 1;
+                }
+                TunnelEvent::ForwardError => {
+                    app.listening_stats.failed_forwards += 1;
+                }
+                TunnelEvent::Reconnecting {
+                    attempt,
+                    max_attempts,
+                    next_retry_in_secs,
+                } => {
+                    let msg = format!(
+                        "Reconnecting (attempt {}/{})... next retry in {}s",
+                        attempt, max_attempts, next_retry_in_secs
+                    );
+                    app.listening_connected = false;
+                    app.listening_error = Some(msg.clone());
+                    app.tunnel_connected = false;
+                    app.tunnel_error = Some(msg);
+                }
+                TunnelEvent::ReconnectFailed { reason } => {
+                    let msg = format!("Connection lost: {}", reason);
+                    app.listening_connected = false;
+                    app.listening_error = Some(msg.clone());
+                    app.tunnel_connected = false;
+                    app.tunnel_error = Some(msg);
                 }
             }
         }
 
-        // Handle non-blocking authentication polling
-        if matches!(app.state, AppState::DisplayingDeviceCode) {
-            app.poll_device_authentication().await?;
-        }
-
         // Handle async states that don't require user input
-        match app.state {
-            AppState::ForwardingRequest => {
-                app.forward_request().await?;
-                continue;
-            }
-            AppState::Loading if app.just_authenticated => {
-                // Automatically load organizations after successful authentication
-                app.just_authenticated = false;
-                app.load_organizations().await?;
-                continue;
-            }
-            AppState::DisplayingDeviceCode => {
-                // This state will transition to Loading automatically after successful auth
-            }
-            _ => {}
+        if matches!(app.state, AppState::ForwardingRequest) {
+            app.forward_request().await?;
+            continue;
         }
 
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            let prev_state = format!("{:?}", app.state);
             app.handle_key_event(key)?;
 
-            crate::log_state_transition!(prev_state, app.state, "user_key_event");
-
-            match app.state {
-                AppState::InitiatingDeviceFlow => {
-                    app.initiate_device_flow().await?;
-                }
-                AppState::Loading => {
-                    debug!(
-                        prev_state = %prev_state,
-                        current_state = ?app.state,
-                        "Handling Loading state"
-                    );
-                    match prev_state.as_str() {
-                        "ShowOrganizations" => {
-                            debug!("Calling select_organization");
-                            app.select_organization().await?;
-                        }
-                        "ShowEndpoints" => {
-                            if let Some(endpoint_id) = app.get_selected_endpoint_id() {
-                                debug!(endpoint_id = %endpoint_id, "Loading endpoint detail");
-                                app.load_endpoint_detail(&endpoint_id).await?;
-                            }
-                        }
-                        "ShowEndpointDetail" => {
-                            if let Some(endpoint_id) =
-                                app.selected_endpoint.as_ref().map(|e| e.id.clone())
-                            {
-                                debug!(endpoint_id = %endpoint_id, "Loading requests");
-                                app.load_requests(&endpoint_id).await?;
-                            }
-                        }
-                        "ShowRequests" => {
-                            if let Some(endpoint_id) =
-                                app.selected_endpoint.as_ref().map(|e| e.id.clone())
-                            {
-                                if let Some(request_id) = app
-                                    .requests
-                                    .get(app.selected_request_index)
-                                    .map(|r| r.id.clone())
-                                {
-                                    debug!(
-                                        endpoint_id = %endpoint_id,
-                                        request_id = %request_id,
-                                        "Loading request details"
-                                    );
-                                    app.load_request_details(&endpoint_id, &request_id).await?;
-                                } else {
-                                    debug!(endpoint_id = %endpoint_id, "Reloading requests");
-                                    app.load_requests(&endpoint_id).await?;
-                                }
-                            }
-                        }
-                        _ => {
-                            debug!("Loading state default case, calling load_organizations");
-                            app.load_organizations().await?;
-                        }
-                    }
-                }
-                AppState::ForwardingRequest => {
-                    app.forward_request().await?;
-                }
-                _ => {}
+            if matches!(app.state, AppState::ForwardingRequest) {
+                app.forward_request().await?;
             }
         }
     }

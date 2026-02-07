@@ -261,11 +261,6 @@ impl Logger {
     }
 }
 
-// Request ID generator for correlation
-pub fn generate_request_id() -> String {
-    Uuid::new_v4().to_string()[..8].to_string()
-}
-
 // Macros for structured logging with automatic context
 #[macro_export]
 macro_rules! log_api_request {

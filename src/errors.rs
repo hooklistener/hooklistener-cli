@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("Unauthorized: your token is invalid or expired")]
@@ -43,19 +44,6 @@ impl ApiError {
             ApiError::ParseError(_) => None,
             ApiError::Other(_) => None,
         }
-    }
-}
-
-pub fn classify_http_error(status: u16, resource: &str) -> ApiError {
-    match status {
-        401 => ApiError::Unauthorized,
-        403 => ApiError::Forbidden,
-        404 => ApiError::NotFound {
-            resource: resource.to_string(),
-        },
-        429 => ApiError::RateLimited,
-        500..=599 => ApiError::ServerError { status },
-        _ => ApiError::Other(format!("HTTP {}", status)),
     }
 }
 

@@ -72,10 +72,12 @@ impl Config {
         self.token_expires_at = None;
     }
 
+    #[cfg(test)]
     pub fn set_selected_organization(&mut self, organization_id: String) {
         self.selected_organization_id = Some(organization_id);
     }
 
+    #[cfg(test)]
     pub fn clear_all(&mut self) {
         self.access_token = None;
         self.token_expires_at = None;
