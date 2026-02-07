@@ -1,8 +1,20 @@
 use ratatui::{
-    prelude::*,
-    style::{Color, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
+
+// Pastel colors matching the UI palette
+mod colors {
+    use ratatui::style::Color;
+
+    pub const STRUCTURE: Color = Color::Rgb(250, 179, 135); // Peach — braces, brackets
+    pub const KEY: Color = Color::Rgb(137, 180, 250); // Soft blue — JSON keys
+    pub const STRING: Color = Color::Rgb(166, 227, 161); // Soft mint — string values
+    pub const NUMBER: Color = Color::Rgb(203, 166, 247); // Soft mauve — numbers
+    pub const KEYWORD: Color = Color::Rgb(148, 226, 213); // Teal — true/false/null
+    pub const PUNCTUATION: Color = Color::Rgb(127, 132, 156); // Muted — commas
+    pub const TEXT: Color = Color::Rgb(205, 214, 244); // Soft white — colons, whitespace
+}
 
 pub struct JsonHighlighter;
 
@@ -34,7 +46,7 @@ impl JsonHighlighter {
                     current_line.push(Span::styled(
                         ch.to_string(),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(colors::STRUCTURE)
                             .add_modifier(Modifier::BOLD),
                     ));
                     i += 1;
@@ -43,7 +55,7 @@ impl JsonHighlighter {
                 ':' => {
                     current_line.push(Span::styled(
                         ch.to_string(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(colors::TEXT),
                     ));
                     i += 1;
                 }
@@ -51,7 +63,7 @@ impl JsonHighlighter {
                 ',' => {
                     current_line.push(Span::styled(
                         ch.to_string(),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(colors::PUNCTUATION),
                     ));
                     i += 1;
                 }
@@ -62,10 +74,10 @@ impl JsonHighlighter {
 
                     let style = if is_key {
                         Style::default()
-                            .fg(Color::Blue)
+                            .fg(colors::KEY)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Green)
+                        Style::default().fg(colors::STRING)
                     };
 
                     current_line.push(Span::styled(string_span, style));
@@ -76,7 +88,7 @@ impl JsonHighlighter {
                     let (number_span, new_i) = Self::parse_number(&chars, i);
                     current_line.push(Span::styled(
                         number_span,
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(colors::NUMBER),
                     ));
                     i = new_i;
                 }
@@ -86,14 +98,14 @@ impl JsonHighlighter {
                         current_line.push(Span::styled(
                             keyword,
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(colors::KEYWORD)
                                 .add_modifier(Modifier::BOLD),
                         ));
                         i = new_i;
                     } else {
                         current_line.push(Span::styled(
                             ch.to_string(),
-                            Style::default().fg(Color::White),
+                            Style::default().fg(colors::TEXT),
                         ));
                         i += 1;
                     }
@@ -108,7 +120,7 @@ impl JsonHighlighter {
                 _ => {
                     current_line.push(Span::styled(
                         ch.to_string(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(colors::TEXT),
                     ));
                     i += 1;
                 }
@@ -223,7 +235,7 @@ impl JsonHighlighter {
             .map(|line| {
                 Line::from(Span::styled(
                     line.to_string(),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(colors::TEXT),
                 ))
             })
             .collect()

@@ -7,20 +7,21 @@ use ratatui::{
     },
 };
 
-// Color scheme constants for consistency
+// Pastel color palette — soft, pleasant, modern
 mod colors {
     use ratatui::style::Color;
 
-    pub const PRIMARY: Color = Color::Cyan; // Main UI elements, borders
-    pub const SECONDARY: Color = Color::Yellow; // Highlights, selected items
-    pub const SUCCESS: Color = Color::Green; // Success states, POST
-    pub const ERROR: Color = Color::Red; // Error states, DELETE
-    pub const WARNING: Color = Color::Yellow; // Warning states, PUT
-    pub const INFO: Color = Color::Blue; // Info states, GET
-    pub const MUTED: Color = Color::Gray; // Secondary text, timestamps
-    pub const TEXT: Color = Color::White; // Primary text
-    pub const ACCENT: Color = Color::Magenta; // Special highlights, PATCH
-    pub const BACKGROUND: Color = Color::DarkGray; // Status bar background
+    pub const PRIMARY: Color = Color::Rgb(137, 180, 250); // Soft blue — borders, main accent
+    pub const SECONDARY: Color = Color::Rgb(250, 179, 135); // Warm peach — highlights, selected
+    pub const SUCCESS: Color = Color::Rgb(166, 227, 161); // Soft mint — success, POST
+    pub const ERROR: Color = Color::Rgb(243, 139, 168); // Soft rose — errors, DELETE
+    pub const WARNING: Color = Color::Rgb(249, 226, 175); // Pastel amber — warnings, PUT
+    pub const INFO: Color = Color::Rgb(116, 199, 236); // Sky blue — info, GET
+    pub const MUTED: Color = Color::Rgb(127, 132, 156); // Muted lavender — secondary text
+    pub const TEXT: Color = Color::Rgb(205, 214, 244); // Soft white — primary text
+    pub const ACCENT: Color = Color::Rgb(203, 166, 247); // Soft mauve — PATCH, specials
+    pub const BACKGROUND: Color = Color::Rgb(49, 50, 68); // Dark surface — status bar
+    pub const SURFACE: Color = Color::Rgb(69, 71, 90); // Raised surface — row highlights
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -320,7 +321,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(colors::PRIMARY)),
         )
-        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .row_highlight_style(Style::default().bg(colors::SURFACE))
         .highlight_symbol("> ");
 
         let mut table_state = TableState::default();
@@ -666,11 +667,15 @@ fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
             .collect();
 
         let tabs = Tabs::new(tab_titles)
-            .block(Block::default().borders(Borders::ALL))
-            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(colors::MUTED)),
+            )
+            .style(Style::default().fg(colors::TEXT))
             .highlight_style(
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(colors::SECONDARY)
                     .add_modifier(Modifier::BOLD),
             )
             .select(app.current_tab);
@@ -699,13 +704,13 @@ fn draw_info_tab(
             Span::styled(
                 "Method: ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 &request.method,
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(colors::SUCCESS)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -714,50 +719,53 @@ fn draw_info_tab(
             Span::styled(
                 "URL: ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(&request.url),
+            Span::styled(&request.url, Style::default().fg(colors::TEXT)),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(
                 "Remote IP: ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(&request.remote_addr),
+            Span::styled(&request.remote_addr, Style::default().fg(colors::TEXT)),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(
                 "Timestamp: ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(&request.created_at),
+            Span::styled(&request.created_at, Style::default().fg(colors::TEXT)),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(
                 "Content Length: ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(request.content_length.to_string()),
+            Span::styled(
+                request.content_length.to_string(),
+                Style::default().fg(colors::TEXT),
+            ),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(
                 "Request ID: ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(&request.id),
+            Span::styled(&request.id, Style::default().fg(colors::MUTED)),
         ]),
     ];
 
@@ -792,7 +800,7 @@ fn draw_info_tab(
             Block::default()
                 .title(" Request Information ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(colors::PRIMARY)),
         )
         .wrap(Wrap { trim: true });
 
@@ -819,10 +827,10 @@ fn draw_headers_tab(
                 Span::styled(
                     format!("{}: ", key),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(value.as_str()),
+                Span::styled(value.as_str(), Style::default().fg(colors::TEXT)),
             ]))
         })
         .collect();
@@ -842,7 +850,7 @@ fn draw_headers_tab(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(colors::SECONDARY)),
     );
 
     frame.render_widget(headers_list, area);
@@ -909,32 +917,32 @@ fn draw_body_tab(
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green)),
+                    .border_style(Style::default().fg(colors::SUCCESS)),
             );
 
             frame.render_widget(body, area);
         } else {
             let body = Paragraph::new("(empty body)")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(colors::MUTED))
                 .alignment(Alignment::Center)
                 .block(
                     Block::default()
                         .title(" Body ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Gray)),
+                        .border_style(Style::default().fg(colors::MUTED)),
                 );
 
             frame.render_widget(body, area);
         }
     } else {
         let body = Paragraph::new("(no body)")
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(colors::MUTED))
             .alignment(Alignment::Center)
             .block(
                 Block::default()
                     .title(" Body ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Gray)),
+                    .border_style(Style::default().fg(colors::MUTED)),
             );
 
         frame.render_widget(body, area);
@@ -949,7 +957,9 @@ fn draw_error(frame: &mut Frame, error_msg: &str, hint: Option<&str>, area: Rect
 
     let mut lines = vec![Line::from(Span::styled(
         error_msg,
-        Style::default().fg(Color::Red),
+        Style::default()
+            .fg(colors::ERROR)
+            .add_modifier(Modifier::BOLD),
     ))];
 
     if let Some(hint_text) = hint {
@@ -967,7 +977,7 @@ fn draw_error(frame: &mut Frame, error_msg: &str, hint: Option<&str>, area: Rect
             Block::default()
                 .title(" Error ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .border_style(Style::default().fg(colors::ERROR)),
         );
 
     frame.render_widget(error, chunks[0]);
@@ -975,9 +985,11 @@ fn draw_error(frame: &mut Frame, error_msg: &str, hint: Option<&str>, area: Rect
     let help_text = vec![Line::from(vec![
         Span::styled(
             "q/Esc",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors::ERROR)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(": Quit"),
+        Span::styled(": Quit", Style::default().fg(colors::TEXT)),
     ])];
 
     let help = Paragraph::new(help_text)
@@ -1003,19 +1015,24 @@ fn draw_forward_url_input(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 "Forwarding Request: ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(&request.method, Style::default().fg(Color::Green)),
-            Span::raw(" from "),
-            Span::styled(&request.remote_addr, Style::default().fg(Color::Yellow)),
+            Span::styled(
+                &request.method,
+                Style::default()
+                    .fg(colors::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" from ", Style::default().fg(colors::TEXT)),
+            Span::styled(&request.remote_addr, Style::default().fg(colors::SECONDARY)),
         ])];
 
         let info = Paragraph::new(request_info).block(
             Block::default()
                 .title(" Request to Forward ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(colors::PRIMARY)),
         );
 
         frame.render_widget(info, chunks[0]);
@@ -1027,14 +1044,14 @@ fn draw_forward_url_input(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(
             if app.is_valid_url(&app.forward_url_input) || app.forward_url_input.is_empty() {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(colors::SECONDARY)
             } else {
-                Style::default().fg(Color::Red)
+                Style::default().fg(colors::ERROR)
             },
         );
 
     let input = Paragraph::new(app.forward_url_input.as_str())
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(colors::TEXT))
         .block(input_block);
 
     frame.render_widget(input, chunks[1]);
@@ -1046,22 +1063,24 @@ fn draw_forward_url_input(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 "Enter",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(colors::SUCCESS)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(": Forward | "),
+            Span::styled(": Forward | ", Style::default().fg(colors::TEXT)),
             Span::styled(
                 "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(colors::ERROR)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(": Cancel"),
+            Span::styled(": Cancel", Style::default().fg(colors::TEXT)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::raw("Example: "),
+            Span::styled("Example: ", Style::default().fg(colors::MUTED)),
             Span::styled(
                 "https://your-server.com/webhook",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(colors::PRIMARY),
             ),
         ]),
     ];
@@ -1082,14 +1101,14 @@ fn draw_forwarding(frame: &mut Frame, app: &App, area: Rect) {
     let forwarding = Paragraph::new(forwarding_text)
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(colors::WARNING)
                 .add_modifier(Modifier::BOLD),
         )
         .alignment(Alignment::Center)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(colors::WARNING)),
         );
 
     frame.render_widget(forwarding, area);
@@ -1109,9 +1128,9 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(result) = &app.forward_result {
         // Status and timing info
         let status_color = if result.success {
-            Color::Green
+            colors::SUCCESS
         } else {
-            Color::Red
+            colors::ERROR
         };
         let status_text = if result.success {
             format!(
@@ -1131,7 +1150,7 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     "Status: ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -1146,10 +1165,10 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     "Target: ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(&result.target_url, Style::default().fg(Color::Yellow)),
+                Span::styled(&result.target_url, Style::default().fg(colors::SECONDARY)),
             ]),
         ];
 
@@ -1175,8 +1194,12 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
                         value.clone()
                     };
                     Row::new(vec![
-                        Cell::from(key.clone()).style(Style::default().fg(Color::Cyan)),
-                        Cell::from(value_display),
+                        Cell::from(key.clone()).style(
+                            Style::default()
+                                .fg(colors::PRIMARY)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Cell::from(value_display).style(Style::default().fg(colors::TEXT)),
                     ])
                 })
                 .collect();
@@ -1189,7 +1212,7 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
                 Block::default()
                     .title(" Response Headers ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green)),
+                    .border_style(Style::default().fg(colors::SUCCESS)),
             );
 
             frame.render_widget(headers_table, chunks[1]);
@@ -1197,13 +1220,13 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
             // Show error message
             let error_text = result.error_message.as_deref().unwrap_or("Unknown error");
             let error = Paragraph::new(error_text)
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(colors::ERROR))
                 .wrap(Wrap { trim: true })
                 .block(
                     Block::default()
                         .title(" Error Details ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Red)),
+                        .border_style(Style::default().fg(colors::ERROR)),
                 );
 
             frame.render_widget(error, chunks[1]);
@@ -1226,11 +1249,12 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
         };
 
         let body = Paragraph::new(body_text)
+            .style(Style::default().fg(colors::TEXT))
             .block(
                 Block::default()
                     .title(" Response Body ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green)),
+                    .border_style(Style::default().fg(colors::SUCCESS)),
             )
             .wrap(Wrap { trim: true });
 
@@ -1242,15 +1266,17 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             "b/Esc",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(colors::WARNING)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(": Back | "),
+        Span::styled(": Back | ", Style::default().fg(colors::TEXT)),
         Span::styled(
             "q",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors::ERROR)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(": Quit"),
+        Span::styled(": Quit", Style::default().fg(colors::TEXT)),
     ])])
     .alignment(Alignment::Center)
     .block(Block::default().borders(Borders::TOP));
