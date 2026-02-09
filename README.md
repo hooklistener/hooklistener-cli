@@ -3,6 +3,8 @@
 [![CI](https://github.com/hooklistener/hooklistener-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hooklistener/hooklistener-cli/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/hooklistener/hooklistener-cli/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/hooklistener/hooklistener-cli/actions/workflows/codeql.yml)
 [![Release](https://img.shields.io/github/v/release/hooklistener/hooklistener-cli?sort=semver)](https://github.com/hooklistener/hooklistener-cli/releases)
+[![crates.io](https://img.shields.io/crates/v/hooklistener-cli.svg)](https://crates.io/crates/hooklistener-cli)
+[![npm](https://img.shields.io/npm/v/hooklistener.svg)](https://www.npmjs.com/package/hooklistener)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers using [Hooklistener](https://hooklistener.com). Built with Rust and Ratatui for a smooth, responsive TUI experience.
@@ -27,6 +29,18 @@ A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposin
 ```bash
 brew tap hooklistener/tap
 brew install hooklistener
+```
+
+### npm
+
+```bash
+npm install -g hooklistener
+```
+
+### Cargo
+
+```bash
+cargo install hooklistener-cli
 ```
 
 ### Quick Install Script

@@ -1,0 +1,26 @@
+{
+  "name": "hooklistener",
+  "version": "0.0.0",
+  "description": "A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hooklistener/hooklistener-cli.git"
+  },
+  "homepage": "https://hooklistener.com",
+  "bin": {
+    "hooklistener": "bin/hooklistener.js"
+  },
+  "files": [
+    "bin/hooklistener.js"
+  ],
+  "optionalDependencies": {
+    "@hooklistener/hooklistener-linux-x64": "0.0.0",
+    "@hooklistener/hooklistener-darwin-x64": "0.0.0",
+    "@hooklistener/hooklistener-darwin-arm64": "0.0.0",
+    "@hooklistener/hooklistener-win32-x64": "0.0.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

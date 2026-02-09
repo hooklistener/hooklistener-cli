@@ -2,6 +2,20 @@
 name = "hooklistener-cli"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers"
+license = "MIT"
+repository = "https://github.com/hooklistener/hooklistener-cli"
+homepage = "https://hooklistener.com"
+readme = "README.md"
+keywords = ["webhook", "cli", "tunnel", "tui", "hooklistener"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
+exclude = [
+    ".github/",
+    "docs/",
+    "npm/",
+    "scripts/",
+    "tests/",
+]
 
 [dependencies]
 ratatui = "^0.29.0"
