@@ -164,7 +164,7 @@ main() {
     VERSION=$(get_latest_version)
     info "Latest version: $VERSION"
 
-    ARCHIVE_NAME="hooklistener-cli-${PLATFORM}.tar.gz"
+    ARCHIVE_NAME="hooklistener-${PLATFORM}.tar.gz"
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE_NAME}"
     CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS.txt"
 
@@ -203,8 +203,8 @@ main() {
     # Create install directory if it doesn't exist
     $NEED_SUDO mkdir -p "$INSTALL_DIR"
 
-    # Install the binary with the shorter name
-    $NEED_SUDO cp "${TMP_DIR}/hooklistener-cli" "${INSTALL_DIR}/${BINARY_NAME}"
+    # Install the binary with the expected command name
+    $NEED_SUDO cp "${TMP_DIR}/hooklistener" "${INSTALL_DIR}/${BINARY_NAME}"
     $NEED_SUDO chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 
     # Verify installation
@@ -217,7 +217,7 @@ main() {
         printf "\n"
         printf "${BOLD}Get started:${NC}\n"
         printf "  hooklistener login    # Authenticate with your account\n"
-        printf "  hooklistener tui      # Launch the terminal UI to browse webhooks\n"
+        printf "  hooklistener listen <endpoint-slug>  # Forward and inspect endpoint webhooks\n"
         printf "  hooklistener tunnel   # Expose your local server to the internet\n"
         printf "  hooklistener --help   # View all commands\n"
         printf "\n"

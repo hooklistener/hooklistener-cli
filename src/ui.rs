@@ -1378,7 +1378,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             let total_requests = app.tunnel_requests.len();
             (
                 format!("🌐 Tunnel ({})", total_requests),
-                "↑/↓/j/k: Scroll | PgUp/PgDn: Page | C: Copy URL | Q: Quit",
+                "↑/↓/j/k: Scroll | PgUp/PgDn: Page | C: Copy URL | R: Reconnect | Q: Quit",
             )
         }
         AppState::Error { .. } => ("❌ Error".to_string(), "Q/Esc: Quit"),
@@ -1412,7 +1412,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else {
         Span::styled(
-            "🔴 No API Key",
+            "🔴 Not Authenticated",
             Style::default()
                 .fg(colors::ERROR)
                 .add_modifier(Modifier::BOLD),

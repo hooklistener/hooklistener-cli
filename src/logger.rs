@@ -48,7 +48,7 @@ impl Logger {
         fs::create_dir_all(&config.directory)?;
 
         // Clean up old log files
-        Self::cleanup_old_logs(&config.directory, config.max_log_files)?;
+        let _ = Self::cleanup_old_logs(&config.directory, config.max_log_files)?;
 
         let log_file_path = config.directory.join(format!(
             "hooklistener-{}.log",
@@ -116,7 +116,7 @@ impl Logger {
         &self.session_id
     }
 
-    fn cleanup_old_logs(log_dir: &Path, max_files: usize) -> Result<()> {
+    pub fn cleanup_old_logs(log_dir: &Path, max_files: usize) -> Result<usize> {
         let entries = fs::read_dir(log_dir)?;
         let mut log_files: Vec<_> = entries
             .filter_map(|entry| {
@@ -138,6 +138,7 @@ impl Logger {
         log_files.sort_by(|a, b| b.1.cmp(&a.1));
 
         // Remove old files if we have too many
+        let mut removed_count = 0;
         if log_files.len() > max_files {
             for (path, _) in log_files.into_iter().skip(max_files) {
                 if let Err(e) = fs::remove_file(&path) {
@@ -147,6 +148,7 @@ impl Logger {
                         "Failed to remove old log file"
                     );
                 } else {
+                    removed_count += 1;
                     info!(
                         file = %path.display(),
                         "Removed old log file"
@@ -155,7 +157,7 @@ impl Logger {
             }
         }
 
-        Ok(())
+        Ok(removed_count)
     }
 
     pub fn create_diagnostic_bundle(&self, bundle_path: &Path) -> Result<()> {

@@ -85,6 +85,7 @@ pub struct App {
     pub tunnel_error: Option<String>,
     pub tunnel_requested_slug: Option<String>,
     pub tunnel_is_static: bool,
+    pub tunnel_reconnect_requested: bool,
 
     // Status messages (auto-expire)
     pub tunnel_status_message: Option<(String, std::time::Instant)>,
@@ -133,6 +134,7 @@ impl App {
             tunnel_error: None,
             tunnel_requested_slug: None,
             tunnel_is_static: false,
+            tunnel_reconnect_requested: false,
             tunnel_status_message: None,
             status_message: None,
             search_active: false,
@@ -426,7 +428,14 @@ impl App {
                     }
                 }
                 KeyCode::Char('r') => {
-                    // TODO: Implement reconnection logic
+                    self.tunnel_reconnect_requested = true;
+                    self.tunnel_connected = false;
+                    self.tunnel_connected_at = None;
+                    self.tunnel_error = Some("Manual reconnect requested...".to_string());
+                    self.tunnel_status_message = Some((
+                        "Restarting tunnel connection...".into(),
+                        std::time::Instant::now(),
+                    ));
                 }
                 _ => {}
             },
@@ -532,13 +541,8 @@ impl App {
     }
 
     pub async fn forward_request(&mut self) -> Result<()> {
-        if let (Some(request), Some(access_token)) =
-            (&self.selected_request, &self.config.access_token)
-        {
-            let client = ApiClient::with_organization(
-                access_token.clone(),
-                self.config.selected_organization_id.clone(),
-            );
+        if let Some(request) = &self.selected_request {
+            let client = ApiClient::for_forwarding();
 
             match client
                 .forward_request(request, &self.forward_url_input)
@@ -641,6 +645,10 @@ impl App {
         {
             self.status_message = None;
         }
+    }
+
+    pub fn take_tunnel_reconnect_request(&mut self) -> bool {
+        std::mem::take(&mut self.tunnel_reconnect_requested)
     }
 }
 
@@ -789,6 +797,15 @@ mod tests {
         let mut app = make_app_with_state(AppState::Tunneling);
         app.handle_key_event(key_event(KeyCode::Char('q'))).unwrap();
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_r_from_tunneling_requests_reconnect() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
+        assert!(app.take_tunnel_reconnect_request());
+        assert!(app.tunnel_status_message.is_some());
+        assert!(app.tunnel_error.is_some());
     }
 
     #[test]

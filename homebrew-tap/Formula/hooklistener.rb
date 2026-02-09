@@ -9,25 +9,25 @@ class Hooklistener < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-cli-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-aarch64-apple-darwin.tar.gz"
       sha256 "PLACEHOLDER_ARM64_SHA256"
     end
 
     on_intel do
-      url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-cli-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-x86_64-apple-darwin.tar.gz"
       sha256 "PLACEHOLDER_X86_64_SHA256"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-cli-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "PLACEHOLDER_LINUX_SHA256"
     end
   end
 
   def install
-    bin.install "hooklistener-cli" => "hooklistener"
+    bin.install "hooklistener"
   end
 
   test do

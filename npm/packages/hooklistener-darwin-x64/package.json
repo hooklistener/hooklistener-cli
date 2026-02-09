@@ -10,6 +10,6 @@
   "os": ["darwin"],
   "cpu": ["x64"],
   "files": [
-    "bin/hooklistener-cli"
+    "bin/hooklistener"
   ]
 }

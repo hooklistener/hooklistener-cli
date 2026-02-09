@@ -105,7 +105,7 @@ function Install-HooklistenerCli {
     Write-Info "Latest version: $Version"
 
     # Archive name for Windows
-    $ArchiveName = "hooklistener-cli.exe-x86_64-pc-windows-msvc.zip"
+    $ArchiveName = "hooklistener.exe-x86_64-pc-windows-msvc.zip"
     $DownloadUrl = "https://github.com/$Repo/releases/download/$Version/$ArchiveName"
     $ChecksumsUrl = "https://github.com/$Repo/releases/download/$Version/SHA256SUMS.txt"
 
@@ -143,9 +143,9 @@ function Install-HooklistenerCli {
             New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
         }
 
-        # Copy binary (rename from hooklistener-cli.exe to hooklistener.exe)
+        # Copy binary
         Write-Info "Installing to $InstallDir..."
-        $SourceBinary = Join-Path $ExtractDir "hooklistener-cli.exe"
+        $SourceBinary = Join-Path $ExtractDir "hooklistener.exe"
         $DestBinary = Join-Path $InstallDir $BinaryName
         Copy-Item -Path $SourceBinary -Destination $DestBinary -Force
 
@@ -162,7 +162,7 @@ function Install-HooklistenerCli {
             Write-Host ""
             Write-Host "Get started:" -ForegroundColor White
             Write-Host "  hooklistener login    # Authenticate with your account"
-            Write-Host "  hooklistener tui      # Launch the terminal UI to browse webhooks"
+            Write-Host "  hooklistener listen <endpoint-slug>  # Forward and inspect endpoint webhooks"
             Write-Host "  hooklistener tunnel   # Expose your local server to the internet"
             Write-Host "  hooklistener --help   # View all commands"
             Write-Host ""

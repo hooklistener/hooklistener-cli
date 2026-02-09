@@ -102,7 +102,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hooklistener-cli-${{ matrix.target }}
+          name: hooklistener-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/hooklistener-cli*
+            target/${{ matrix.target }}/release/hooklistener*
           if-no-files-found: error

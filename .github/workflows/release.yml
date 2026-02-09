@@ -46,7 +46,7 @@ jobs:
       - name: Package binary
         shell: bash
         run: |
-          binary_name="hooklistener-cli"
+          binary_name="hooklistener"
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
             binary_name="${binary_name}.exe"
           fi
@@ -126,22 +126,22 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             platform: linux-x64
             npm-pkg: hooklistener-linux-x64
-            binary: hooklistener-cli
+            binary: hooklistener
             archive: tar.gz
           - target: x86_64-apple-darwin
             platform: darwin-x64
             npm-pkg: hooklistener-darwin-x64
-            binary: hooklistener-cli
+            binary: hooklistener
             archive: tar.gz
           - target: aarch64-apple-darwin
             platform: darwin-arm64
             npm-pkg: hooklistener-darwin-arm64
-            binary: hooklistener-cli
+            binary: hooklistener
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             platform: win32-x64
             npm-pkg: hooklistener-win32-x64
-            binary: hooklistener-cli.exe
+            binary: hooklistener.exe
             archive: zip
     steps:
       - name: Checkout
@@ -160,7 +160,7 @@ jobs:
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             unzip -j "dist/${{ matrix.binary }}-${{ matrix.target }}.zip" -d "npm/packages/${{ matrix.npm-pkg }}/bin/"
           else
-            tar -xzf "dist/hooklistener-cli-${{ matrix.target }}.tar.gz" -C "npm/packages/${{ matrix.npm-pkg }}/bin/"
+            tar -xzf "dist/hooklistener-${{ matrix.target }}.tar.gz" -C "npm/packages/${{ matrix.npm-pkg }}/bin/"
           fi
           chmod +x "npm/packages/${{ matrix.npm-pkg }}/bin/${{ matrix.binary }}" || true
 
@@ -209,6 +209,7 @@ jobs:
         run: npm/scripts/publish-npm.sh "${{ steps.version.outputs.version }}"
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   update-homebrew:
     name: Update Homebrew Formula

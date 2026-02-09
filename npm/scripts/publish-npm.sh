@@ -15,8 +15,10 @@ NPM_DIR="${ROOT}/npm/packages"
 
 echo "Publishing hooklistener npm packages v${VERSION}"
 
-# Configure npm auth
-echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+# Configure npm auth (fallback if NODE_AUTH_TOKEN not set by setup-node)
+if [[ -n "${NPM_TOKEN:-}" ]]; then
+  echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "${HOME}/.npmrc"
+fi
 
 # Update version in all package.json files
 for pkg_dir in \

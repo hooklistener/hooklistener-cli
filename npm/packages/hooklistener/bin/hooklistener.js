@@ -26,7 +26,7 @@ if (!pkg) {
 let binPath;
 try {
   const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
-  const binName = process.platform === "win32" ? "hooklistener-cli.exe" : "hooklistener-cli";
+  const binName = process.platform === "win32" ? "hooklistener.exe" : "hooklistener";
   binPath = path.join(pkgDir, "bin", binName);
 } catch {
   console.error(

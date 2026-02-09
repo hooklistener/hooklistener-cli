@@ -2,12 +2,13 @@
 name = "hooklistener-cli"
 version = "0.1.0"
 edition = "2024"
+autobins = false
 description = "A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers"
 license = "MIT"
 repository = "https://github.com/hooklistener/hooklistener-cli"
 homepage = "https://hooklistener.com"
 readme = "README.md"
-keywords = ["webhook", "cli", "tunnel", "tui", "hooklistener"]
+keywords = ["webhook", "cli", "tunnel", "hooklistener"]
 categories = ["command-line-utilities", "development-tools", "web-programming"]
 exclude = [
     ".github/",
@@ -33,6 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "ansi", "chrono"] }
 tracing-appender = "0.2"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 base64 = "0.22"
 thiserror = "2.0"
@@ -41,6 +43,10 @@ arboard = "3.4"
 [dev-dependencies]
 mockito = "1.7"
 tempfile = "3.15"
+
+[[bin]]
+name = "hooklistener"
+path = "src/main.rs"
 
 [workspace.metadata.dist]
 # Configuration for cargo-dist release automation

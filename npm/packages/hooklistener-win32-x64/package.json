@@ -10,6 +10,6 @@
   "os": ["win32"],
   "cpu": ["x64"],
   "files": [
-    "bin/hooklistener-cli.exe"
+    "bin/hooklistener.exe"
   ]
 }

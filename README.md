@@ -7,14 +7,14 @@
 [![npm](https://img.shields.io/npm/v/hooklistener.svg)](https://www.npmjs.com/package/hooklistener)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers using [Hooklistener](https://hooklistener.com). Built with Rust and Ratatui for a smooth, responsive TUI experience.
+A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers using [Hooklistener](https://hooklistener.com). Built with Rust for a responsive interactive terminal experience.
 
 ![Hooklistener CLI Demo](docs/images/hooklistener-cli.gif)
 
 ## Features
 
 - 🚀 **Fast & Lightweight** - Built in Rust for maximum performance
-- 🖥️ **Terminal UI** - Browse requests with a keyboard-driven interface
+- 🖥️ **Interactive Terminal Experience** - Browse requests with keyboard shortcuts
 - 🔄 **Real-time Forwarding** - Stream webhook requests from existing endpoints to your local server
 - 🚇 **HTTP Tunneling** - Expose your local server to the internet with a public URL (like ngrok)
 - 🔍 **Search & Filter** - Quickly find specific requests
@@ -67,7 +67,7 @@ After downloading, move the binary to your PATH:
 
 ```bash
 # macOS/Linux
-sudo mv hooklistener-cli /usr/local/bin/hooklistener
+sudo mv hooklistener /usr/local/bin/hooklistener
 ```
 
 Now you can run `hooklistener` from anywhere.
@@ -82,8 +82,7 @@ Now you can run `hooklistener` from anywhere.
    Follow the on-screen instructions to authorize the device.
 
 3. **Choose your mode**:
-   - **Browse Webhooks**: Run `hooklistener` (or `hooklistener tui`) to view requests.
-   - **Forward Webhooks**: Run `hooklistener listen <endpoint-slug>` to forward events from an existing endpoint.
+   - **Forward & Inspect Webhooks**: Run `hooklistener listen <endpoint-slug>` to forward events from an existing endpoint.
    - **Expose Local Server**: Run `hooklistener tunnel` to get a public URL for your local app.
 
 ## Usage
@@ -92,37 +91,32 @@ Now you can run `hooklistener` from anywhere.
 Authenticate securely via the device flow. This is required for all operations.
 
 ```bash
-# Authenticate (opens browser if needed)
+# Authenticate
 hooklistener login
 
 # Force re-authentication
 hooklistener login --force
+
+# Log out
+hooklistener logout
 ```
 
-### Browsing Webhooks (TUI)
-Launch the interactive Terminal User Interface to browse, search, and inspect webhook requests.
+### Organization Selection
+Most API-backed commands use a selected organization. Set it once and reuse it.
 
 ```bash
-# Launch TUI (default command)
-hooklistener tui
-# or simply
-hooklistener
+# List organizations available to your account
+hooklistener org list
+
+# Set default organization for commands that require one
+hooklistener org use <organization-id>
+
+# Clear default organization
+hooklistener org clear
 ```
 
-**Keyboard Shortcuts:**
-| Key | Action |
-|-----|--------|
-| `↑`/`k` | Move up |
-| `↓`/`j` | Move down |
-| `Enter` | View request details |
-| `/` | Search requests |
-| `f` | Toggle filters |
-| `r` | Refresh |
-| `q` | Quit |
-| `?` | Show help |
-
 ### Forwarding Webhooks (`listen`)
-Use this when you have an **existing Hooklistener Endpoint** and want to debug webhooks locally. It forwards requests sent to that endpoint to your localhost.
+Use this when you have an **existing Hooklistener Endpoint** and want to debug webhooks locally. It forwards requests sent to that endpoint to your localhost and shows live request details in the terminal.
 
 ```bash
 # Forward webhooks from 'my-endpoint' to http://localhost:3000 (default)
@@ -130,6 +124,32 @@ hooklistener listen my-endpoint
 
 # Forward to a custom local URL
 hooklistener listen my-endpoint --target http://localhost:8080
+```
+
+### Endpoint Discovery (`endpoint`)
+Manage endpoints and captured requests from the CLI.
+
+```bash
+# Create/list/show/delete endpoints
+hooklistener endpoint create "Billing Webhooks" --slug billing-webhooks
+hooklistener endpoint list
+hooklistener endpoint show <endpoint-id>
+hooklistener endpoint delete <endpoint-id>
+
+# Override organization for a single command
+hooklistener endpoint list --org <organization-id>
+
+# List captured requests for an endpoint
+hooklistener endpoint requests <endpoint-id> --page 1 --page-size 50
+
+# Show/delete a single request
+hooklistener endpoint request <endpoint-id> <request-id>
+hooklistener endpoint delete-request <endpoint-id> <request-id>
+
+# Replay and inspect replay attempts
+hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhook
+hooklistener endpoint forwards <endpoint-id> <request-id>
+hooklistener endpoint forward <forward-id>
 ```
 
 ### Exposing Local Server (`tunnel`)
@@ -149,6 +169,20 @@ hooklistener tunnel --host 127.0.0.1 --port 5000
 hooklistener tunnel --slug my-cool-app
 ```
 
+### Static Tunnel Slugs (`static-tunnel`)
+Manage reserved static slugs used by `hooklistener tunnel --slug`.
+
+```bash
+# List static tunnel slugs
+hooklistener static-tunnel list
+
+# Create a static slug
+hooklistener static-tunnel create my-cool-app --name "Local App"
+
+# Delete a static slug by ID
+hooklistener static-tunnel delete <slug-id>
+```
+
 ### Maintenance & Diagnostics
 
 ```bash
@@ -160,6 +194,18 @@ hooklistener clean-logs --keep 5
 
 # Show help
 hooklistener --help
+```
+
+### Automation & Completions
+
+```bash
+# Machine-readable output for non-interactive commands
+hooklistener --json org list
+hooklistener --json endpoint list
+
+# Generate shell completions
+hooklistener completions bash > ~/.local/share/bash-completion/completions/hooklistener
+hooklistener completions zsh > ~/.zfunc/_hooklistener
 ```
 
 ## Configuration
@@ -187,7 +233,7 @@ git clone https://github.com/hooklistener/hooklistener-cli.git
 cd hooklistener-cli
 
 # Run locally
-cargo run -- tui
+cargo run -- listen my-endpoint
 
 # Build release
 cargo build --release
