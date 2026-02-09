@@ -141,22 +141,3 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  update-homebrew:
-    name: Update Homebrew Formula
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Get version from tag
-        id: version
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Version: ${VERSION}"
-
-      - name: Trigger Homebrew tap update
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          repository: hooklistener/homebrew-tap
-          event-type: new-release
-          client-payload: '{"version": "${{ steps.version.outputs.version }}"}'
