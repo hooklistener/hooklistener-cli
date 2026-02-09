@@ -4,47 +4,24 @@
 
 const { execFileSync } = require("child_process");
 const path = require("path");
+const fs = require("fs");
 
-const PLATFORMS = {
-  "linux-x64": "@hooklistener/hooklistener-linux-x64",
-  "darwin-x64": "@hooklistener/hooklistener-darwin-x64",
-  "darwin-arm64": "@hooklistener/hooklistener-darwin-arm64",
-  "win32-x64": "@hooklistener/hooklistener-win32-x64",
-};
+const BIN_NAME = process.platform === "win32" ? "hooklistener.exe" : "hooklistener";
+const BIN_PATH = path.join(__dirname, "..", "native", BIN_NAME);
 
-const platformKey = `${process.platform}-${process.arch}`;
-const pkg = PLATFORMS[platformKey];
-
-if (!pkg) {
+if (!fs.existsSync(BIN_PATH)) {
   console.error(
-    `Unsupported platform: ${process.platform}-${process.arch}\n` +
-    `hooklistener currently supports: ${Object.keys(PLATFORMS).join(", ")}`
+    `hooklistener binary not found at ${BIN_PATH}\n\n` +
+      `This usually means the postinstall script failed to download the binary.\n` +
+      `Try reinstalling:\n\n` +
+      `  npm install -g hooklistener\n\n` +
+      `Or set HOOKLISTENER_BINARY_PATH to a pre-downloaded binary and reinstall.`
   );
   process.exit(1);
 }
 
-let binPath;
 try {
-  const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
-  const binName = process.platform === "win32" ? "hooklistener.exe" : "hooklistener";
-  binPath = path.join(pkgDir, "bin", binName);
-} catch {
-  console.error(
-    `The package ${pkg} could not be found. This usually means the optional\n` +
-    `dependency was not installed. Try reinstalling with:\n\n` +
-    `  npm install -g hooklistener\n`
-  );
-  process.exit(1);
-}
-
-const args = process.argv.slice(2);
-
-try {
-  const result = execFileSync(binPath, args, {
-    stdio: "inherit",
-    windowsHide: false,
-  });
-  process.exit(0);
+  execFileSync(BIN_PATH, process.argv.slice(2), { stdio: "inherit" });
 } catch (err) {
   if (err.status !== null) {
     process.exit(err.status);

@@ -6,56 +6,25 @@ set -euo pipefail
 #
 # Expects:
 #   - NPM_TOKEN environment variable to be set
-#   - Platform binaries already placed in each package's bin/ directory
 #   - Working directory is the repository root
 
 VERSION="${1:?Usage: publish-npm.sh <version>}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-NPM_DIR="${ROOT}/npm/packages"
+PKG_DIR="${ROOT}/npm/packages/hooklistener"
 
-echo "Publishing hooklistener npm packages v${VERSION}"
+echo "Publishing hooklistener npm package v${VERSION}"
 
 # Configure npm auth (fallback if NODE_AUTH_TOKEN not set by setup-node)
 if [[ -n "${NPM_TOKEN:-}" ]]; then
   echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "${HOME}/.npmrc"
 fi
 
-# Update version in all package.json files
-for pkg_dir in \
-  "${NPM_DIR}/hooklistener-linux-x64" \
-  "${NPM_DIR}/hooklistener-darwin-x64" \
-  "${NPM_DIR}/hooklistener-darwin-arm64" \
-  "${NPM_DIR}/hooklistener-win32-x64"; do
+# Update version in package.json
+jq --arg v "${VERSION}" '.version = $v' "${PKG_DIR}/package.json" > "${PKG_DIR}/package.json.tmp"
+mv "${PKG_DIR}/package.json.tmp" "${PKG_DIR}/package.json"
 
-  pkg_name="$(jq -r .name "${pkg_dir}/package.json")"
-  echo "Setting ${pkg_name} to v${VERSION}"
-
-  jq --arg v "${VERSION}" '.version = $v' "${pkg_dir}/package.json" > "${pkg_dir}/package.json.tmp"
-  mv "${pkg_dir}/package.json.tmp" "${pkg_dir}/package.json"
-done
-
-# Update main package version + optionalDependencies versions
-MAIN_DIR="${NPM_DIR}/hooklistener"
-jq --arg v "${VERSION}" '
-  .version = $v |
-  .optionalDependencies |= with_entries(.value = $v)
-' "${MAIN_DIR}/package.json" > "${MAIN_DIR}/package.json.tmp"
-mv "${MAIN_DIR}/package.json.tmp" "${MAIN_DIR}/package.json"
-
-# Publish platform packages first
-for pkg_dir in \
-  "${NPM_DIR}/hooklistener-linux-x64" \
-  "${NPM_DIR}/hooklistener-darwin-x64" \
-  "${NPM_DIR}/hooklistener-darwin-arm64" \
-  "${NPM_DIR}/hooklistener-win32-x64"; do
-
-  pkg_name="$(jq -r .name "${pkg_dir}/package.json")"
-  echo "Publishing ${pkg_name}@${VERSION}..."
-  npm publish "${pkg_dir}" --access public
-done
-
-# Publish main package
+# Publish
 echo "Publishing hooklistener@${VERSION}..."
-npm publish "${MAIN_DIR}" --access public
+npm publish "${PKG_DIR}" --access public
 
-echo "All npm packages published successfully!"
+echo "npm package published successfully!"

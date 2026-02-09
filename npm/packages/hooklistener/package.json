@@ -11,15 +11,13 @@
   "bin": {
     "hooklistener": "bin/hooklistener.js"
   },
-  "files": [
-    "bin/hooklistener.js"
-  ],
-  "optionalDependencies": {
-    "@hooklistener/hooklistener-linux-x64": "0.0.0",
-    "@hooklistener/hooklistener-darwin-x64": "0.0.0",
-    "@hooklistener/hooklistener-darwin-arm64": "0.0.0",
-    "@hooklistener/hooklistener-win32-x64": "0.0.0"
+  "scripts": {
+    "postinstall": "node scripts/install.js"
   },
+  "files": [
+    "bin/hooklistener.js",
+    "scripts/install.js"
+  ],
   "engines": {
     "node": ">=16"
   }
