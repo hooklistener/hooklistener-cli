@@ -1465,6 +1465,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                     request_id,
                     method,
                     path,
+                    headers,
+                    body,
+                    query_string,
                 } => {
                     use std::time::Instant;
                     let tunnel_request = app::TunnelRequest {
@@ -1475,14 +1478,29 @@ async fn run_app<B: ratatui::backend::Backend>(
                         status: None,
                         completed_at: None,
                         error: None,
+                        headers,
+                        body: app::truncate_body(body),
+                        query_string,
+                        response_headers: None,
+                        response_body: None,
                     };
-                    app.tunnel_requests.push(tunnel_request);
+                    app.tunnel_requests.push_back(tunnel_request);
+                    if app.tunnel_requests.len() > app::MAX_TUNNEL_REQUESTS {
+                        app.tunnel_requests.pop_front();
+                        // Clamp selected index if it now exceeds the new length
+                        if !app.tunnel_requests.is_empty() {
+                            app.tunnel_selected_index =
+                                app.tunnel_selected_index.min(app.tunnel_requests.len() - 1);
+                        }
+                    }
                     app.tunnel_stats.total += 1;
                 }
                 TunnelEvent::RequestForwarded {
                     request_id,
                     status,
                     duration_ms,
+                    response_headers,
+                    response_body,
                 } => {
                     // Update the request in the list
                     if let Some(req) = app
@@ -1492,6 +1510,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     {
                         req.status = Some(status);
                         req.completed_at = Some(std::time::Instant::now());
+                        req.response_headers = Some(response_headers);
+                        req.response_body = app::truncate_body(response_body);
                     }
                     app.tunnel_stats.success += 1;
                     app.tunnel_stats.total_duration_ms += duration_ms;

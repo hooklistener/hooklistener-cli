@@ -22,6 +22,19 @@ mod colors {
     pub const ACCENT: Color = Color::Rgb(203, 166, 247); // Soft mauve — PATCH, specials
     pub const BACKGROUND: Color = Color::Rgb(49, 50, 68); // Dark surface — status bar
     pub const SURFACE: Color = Color::Rgb(69, 71, 90); // Raised surface — row highlights
+
+    /// Map an HTTP status code to an appropriate color.
+    pub fn for_http_status(status: u16) -> Color {
+        if (200..300).contains(&status) {
+            SUCCESS
+        } else if (400..500).contains(&status) {
+            WARNING
+        } else if status >= 500 {
+            ERROR
+        } else {
+            INFO
+        }
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -535,15 +548,31 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
 
         frame.render_widget(no_requests, chunks[2]);
     } else {
-        // Calculate visible window
-        let available_rows = chunks[2].height.saturating_sub(3) as usize; // Subtract header and borders
-        let start_idx = app.tunnel_scroll_offset;
-        let end_idx = (start_idx + available_rows).min(app.tunnel_requests.len());
+        let available_rows = chunks[2].height.saturating_sub(4) as usize; // borders + header + header margin
+
+        if available_rows == 0 {
+            let compact = Paragraph::new("Expand terminal height to view requests")
+                .style(Style::default().fg(colors::MUTED))
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .title(format!(" Live Requests ({}) ", app.tunnel_requests.len()))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(colors::MUTED)),
+                );
+            frame.render_widget(compact, chunks[2]);
+            return;
+        }
 
         // Reverse to show newest first
-        let mut visible_requests: Vec<_> = app.tunnel_requests.iter().collect();
-        visible_requests.reverse();
-        let visible_requests = &visible_requests[start_idx..end_idx];
+        let reversed_requests: Vec<_> = app.tunnel_requests.iter().rev().collect();
+
+        // Keep the selected row inside the visible window.
+        let start_idx = app
+            .tunnel_selected_index
+            .saturating_sub(available_rows.saturating_sub(1));
+        let end_idx = (start_idx + available_rows).min(reversed_requests.len());
+        let visible_requests = &reversed_requests[start_idx..end_idx];
 
         let rows: Vec<Row> = visible_requests
             .iter()
@@ -572,16 +601,7 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
 
                 // Status display
                 let (status_display, status_color) = if let Some(status) = request.status {
-                    let color = if (200..300).contains(&status) {
-                        colors::SUCCESS
-                    } else if (400..500).contains(&status) {
-                        colors::WARNING
-                    } else if status >= 500 {
-                        colors::ERROR
-                    } else {
-                        colors::INFO
-                    };
-                    (status.to_string(), color)
+                    (status.to_string(), colors::for_http_status(status))
                 } else if request.error.is_some() {
                     ("Error".to_string(), colors::ERROR)
                 } else {
@@ -643,9 +663,17 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
                 .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(colors::PRIMARY)),
-        );
+        )
+        .row_highlight_style(Style::default().bg(colors::SURFACE))
+        .highlight_symbol("▸ ");
 
-        frame.render_widget(requests_table, chunks[2]);
+        let mut table_state = TableState::default();
+        // Selection within visible window
+        if app.tunnel_selected_index >= start_idx && app.tunnel_selected_index < end_idx {
+            table_state.select(Some(app.tunnel_selected_index - start_idx));
+        }
+
+        frame.render_stateful_widget(requests_table, chunks[2], &mut table_state);
     }
 }
 
@@ -659,12 +687,12 @@ fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     if let Some(request) = &app.selected_request {
-        // Tab titles
-        let tab_titles: Vec<Line> = ["Info", "Headers", "Body"]
-            .iter()
-            .cloned()
-            .map(Line::from)
-            .collect();
+        // Tab titles — include Response tab when tunnel response data is available
+        let mut titles = vec!["Info", "Headers", "Body"];
+        if app.selected_tunnel_response.is_some() {
+            titles.push("Response");
+        }
+        let tab_titles: Vec<Line> = titles.into_iter().map(Line::from).collect();
 
         let tabs = Tabs::new(tab_titles)
             .block(
@@ -687,6 +715,7 @@ fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
             0 => draw_info_tab(frame, app, request, chunks[1]),
             1 => draw_headers_tab(frame, app, request, chunks[1]),
             2 => draw_body_tab(frame, app, request, chunks[1]),
+            3 => draw_response_tab(frame, app, chunks[1]),
             _ => {}
         }
     }
@@ -813,7 +842,12 @@ fn draw_headers_tab(
     request: &crate::models::WebhookRequest,
     area: Rect,
 ) {
-    let headers: Vec<(&String, &String)> = request.headers.iter().collect();
+    let mut headers: Vec<(&String, &String)> = request.headers.iter().collect();
+    headers.sort_by(|(k1, _), (k2, _)| {
+        k1.to_ascii_lowercase()
+            .cmp(&k2.to_ascii_lowercase())
+            .then_with(|| k1.cmp(k2))
+    });
     let available_lines = area.height.saturating_sub(2) as usize;
 
     let start_line = app.headers_scroll_offset;
@@ -856,96 +890,267 @@ fn draw_headers_tab(
     frame.render_widget(headers_list, area);
 }
 
+/// Render an empty/missing body placeholder.
+fn render_empty_body(frame: &mut Frame, title: &str, message: &str, area: Rect) {
+    let widget = Paragraph::new(message)
+        .style(Style::default().fg(colors::MUTED))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::MUTED)),
+        );
+    frame.render_widget(widget, area);
+}
+
+/// Render a scrollable, syntax-highlighted body section.
+/// `title_prefix` is e.g. "Body" or "Response Body".
+/// `title_extra` is appended after the prefix (e.g. " JSON (Full)").
+fn render_highlighted_body(
+    frame: &mut Frame,
+    content: &str,
+    scroll_offset: usize,
+    title_prefix: &str,
+    title_extra: &str,
+    border_color: Color,
+    area: Rect,
+) {
+    let highlighted_lines = JsonHighlighter::highlight_json(content);
+    let available_lines = area.height.saturating_sub(2) as usize;
+
+    let start_line = scroll_offset;
+    let end_line = (start_line + available_lines).min(highlighted_lines.len());
+
+    let actual_start = if end_line <= highlighted_lines.len() {
+        start_line
+    } else {
+        highlighted_lines.len().saturating_sub(available_lines)
+    };
+    let actual_end = (actual_start + available_lines).min(highlighted_lines.len());
+
+    let visible_lines = highlighted_lines[actual_start..actual_end].to_vec();
+
+    let title = if highlighted_lines.len() > available_lines {
+        format!(
+            " {}{} (lines {}-{}/{}) ",
+            title_prefix,
+            title_extra,
+            actual_start + 1,
+            actual_end,
+            highlighted_lines.len()
+        )
+    } else {
+        format!(" {}{} ", title_prefix, title_extra)
+    };
+
+    let body = Paragraph::new(visible_lines).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color)),
+    );
+    frame.render_widget(body, area);
+}
+
 fn draw_body_tab(
     frame: &mut Frame,
     app: &App,
     request: &crate::models::WebhookRequest,
     area: Rect,
 ) {
-    // Use full body if available, otherwise fall back to preview
     let body_text = request.body.as_ref().or(request.body_preview.as_ref());
 
-    if let Some(body_content) = body_text {
-        if !body_content.is_empty() {
-            // Apply syntax highlighting to get formatted Lines
-            let highlighted_lines = JsonHighlighter::highlight_json(body_content);
+    let Some(body_content) = body_text else {
+        render_empty_body(frame, " Body ", "(no body)", area);
+        return;
+    };
 
-            // Account for borders (2 lines) and potential padding
-            let available_lines = area.height.saturating_sub(2) as usize;
+    if body_content.is_empty() {
+        render_empty_body(frame, " Body ", "(empty body)", area);
+        return;
+    }
 
-            let start_line = app.body_scroll_offset;
-            let end_line = (start_line + available_lines).min(highlighted_lines.len());
-
-            // Ensure we don't go past the available content
-            let actual_start = if end_line <= highlighted_lines.len() {
-                start_line
-            } else {
-                highlighted_lines.len().saturating_sub(available_lines)
-            };
-            let actual_end = (actual_start + available_lines).min(highlighted_lines.len());
-
-            let visible_lines = highlighted_lines[actual_start..actual_end].to_vec();
-
-            let title_suffix = if request.body.is_some() {
-                " (Full)"
-            } else {
-                " (Preview)"
-            };
-
-            // Detect if content is JSON for title indication
-            let content_type =
-                if body_content.trim().starts_with('{') || body_content.trim().starts_with('[') {
-                    " JSON"
-                } else {
-                    ""
-                };
-
-            let title = if highlighted_lines.len() > available_lines {
-                format!(
-                    " Body{}{} (lines {}-{}/{}) ",
-                    content_type,
-                    title_suffix,
-                    actual_start + 1,
-                    actual_end,
-                    highlighted_lines.len()
-                )
-            } else {
-                format!(" Body{}{} ", content_type, title_suffix)
-            };
-
-            let body = Paragraph::new(visible_lines).block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(colors::SUCCESS)),
-            );
-
-            frame.render_widget(body, area);
-        } else {
-            let body = Paragraph::new("(empty body)")
-                .style(Style::default().fg(colors::MUTED))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .title(" Body ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(colors::MUTED)),
-                );
-
-            frame.render_widget(body, area);
-        }
+    let source_suffix = if request.body.is_some() {
+        " (Full)"
     } else {
-        let body = Paragraph::new("(no body)")
+        " (Preview)"
+    };
+
+    let content_type =
+        if body_content.trim().starts_with('{') || body_content.trim().starts_with('[') {
+            " JSON"
+        } else {
+            ""
+        };
+
+    let title_extra = format!("{}{}", content_type, source_suffix);
+
+    render_highlighted_body(
+        frame,
+        body_content,
+        app.body_scroll_offset,
+        "Body",
+        &title_extra,
+        colors::SUCCESS,
+        area,
+    );
+}
+
+fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(resp) = &app.selected_tunnel_response else {
+        let empty = Paragraph::new("(no response data)")
             .style(Style::default().fg(colors::MUTED))
             .alignment(Alignment::Center)
             .block(
                 Block::default()
-                    .title(" Body ")
+                    .title(" Response ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(colors::MUTED)),
             );
+        frame.render_widget(empty, area);
+        return;
+    };
 
-        frame.render_widget(body, area);
+    // Three-section layout: status info, response headers, response body
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5), // Status info
+            Constraint::Length(8), // Response headers
+            Constraint::Min(0),    // Response body
+        ])
+        .split(area);
+
+    // Section 1: Status info
+    let status_color = resp
+        .status
+        .map(colors::for_http_status)
+        .unwrap_or(colors::MUTED);
+
+    let mut status_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Status: ",
+                Style::default()
+                    .fg(colors::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                resp.status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Pending".to_string()),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Duration: ",
+                Style::default()
+                    .fg(colors::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                resp.duration_ms
+                    .map(|d| format!("{}ms", d))
+                    .unwrap_or_else(|| "-".to_string()),
+                Style::default().fg(colors::TEXT),
+            ),
+        ]),
+    ];
+
+    if let Some(error) = &resp.error {
+        status_lines.push(Line::from(vec![
+            Span::styled(
+                "Error: ",
+                Style::default()
+                    .fg(colors::ERROR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(error.as_str(), Style::default().fg(colors::ERROR)),
+        ]));
+    }
+
+    let status_info = Paragraph::new(status_lines).block(
+        Block::default()
+            .title(" Response Status ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(status_color)),
+    );
+    frame.render_widget(status_info, chunks[0]);
+
+    // Section 2: Response headers
+    let mut headers: Vec<(&String, &String)> = resp.headers.iter().collect();
+    headers.sort_by(|(k1, _), (k2, _)| {
+        k1.to_ascii_lowercase()
+            .cmp(&k2.to_ascii_lowercase())
+            .then_with(|| k1.cmp(k2))
+    });
+    let available_header_lines = chunks[1].height.saturating_sub(2) as usize;
+    let max_header_scroll = headers.len().saturating_sub(available_header_lines.max(1));
+    let start_line = app.response_headers_scroll_offset.min(max_header_scroll);
+    let end_line = (start_line + available_header_lines).min(headers.len());
+    let visible_headers = &headers[start_line..end_line];
+
+    let header_items: Vec<ListItem> = visible_headers
+        .iter()
+        .map(|(key, value)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{}: ", key),
+                    Style::default()
+                        .fg(colors::PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(value.as_str(), Style::default().fg(colors::TEXT)),
+            ]))
+        })
+        .collect();
+
+    let headers_title = if headers.is_empty() {
+        " Response Headers (0) ".to_string()
+    } else if available_header_lines == 0 {
+        format!(" Response Headers (0/{}) ", headers.len())
+    } else if headers.len() > available_header_lines {
+        format!(
+            " Response Headers ({}-{}/{}) ",
+            start_line + 1,
+            end_line,
+            headers.len()
+        )
+    } else {
+        format!(" Response Headers ({}) ", headers.len())
+    };
+
+    let headers_list = List::new(header_items).block(
+        Block::default()
+            .title(headers_title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::SECONDARY)),
+    );
+    frame.render_widget(headers_list, chunks[1]);
+
+    // Section 3: Response body
+    match resp.body.as_deref() {
+        Some(body_content) if !body_content.is_empty() => {
+            render_highlighted_body(
+                frame,
+                body_content,
+                app.response_scroll_offset,
+                "Response Body",
+                "",
+                colors::SUCCESS,
+                chunks[2],
+            );
+        }
+        Some(_) => {
+            render_empty_body(frame, " Response Body ", "(empty response body)", chunks[2]);
+        }
+        None => {
+            render_empty_body(frame, " Response Body ", "(no response body)", chunks[2]);
+        }
     }
 }
 
@@ -1378,7 +1583,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             let total_requests = app.tunnel_requests.len();
             (
                 format!("🌐 Tunnel ({})", total_requests),
-                "↑/↓/j/k: Scroll | PgUp/PgDn: Page | C: Copy URL | R: Reconnect | Q: Quit",
+                "↑/↓: Navigate | Enter: Details | C: Copy URL | R: Reconnect | Q: Quit",
             )
         }
         AppState::Error { .. } => ("❌ Error".to_string(), "Q/Esc: Quit"),
