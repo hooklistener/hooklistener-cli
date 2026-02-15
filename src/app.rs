@@ -4,6 +4,10 @@ use crate::errors::ApiError;
 use crate::models::{ForwardResponse, WebhookRequest};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use std::collections::{HashMap, VecDeque};
+
+pub const MAX_TUNNEL_REQUESTS: usize = 500;
+pub const MAX_BODY_SIZE: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub enum AppState {
@@ -48,6 +52,76 @@ pub struct TunnelRequest {
     pub status: Option<u16>,
     pub completed_at: Option<std::time::Instant>,
     pub error: Option<String>,
+    pub headers: HashMap<String, String>,
+    pub body: Option<String>,
+    pub query_string: String,
+    pub response_headers: Option<HashMap<String, String>>,
+    pub response_body: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TunnelResponseData {
+    pub status: Option<u16>,
+    pub headers: HashMap<String, String>,
+    pub body: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DetailReturnTarget {
+    Listening,
+    Tunneling,
+}
+
+pub fn truncate_body(body: Option<String>) -> Option<String> {
+    body.map(|b| {
+        if b.len() > MAX_BODY_SIZE {
+            // Clamp to a valid UTF-8 boundary so truncation never panics.
+            let mut cutoff = MAX_BODY_SIZE.min(b.len());
+            while !b.is_char_boundary(cutoff) {
+                cutoff = cutoff.saturating_sub(1);
+            }
+
+            let mut truncated = b[..cutoff].to_string();
+            truncated.push_str("\n...(truncated)");
+            truncated
+        } else {
+            b
+        }
+    })
+}
+
+const VIEWPORT_LINES: usize = 20;
+
+fn parse_query_string(query_string: &str) -> HashMap<String, String> {
+    if query_string.is_empty() {
+        return HashMap::new();
+    }
+
+    let parse_target = format!("http://localhost/?{}", query_string);
+    if let Ok(url) = reqwest::Url::parse(&parse_target) {
+        url.query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    } else {
+        // Fallback to raw parsing if the query string is malformed.
+        query_string
+            .split('&')
+            .filter_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next()?.to_string();
+                let value = parts.next().unwrap_or_default().to_string();
+                Some((key, value))
+            })
+            .collect()
+    }
+}
+
+/// Compute the maximum scroll offset for a text body given a fixed viewport.
+fn max_body_scroll(text: &str) -> usize {
+    let line_count = text.lines().count();
+    line_count.saturating_sub(VIEWPORT_LINES)
 }
 
 pub struct App {
@@ -76,9 +150,13 @@ pub struct App {
     pub tunnel_id: Option<String>,
     pub tunnel_connected: bool,
     pub tunnel_connected_at: Option<std::time::Instant>,
-    pub tunnel_requests: Vec<TunnelRequest>,
+    pub tunnel_requests: VecDeque<TunnelRequest>,
     pub tunnel_stats: TunnelStats,
-    pub tunnel_scroll_offset: usize,
+    pub tunnel_selected_index: usize,
+    pub detail_return_state: Option<DetailReturnTarget>,
+    pub selected_tunnel_response: Option<TunnelResponseData>,
+    pub response_headers_scroll_offset: usize,
+    pub response_scroll_offset: usize,
     pub tunnel_local_host: String,
     pub tunnel_local_port: u16,
     pub tunnel_org_id: Option<String>,
@@ -125,9 +203,13 @@ impl App {
             tunnel_id: None,
             tunnel_connected: false,
             tunnel_connected_at: None,
-            tunnel_requests: Vec::new(),
+            tunnel_requests: VecDeque::new(),
             tunnel_stats: TunnelStats::default(),
-            tunnel_scroll_offset: 0,
+            tunnel_selected_index: 0,
+            detail_return_state: None,
+            selected_tunnel_response: None,
+            response_headers_scroll_offset: 0,
+            response_scroll_offset: 0,
             tunnel_local_host: String::from("localhost"),
             tunnel_local_port: 3000,
             tunnel_org_id: None,
@@ -140,6 +222,41 @@ impl App {
             search_active: false,
             search_query: String::new(),
         }
+    }
+
+    /// Number of tabs available in the request detail view.
+    /// Returns 4 when tunnel response data is present (Info, Headers, Body, Response),
+    /// otherwise 3 (Info, Headers, Body).
+    fn num_detail_tabs(&self) -> usize {
+        if self.selected_tunnel_response.is_some() {
+            4
+        } else {
+            3
+        }
+    }
+
+    /// Return the body text of the currently selected request (full body or preview).
+    fn selected_body_text(&self) -> Option<&str> {
+        self.selected_request
+            .as_ref()
+            .and_then(|r| r.body.as_deref().or(r.body_preview.as_deref()))
+    }
+
+    /// Return the response body text from the selected tunnel response.
+    fn response_body_text(&self) -> Option<&str> {
+        self.selected_tunnel_response
+            .as_ref()
+            .and_then(|r| r.body.as_deref())
+    }
+
+    /// Maximum scroll offset for response headers in the Response tab.
+    /// Use a conservative bound (`len - 1`) so tiny terminals can still
+    /// navigate to the final headers even when the rendered viewport shrinks.
+    fn max_response_headers_scroll(&self) -> usize {
+        self.selected_tunnel_response
+            .as_ref()
+            .map(|r| r.headers.len().saturating_sub(1))
+            .unwrap_or(0)
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
@@ -157,7 +274,14 @@ impl App {
                         self.current_tab = 0;
                         self.headers_scroll_offset = 0;
                         self.body_scroll_offset = 0;
-                        self.state = AppState::Listening;
+                        self.response_headers_scroll_offset = 0;
+                        self.response_scroll_offset = 0;
+                        self.selected_tunnel_response = None;
+                        self.state = match self.detail_return_state {
+                            Some(DetailReturnTarget::Tunneling) => AppState::Tunneling,
+                            _ => AppState::Listening,
+                        };
+                        self.detail_return_state = None;
                     }
                     KeyCode::Char('f') => {
                         self.forward_url_input.clear();
@@ -176,25 +300,16 @@ impl App {
                             self.state = AppState::ExportMenu;
                         }
                     }
-                    KeyCode::Tab => {
-                        self.current_tab = (self.current_tab + 1) % 3;
+                    KeyCode::Tab | KeyCode::Right => {
+                        self.current_tab = (self.current_tab + 1) % self.num_detail_tabs();
                     }
-                    KeyCode::BackTab => {
+                    KeyCode::BackTab | KeyCode::Left => {
+                        let num_tabs = self.num_detail_tabs();
                         self.current_tab = if self.current_tab == 0 {
-                            2
+                            num_tabs - 1
                         } else {
                             self.current_tab - 1
                         };
-                    }
-                    KeyCode::Left => {
-                        self.current_tab = if self.current_tab == 0 {
-                            2
-                        } else {
-                            self.current_tab - 1
-                        };
-                    }
-                    KeyCode::Right => {
-                        self.current_tab = (self.current_tab + 1) % 3;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         match self.current_tab {
@@ -210,40 +325,47 @@ impl App {
                                     self.body_scroll_offset -= 1;
                                 }
                             }
-                            _ => {} // Info tab - no scrolling
-                        }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        match self.current_tab {
-                            1 => {
-                                // Headers tab
-                                if let Some(request) = &self.selected_request {
-                                    let max_scroll = request.headers.len().saturating_sub(1);
-                                    if self.headers_scroll_offset < max_scroll {
-                                        self.headers_scroll_offset += 1;
-                                    }
-                                }
-                            }
-                            2 => {
-                                // Body tab
-                                if let Some(request) = &self.selected_request {
-                                    let body_text =
-                                        request.body.as_ref().or(request.body_preview.as_ref());
-                                    if let Some(body) = body_text {
-                                        let lines: Vec<&str> = body.lines().collect();
-                                        let viewport_lines = 20;
-                                        if lines.len() > viewport_lines {
-                                            let max_scroll = lines.len() - viewport_lines;
-                                            if self.body_scroll_offset < max_scroll {
-                                                self.body_scroll_offset += 1;
-                                            }
-                                        }
-                                    }
+                            3 => {
+                                // Response tab: body first, then headers
+                                if self.response_scroll_offset > 0 {
+                                    self.response_scroll_offset -= 1;
+                                } else if self.response_headers_scroll_offset > 0 {
+                                    self.response_headers_scroll_offset -= 1;
                                 }
                             }
                             _ => {} // Info tab - no scrolling
                         }
                     }
+                    KeyCode::Down | KeyCode::Char('j') => match self.current_tab {
+                        1 => {
+                            if let Some(request) = &self.selected_request {
+                                let max = request.headers.len().saturating_sub(1);
+                                if self.headers_scroll_offset < max {
+                                    self.headers_scroll_offset += 1;
+                                }
+                            }
+                        }
+                        2 => {
+                            if let Some(body) = self.selected_body_text() {
+                                let max = max_body_scroll(body);
+                                if self.body_scroll_offset < max {
+                                    self.body_scroll_offset += 1;
+                                }
+                            }
+                        }
+                        3 => {
+                            let headers_max = self.max_response_headers_scroll();
+                            if self.response_headers_scroll_offset < headers_max {
+                                self.response_headers_scroll_offset += 1;
+                            } else if let Some(body) = self.response_body_text() {
+                                let body_max = max_body_scroll(body);
+                                if self.response_scroll_offset < body_max {
+                                    self.response_scroll_offset += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                     KeyCode::PageUp => match self.current_tab {
                         1 => {
                             self.headers_scroll_offset =
@@ -252,29 +374,44 @@ impl App {
                         2 => {
                             self.body_scroll_offset = self.body_scroll_offset.saturating_sub(10);
                         }
+                        3 => {
+                            let take_from_body = self.response_scroll_offset.min(10);
+                            self.response_scroll_offset -= take_from_body;
+                            let remaining = 10 - take_from_body;
+                            self.response_headers_scroll_offset = self
+                                .response_headers_scroll_offset
+                                .saturating_sub(remaining);
+                        }
                         _ => {}
                     },
                     KeyCode::PageDown => match self.current_tab {
                         1 => {
                             if let Some(request) = &self.selected_request {
-                                let max_scroll = request.headers.len().saturating_sub(1);
+                                let max = request.headers.len().saturating_sub(1);
                                 self.headers_scroll_offset =
-                                    (self.headers_scroll_offset + 10).min(max_scroll);
+                                    (self.headers_scroll_offset + 10).min(max);
                             }
                         }
                         2 => {
-                            if let Some(request) = &self.selected_request {
-                                let body_text =
-                                    request.body.as_ref().or(request.body_preview.as_ref());
-                                if let Some(body) = body_text {
-                                    let lines: Vec<&str> = body.lines().collect();
-                                    let viewport_lines = 20;
-                                    if lines.len() > viewport_lines {
-                                        let max_scroll = lines.len() - viewport_lines;
-                                        self.body_scroll_offset =
-                                            (self.body_scroll_offset + 10).min(max_scroll);
-                                    }
-                                }
+                            if let Some(body) = self.selected_body_text() {
+                                let max = max_body_scroll(body);
+                                self.body_scroll_offset = (self.body_scroll_offset + 10).min(max);
+                            }
+                        }
+                        3 => {
+                            let headers_max = self.max_response_headers_scroll();
+                            let header_room =
+                                headers_max.saturating_sub(self.response_headers_scroll_offset);
+                            let to_headers = header_room.min(10);
+                            self.response_headers_scroll_offset += to_headers;
+
+                            let remaining = 10 - to_headers;
+                            if remaining > 0
+                                && let Some(body) = self.response_body_text()
+                            {
+                                let body_max = max_body_scroll(body);
+                                self.response_scroll_offset =
+                                    (self.response_scroll_offset + remaining).min(body_max);
                             }
                         }
                         _ => {}
@@ -282,6 +419,10 @@ impl App {
                     KeyCode::Home => match self.current_tab {
                         1 => self.headers_scroll_offset = 0,
                         2 => self.body_scroll_offset = 0,
+                        3 => {
+                            self.response_headers_scroll_offset = 0;
+                            self.response_scroll_offset = 0;
+                        }
                         _ => {}
                     },
                     KeyCode::End => match self.current_tab {
@@ -292,18 +433,17 @@ impl App {
                             }
                         }
                         2 => {
-                            if let Some(request) = &self.selected_request {
-                                let body_text =
-                                    request.body.as_ref().or(request.body_preview.as_ref());
-                                if let Some(body) = body_text {
-                                    let lines: Vec<&str> = body.lines().collect();
-                                    let viewport_lines = 20;
-                                    if lines.len() > viewport_lines {
-                                        self.body_scroll_offset = lines.len() - viewport_lines;
-                                    } else {
-                                        self.body_scroll_offset = 0;
-                                    }
-                                }
+                            if let Some(body) = self.selected_body_text() {
+                                self.body_scroll_offset = max_body_scroll(body);
+                            }
+                        }
+                        3 => {
+                            self.response_headers_scroll_offset =
+                                self.max_response_headers_scroll();
+                            if let Some(body) = self.response_body_text() {
+                                self.response_scroll_offset = max_body_scroll(body);
+                            } else {
+                                self.response_scroll_offset = 0;
                             }
                         }
                         _ => {}
@@ -372,6 +512,8 @@ impl App {
                                 self.current_tab = 0;
                                 self.headers_scroll_offset = 0;
                                 self.body_scroll_offset = 0;
+                                self.response_headers_scroll_offset = 0;
+                                self.detail_return_state = Some(DetailReturnTarget::Listening);
                                 self.state = AppState::ShowRequestDetail;
                             }
                         }
@@ -384,29 +526,82 @@ impl App {
                     self.should_quit = true;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if self.tunnel_scroll_offset > 0 {
-                        self.tunnel_scroll_offset -= 1;
+                    if self.tunnel_selected_index > 0 {
+                        self.tunnel_selected_index -= 1;
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let max_scroll = self.tunnel_requests.len().saturating_sub(10);
-                    if self.tunnel_scroll_offset < max_scroll {
-                        self.tunnel_scroll_offset += 1;
+                    if !self.tunnel_requests.is_empty()
+                        && self.tunnel_selected_index < self.tunnel_requests.len() - 1
+                    {
+                        self.tunnel_selected_index += 1;
                     }
                 }
                 KeyCode::PageUp => {
-                    self.tunnel_scroll_offset = self.tunnel_scroll_offset.saturating_sub(10);
+                    self.tunnel_selected_index = self.tunnel_selected_index.saturating_sub(10);
                 }
                 KeyCode::PageDown => {
-                    let max_scroll = self.tunnel_requests.len().saturating_sub(10);
-                    self.tunnel_scroll_offset = (self.tunnel_scroll_offset + 10).min(max_scroll);
+                    if !self.tunnel_requests.is_empty() {
+                        self.tunnel_selected_index =
+                            (self.tunnel_selected_index + 10).min(self.tunnel_requests.len() - 1);
+                    }
                 }
                 KeyCode::Home => {
-                    self.tunnel_scroll_offset = 0;
+                    self.tunnel_selected_index = 0;
                 }
                 KeyCode::End => {
-                    let max_scroll = self.tunnel_requests.len().saturating_sub(10);
-                    self.tunnel_scroll_offset = max_scroll;
+                    if !self.tunnel_requests.is_empty() {
+                        self.tunnel_selected_index = self.tunnel_requests.len() - 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if !self.tunnel_requests.is_empty() {
+                        // Reversed list: index 0 = newest = last element in deque
+                        let reversed_idx =
+                            self.tunnel_requests.len() - 1 - self.tunnel_selected_index;
+                        if let Some(tunnel_req) = self.tunnel_requests.get(reversed_idx) {
+                            // Build a WebhookRequest from the TunnelRequest
+                            let webhook_req = WebhookRequest {
+                                id: tunnel_req.request_id.clone(),
+                                timestamp: 0,
+                                remote_addr: "Tunnel".to_string(),
+                                headers: tunnel_req.headers.clone(),
+                                content_length: tunnel_req
+                                    .body
+                                    .as_ref()
+                                    .map(|b| b.len() as i64)
+                                    .unwrap_or(0),
+                                method: tunnel_req.method.clone(),
+                                url: tunnel_req.path.clone(),
+                                path: Some(tunnel_req.path.clone()),
+                                query_params: parse_query_string(&tunnel_req.query_string),
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                                body_preview: tunnel_req.body.clone(),
+                                body: tunnel_req.body.clone(),
+                            };
+                            self.selected_request = Some(webhook_req);
+
+                            // Build response data if available
+                            let duration_ms = tunnel_req.completed_at.map(|completed| {
+                                completed.duration_since(tunnel_req.received_at).as_millis() as u64
+                            });
+                            self.selected_tunnel_response = Some(TunnelResponseData {
+                                status: tunnel_req.status,
+                                headers: tunnel_req.response_headers.clone().unwrap_or_default(),
+                                body: tunnel_req.response_body.clone(),
+                                duration_ms,
+                                error: tunnel_req.error.clone(),
+                            });
+
+                            self.current_tab = 0;
+                            self.headers_scroll_offset = 0;
+                            self.body_scroll_offset = 0;
+                            self.response_headers_scroll_offset = 0;
+                            self.response_scroll_offset = 0;
+                            self.detail_return_state = Some(DetailReturnTarget::Tunneling);
+                            self.state = AppState::ShowRequestDetail;
+                        }
+                    }
                 }
                 KeyCode::Char('c') => {
                     if let Some(subdomain) = &self.tunnel_subdomain {
@@ -821,8 +1016,166 @@ mod tests {
     #[test]
     fn test_back_from_request_detail_goes_to_listening() {
         let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        app.detail_return_state = Some(DetailReturnTarget::Listening);
         app.handle_key_event(key_event(KeyCode::Char('b'))).unwrap();
         assert!(matches!(app.state, AppState::Listening));
+    }
+
+    #[test]
+    fn test_back_from_request_detail_goes_to_tunneling() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        app.detail_return_state = Some(DetailReturnTarget::Tunneling);
+        app.handle_key_event(key_event(KeyCode::Char('b'))).unwrap();
+        assert!(matches!(app.state, AppState::Tunneling));
+    }
+
+    #[test]
+    fn test_enter_from_tunneling_opens_detail() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests.push_back(TunnelRequest {
+            request_id: "req-1".to_string(),
+            method: "POST".to_string(),
+            path: "/webhook".to_string(),
+            received_at: std::time::Instant::now(),
+            status: Some(200),
+            completed_at: Some(std::time::Instant::now()),
+            error: None,
+            headers: HashMap::new(),
+            body: Some("{\"test\":true}".to_string()),
+            query_string: String::new(),
+            response_headers: Some(HashMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )])),
+            response_body: Some("{\"ok\":true}".to_string()),
+        });
+        app.tunnel_selected_index = 0;
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.state, AppState::ShowRequestDetail));
+        assert_eq!(app.detail_return_state, Some(DetailReturnTarget::Tunneling));
+        assert!(app.selected_request.is_some());
+        assert!(app.selected_tunnel_response.is_some());
+        let resp = app.selected_tunnel_response.unwrap();
+        assert_eq!(resp.status, Some(200));
+        assert!(resp.body.is_some());
+    }
+
+    #[test]
+    fn test_enter_from_tunneling_decodes_query_params() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests.push_back(TunnelRequest {
+            request_id: "req-2".to_string(),
+            method: "GET".to_string(),
+            path: "/search".to_string(),
+            received_at: std::time::Instant::now(),
+            status: Some(200),
+            completed_at: Some(std::time::Instant::now()),
+            error: None,
+            headers: HashMap::new(),
+            body: None,
+            query_string: "q=hello%20world&plus=a+b".to_string(),
+            response_headers: Some(HashMap::new()),
+            response_body: None,
+        });
+        app.tunnel_selected_index = 0;
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+
+        let selected = app
+            .selected_request
+            .expect("selected request should be set");
+        assert_eq!(
+            selected.query_params.get("q"),
+            Some(&"hello world".to_string())
+        );
+        assert_eq!(selected.query_params.get("plus"), Some(&"a b".to_string()));
+    }
+
+    #[test]
+    fn test_tab_cycling_with_response_tab() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        app.selected_request = Some(make_request("GET", "/"));
+        app.selected_tunnel_response = Some(TunnelResponseData {
+            status: Some(200),
+            headers: HashMap::new(),
+            body: None,
+            duration_ms: Some(42),
+            error: None,
+        });
+        assert_eq!(app.current_tab, 0);
+        // Cycle through 4 tabs: 0 -> 1 -> 2 -> 3 -> 0
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+        assert_eq!(app.current_tab, 1);
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+        assert_eq!(app.current_tab, 2);
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+        assert_eq!(app.current_tab, 3);
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+        assert_eq!(app.current_tab, 0);
+    }
+
+    #[test]
+    fn test_response_tab_scrolls_headers_then_body() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        app.selected_request = Some(make_request("GET", "/"));
+
+        let headers = (0..10)
+            .map(|i| (format!("x-test-{}", i), format!("value-{}", i)))
+            .collect();
+        let body = (0..30)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        app.selected_tunnel_response = Some(TunnelResponseData {
+            status: Some(200),
+            headers,
+            body: Some(body),
+            duration_ms: Some(42),
+            error: None,
+        });
+        app.current_tab = 3;
+
+        let headers_max = 10usize.saturating_sub(1);
+        for _ in 0..headers_max {
+            app.handle_key_event(key_event(KeyCode::Down)).unwrap();
+        }
+        assert_eq!(app.response_headers_scroll_offset, headers_max);
+        assert_eq!(app.response_scroll_offset, 0);
+
+        app.handle_key_event(key_event(KeyCode::Down)).unwrap();
+        assert_eq!(app.response_headers_scroll_offset, headers_max);
+        assert_eq!(app.response_scroll_offset, 1);
+    }
+
+    #[test]
+    fn test_truncate_body_under_limit() {
+        let small = Some("hello".to_string());
+        assert_eq!(truncate_body(small), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_truncate_body_over_limit() {
+        let large = Some("x".repeat(MAX_BODY_SIZE + 100));
+        let result = truncate_body(large).unwrap();
+        assert!(result.len() < MAX_BODY_SIZE + 100);
+        assert!(result.ends_with("\n...(truncated)"));
+    }
+
+    #[test]
+    fn test_truncate_body_over_limit_utf8_boundary() {
+        // 3-byte codepoint makes MAX_BODY_SIZE likely land mid-character.
+        let large = Some("€".repeat((MAX_BODY_SIZE / 3) + 100));
+        let result = truncate_body(large).unwrap();
+
+        assert!(result.ends_with("\n...(truncated)"));
+        let prefix = result.strip_suffix("\n...(truncated)").unwrap();
+        assert!(prefix.len() <= MAX_BODY_SIZE);
+        assert!(prefix.is_char_boundary(prefix.len()));
+    }
+
+    #[test]
+    fn test_truncate_body_none() {
+        assert_eq!(truncate_body(None), None);
     }
 
     // Helper to build test WebhookRequests

@@ -11,6 +11,15 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, warn};
 
+/// Extract the string representation of a JSON value.
+/// Returns the inner string for `Value::String`, otherwise uses `to_string()`.
+fn json_value_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        _ => v.to_string(),
+    }
+}
+
 /// Phoenix Channel message structure
 #[derive(Debug, Serialize, Deserialize)]
 struct ChannelMessage {
@@ -49,11 +58,16 @@ pub enum TunnelEvent {
         request_id: String,
         method: String,
         path: String,
+        headers: HashMap<String, String>,
+        body: Option<String>,
+        query_string: String,
     },
     RequestForwarded {
         request_id: String,
         status: u16,
         duration_ms: u64,
+        response_headers: HashMap<String, String>,
+        response_body: Option<String>,
     },
     RequestFailed {
         request_id: String,
@@ -444,15 +458,7 @@ impl TunnelClient {
                                 headers: request
                                     .headers
                                     .iter()
-                                    .map(|(k, v)| {
-                                        (
-                                            k.clone(),
-                                            match v {
-                                                serde_json::Value::String(s) => s.clone(),
-                                                _ => v.to_string(),
-                                            },
-                                        )
-                                    })
+                                    .map(|(k, v)| (k.clone(), json_value_to_string(v)))
                                     .collect(),
                                 content_length: request
                                     .body
@@ -465,15 +471,7 @@ impl TunnelClient {
                                 query_params: request
                                     .query_params
                                     .iter()
-                                    .map(|(k, v)| {
-                                        (
-                                            k.clone(),
-                                            match v {
-                                                serde_json::Value::String(s) => s.clone(),
-                                                _ => v.to_string(),
-                                            },
-                                        )
-                                    })
+                                    .map(|(k, v)| (k.clone(), json_value_to_string(v)))
                                     .collect(),
                                 created_at: chrono::Utc::now().to_rfc3339(),
                                 body_preview: request.body.clone(),
@@ -534,15 +532,7 @@ impl TunnelClient {
             let query_string: Vec<String> = request
                 .query_params
                 .iter()
-                .map(|(k, v)| {
-                    let value_str = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        _ => v.to_string(),
-                    };
-                    format!("{}={}", k, value_str)
-                })
+                .map(|(k, v)| format!("{}={}", k, json_value_to_string(v)))
                 .collect();
             format!("{}?{}", target, query_string.join("&"))
         } else {
@@ -566,15 +556,10 @@ impl TunnelClient {
             }
         };
 
-        // Add headers
+        // Add headers (skip host — it will be set by reqwest)
         for (key, value) in &request.headers {
-            // Skip host header as it will be set by reqwest
             if key.to_lowercase() != "host" {
-                let value_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => value.to_string(),
-                };
-                req_builder = req_builder.header(key, value_str);
+                req_builder = req_builder.header(key, json_value_to_string(value));
             }
         }
 
@@ -1028,6 +1013,19 @@ impl TunnelForwarder {
                         raw_body.as_bytes().to_vec()
                     };
 
+                    // Convert headers Map<String, Value> → HashMap<String, String>
+                    let headers_map: HashMap<String, String> = headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), json_value_to_string(v)))
+                        .collect();
+
+                    // Convert body bytes to Option<String>
+                    let body_string = if body.is_empty() {
+                        None
+                    } else {
+                        Some(String::from_utf8_lossy(&body).into_owned())
+                    };
+
                     // Notify UI about request
                     let _ = self
                         .event_tx
@@ -1035,6 +1033,9 @@ impl TunnelForwarder {
                             request_id: request_id.clone(),
                             method: method.clone(),
                             path: path.clone(),
+                            headers: headers_map,
+                            body: body_string,
+                            query_string: query_string.clone(),
                         })
                         .await;
 
@@ -1132,13 +1133,10 @@ impl TunnelForwarder {
             }
         };
 
-        // Add headers
+        // Add headers (skip host — it will be set by reqwest)
         for (key, value) in headers {
             if key.to_lowercase() != "host" {
-                let value_str = match value {
-                    serde_json::Value::String(s) => s,
-                    _ => value.to_string(),
-                };
+                let value_str = json_value_to_string(&value);
                 if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
                     && let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value_str)
                 {
@@ -1192,6 +1190,8 @@ impl TunnelForwarder {
                         request_id: request_id.clone(),
                         status,
                         duration_ms,
+                        response_headers: response_headers.clone(),
+                        response_body: Some(response_body.clone()),
                     })
                     .await;
 
