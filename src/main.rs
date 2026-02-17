@@ -13,13 +13,17 @@ use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use crossterm::{
-    cursor::Show,
+    cursor::{MoveToColumn, Show},
     event::{self, Event, KeyEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    style::Stylize,
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::{sync::mpsc, time::sleep};
@@ -463,7 +467,10 @@ async fn main() -> Result<()> {
                     "output": output.display().to_string()
                 }))?;
             } else {
-                println!("Diagnostic bundle created in: {}", output.display());
+                println!(
+                    "✅ Diagnostic bundle created in: {}",
+                    output.display().to_string().bold()
+                );
             }
         }
         Commands::CleanLogs { keep } => {
@@ -481,9 +488,9 @@ async fn main() -> Result<()> {
             } else {
                 println!(
                     "Removed {} old log file(s) from {} (keeping {} most recent)",
-                    removed,
-                    directory.display(),
-                    keep
+                    removed.to_string().bold(),
+                    directory.display().to_string().dim(),
+                    keep.to_string().bold()
                 );
             }
         }
@@ -509,7 +516,7 @@ async fn main() -> Result<()> {
                         "organization_id": config.selected_organization_id
                     }))?;
                 } else {
-                    println!("Config file: {}", config_path.display());
+                    println!("{} {}", "Config file:".dim(), config_path.display());
                     println!();
                     match &config.access_token {
                         Some(token) => {
@@ -518,18 +525,31 @@ async fn main() -> Result<()> {
                             } else {
                                 token.clone()
                             };
-                            let status = if config.is_token_valid() {
-                                "valid"
+                            if config.is_token_valid() {
+                                println!(
+                                    "  {} {} {}",
+                                    "Token:".bold(),
+                                    truncated,
+                                    "(valid)".green()
+                                );
                             } else {
-                                "expired"
-                            };
-                            println!("Token: {} ({})", truncated, status);
+                                println!(
+                                    "  {} {} {}",
+                                    "Token:".bold(),
+                                    truncated,
+                                    "(expired)".red()
+                                );
+                            }
                         }
-                        None => println!("Token: (none)"),
+                        None => println!("  {} {}", "Token:".bold(), "(none)".dim()),
                     }
                     match &config.selected_organization_id {
-                        Some(org_id) => println!("Organization: {}", org_id),
-                        None => println!("Organization: (none)"),
+                        Some(org_id) => {
+                            println!("  {} {}", "Organization:".bold(), org_id)
+                        }
+                        None => {
+                            println!("  {} {}", "Organization:".bold(), "(none)".dim())
+                        }
                     }
                 }
             }
@@ -546,7 +566,7 @@ async fn main() -> Result<()> {
                                 "value": null
                             }))?;
                         } else {
-                            println!("Cleared selected_organization_id");
+                            println!("✅ Cleared {}", "selected_organization_id".bold());
                         }
                     } else {
                         config.selected_organization_id = Some(value);
@@ -559,8 +579,9 @@ async fn main() -> Result<()> {
                             }))?;
                         } else {
                             println!(
-                                "Set selected_organization_id to {}",
-                                config.selected_organization_id.as_deref().unwrap()
+                                "✅ Set {} to {}",
+                                "selected_organization_id".bold(),
+                                config.selected_organization_id.as_deref().unwrap().bold()
                             );
                         }
                     }
@@ -582,7 +603,7 @@ async fn main() -> Result<()> {
                         "status": "already_logged_out"
                     }))?;
                 } else {
-                    println!("Already logged out.");
+                    println!("{}", "Already logged out.".dim());
                 }
             } else {
                 config.clear_token();
@@ -592,7 +613,7 @@ async fn main() -> Result<()> {
                         "status": "logged_out"
                     }))?;
                 } else {
-                    println!("Logged out successfully.");
+                    println!("✅ Logged out successfully.");
                 }
             }
         }
@@ -633,7 +654,11 @@ async fn main() -> Result<()> {
                         "organization_name": organization_name
                     }))?;
                 } else {
-                    println!("Selected organization: {} ({})", organization_name, id);
+                    println!(
+                        "✅ Selected organization: {} ({})",
+                        organization_name.bold(),
+                        id.dim()
+                    );
                 }
             }
             OrgAction::Clear => {
@@ -646,7 +671,7 @@ async fn main() -> Result<()> {
                         "selected_organization_id": null
                     }))?;
                 } else {
-                    println!("Cleared selected organization.");
+                    println!("✅ Cleared selected organization.");
                 }
             }
         },
@@ -663,8 +688,8 @@ async fn main() -> Result<()> {
                         "endpoint": endpoint
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
-                    println!("Created endpoint:");
+                    print_context("Organization:", &organization_id);
+                    println!("✅ Created endpoint:");
                     print_endpoints(std::slice::from_ref(&endpoint));
                 }
             }
@@ -680,7 +705,7 @@ async fn main() -> Result<()> {
                         "endpoints": endpoints
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
+                    print_context("Organization:", &organization_id);
                     print_endpoints(&endpoints);
                 }
             }
@@ -696,7 +721,7 @@ async fn main() -> Result<()> {
                         "endpoint": endpoint
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
+                    print_context("Organization:", &organization_id);
                     print_endpoints(std::slice::from_ref(&endpoint));
                 }
             }
@@ -714,8 +739,9 @@ async fn main() -> Result<()> {
                     }))?;
                 } else {
                     println!(
-                        "Deleted endpoint: {} (organization {})",
-                        endpoint_id, organization_id
+                        "🗑  Deleted endpoint: {} {}",
+                        endpoint_id.bold(),
+                        format!("(organization {})", organization_id).dim()
                     );
                 }
             }
@@ -739,8 +765,8 @@ async fn main() -> Result<()> {
                         "requests": requests
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
-                    println!("Endpoint: {}", endpoint_id);
+                    print_context("Organization:", &organization_id);
+                    print_context("Endpoint:", &endpoint_id);
                     print_endpoint_requests(&requests);
                 }
             }
@@ -763,8 +789,8 @@ async fn main() -> Result<()> {
                         "request": request
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
-                    println!("Endpoint: {}", endpoint_id);
+                    print_context("Organization:", &organization_id);
+                    print_context("Endpoint:", &endpoint_id);
                     print_endpoint_request_detail(&request);
                 }
             }
@@ -789,8 +815,13 @@ async fn main() -> Result<()> {
                     }))?;
                 } else {
                     println!(
-                        "Deleted request: {} (endpoint {}, organization {})",
-                        request_id, endpoint_id, organization_id
+                        "🗑  Deleted request: {} {}",
+                        request_id.bold(),
+                        format!(
+                            "(endpoint {}, organization {})",
+                            endpoint_id, organization_id
+                        )
+                        .dim()
                     );
                 }
             }
@@ -822,12 +853,14 @@ async fn main() -> Result<()> {
                         "forward": response
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
-                    println!("Endpoint: {}", endpoint_id);
-                    println!("Request: {}", request_id);
+                    print_context("Organization:", &organization_id);
+                    print_context("Endpoint:", &endpoint_id);
+                    print_context("Request:", &request_id);
                     println!(
-                        "Forward accepted: {} (status: {}, target: {})",
-                        response.forward_id, response.status, response.target_url
+                        "✅ Forward accepted: {} (status: {}, target: {})",
+                        response.forward_id.bold(),
+                        response.status.bold(),
+                        response.target_url.underlined()
                     );
                 }
             }
@@ -853,9 +886,9 @@ async fn main() -> Result<()> {
                         "forwards": forwards
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
-                    println!("Endpoint: {}", endpoint_id);
-                    println!("Request: {}", request_id);
+                    print_context("Organization:", &organization_id);
+                    print_context("Endpoint:", &endpoint_id);
+                    print_context("Request:", &request_id);
                     print_endpoint_request_forwards(&forwards);
                 }
             }
@@ -871,7 +904,7 @@ async fn main() -> Result<()> {
                         "forward": forward
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
+                    print_context("Organization:", &organization_id);
                     print_forward_detail(&forward);
                 }
             }
@@ -889,7 +922,7 @@ async fn main() -> Result<()> {
                         "tunnels": tunnels
                     }))?;
                 } else {
-                    println!("Organization: {}", organization_id);
+                    print_context("Organization:", &organization_id);
                     print_static_tunnels(&tunnels);
                 }
             }
@@ -908,11 +941,12 @@ async fn main() -> Result<()> {
                     }))?;
                 } else {
                     println!(
-                        "Created static tunnel: {} ({})",
-                        created.static_tunnel.slug, created.static_tunnel.id
+                        "✅ Created static tunnel: {} {}",
+                        created.static_tunnel.slug.bold(),
+                        format!("({})", created.static_tunnel.id).dim()
                     );
                     if let Some(message) = created.message {
-                        println!("{}", message);
+                        println!("   {}", message.dim());
                     }
                 }
             }
@@ -933,7 +967,7 @@ async fn main() -> Result<()> {
                     }))?;
                 } else {
                     println!(
-                        "{}",
+                        "🗑  {}",
                         response
                             .message
                             .unwrap_or_else(|| "Static tunnel deleted.".to_string())
@@ -1036,9 +1070,15 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
     let mut config = config::Config::load()?;
 
     if config.is_token_valid() && !force_reauth {
-        println!("✅ You're already authenticated.");
-        println!("Run `hooklistener listen <endpoint>` to start forwarding webhooks.");
-        println!("Use `hooklistener login --force` if you need to re-authenticate.");
+        println!("\n  ✅ You're already authenticated.\n");
+        println!(
+            "  Run {} to start forwarding webhooks.",
+            "hooklistener listen <endpoint>".bold()
+        );
+        println!(
+            "  Use {} if you need to re-authenticate.\n",
+            "hooklistener login --force".bold()
+        );
         return Ok(());
     }
 
@@ -1057,54 +1097,84 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
         .unwrap_or_else(|| user_code.clone());
     let portal_url = device_portal_url();
 
-    println!("🔐 Hooklistener Login");
-    println!("Visit {} and enter the code {}", portal_url, display_code);
-    println!("Waiting for you to approve the device...");
+    let clipboard_ok = arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_text(&display_code))
+        .is_ok();
+
+    println!("\n  🔐 {}\n", "Hooklistener Login".bold());
+    println!("  Open:  {}", portal_url.as_str().underlined());
+    print!("  Code:  {}", display_code.bold());
+    if clipboard_ok {
+        print!("  {}", "(copied to clipboard)".dim());
+    }
+    println!("\n");
+
+    let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let mut spinner_idx: usize = 0;
+    let mut stdout = io::stdout();
+
+    let mut poll_interval = tokio::time::interval(Duration::from_secs(5));
+    poll_interval.tick().await; // consume the immediate first tick
 
     loop {
+        // Poll the API
         match device_flow.poll_for_authorization().await {
             Ok(Some(access_token)) => {
+                execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
                 let expires_at = Utc::now() + ChronoDuration::days(SESSION_TOKEN_VALIDITY_DAYS);
                 config.set_access_token(access_token, expires_at);
                 config.save()?;
-                println!("✅ Authentication successful!");
-                println!("Run `hooklistener listen <endpoint>` to forward webhooks.");
-                break;
+                println!("  ✅ Authentication successful!\n");
+                println!(
+                    "  Run {} to forward webhooks.\n",
+                    "hooklistener listen <endpoint>".bold()
+                );
+                return Ok(());
             }
             Ok(None) => {
-                if let Some(remaining) = device_flow.time_remaining() {
-                    let minutes = remaining.num_minutes();
-                    let seconds = remaining.num_seconds() % 60;
-                    if minutes > 0 {
-                        println!(
-                            "Still waiting for confirmation... code expires in {}m {}s",
-                            minutes, seconds
-                        );
-                    } else {
-                        println!(
-                            "Still waiting for confirmation... code expires in {}s",
-                            seconds
-                        );
-                    }
-
-                    if remaining == ChronoDuration::zero() {
-                        return Err(anyhow!(
-                            "Device code expired before authorization completed. Please run `hooklistener login` again."
-                        ));
-                    }
-                } else {
-                    println!("Still waiting for confirmation...");
+                if let Some(remaining) = device_flow.time_remaining()
+                    && remaining == ChronoDuration::zero()
+                {
+                    execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+                    return Err(anyhow!(
+                        "Device code expired before authorization completed. Please run `hooklistener login` again."
+                    ));
                 }
-
-                sleep(Duration::from_secs(5)).await;
             }
             Err(err) => {
+                execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
                 return Err(anyhow!("Authentication failed: {}", err));
             }
         }
-    }
 
-    Ok(())
+        // Animate spinner until next poll
+        loop {
+            let spinner = spinner_chars[spinner_idx % spinner_chars.len()];
+            spinner_idx = (spinner_idx + 1) % spinner_chars.len();
+
+            let status = if let Some(remaining) = device_flow.time_remaining() {
+                let minutes = remaining.num_minutes();
+                let seconds = remaining.num_seconds() % 60;
+                let timer = if minutes > 0 {
+                    format!("{minutes}m {seconds:02}s")
+                } else {
+                    format!("{seconds}s")
+                };
+                format!("  {spinner} Waiting for approval... {}", timer.dim())
+            } else {
+                format!("  {spinner} Waiting for approval...")
+            };
+
+            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            print!("{status}");
+            stdout.flush()?;
+
+            tokio::select! {
+                _ = sleep(Duration::from_millis(80)) => continue,
+                _ = poll_interval.tick() => break,
+            }
+        }
+    }
 }
 
 fn device_portal_url() -> String {
@@ -1137,120 +1207,167 @@ fn require_organization(cli_org: Option<String>, config: &config::Config) -> Res
     })
 }
 
+/// Print a dim context line like "Organization: abc123".
+fn print_context(label: &str, value: &str) {
+    println!("{} {}", label.dim(), value.dim());
+}
+
+/// Print a pagination footer.
+fn print_pagination(p: &api::Pagination) {
+    println!(
+        "{}",
+        format!(
+            "Page {}/{} (page_size={}, total={})",
+            p.page, p.total_pages, p.page_size, p.total_count
+        )
+        .dim()
+    );
+}
+
+/// Print a key-value map (headers, query params) with a bold section label.
+fn print_key_value_map(
+    label: &str,
+    map: &std::collections::HashMap<String, serde_json::Value>,
+    separator: &str,
+) {
+    if map.is_empty() {
+        println!("{} {}", label.bold(), "(none)".dim());
+    } else {
+        println!("{}", label.bold());
+        for (key, value) in map {
+            println!("  {}{}{}", key.as_str().dim(), separator, value);
+        }
+    }
+}
+
+/// Print a body section, showing "(empty)" when the body is absent or blank.
+fn print_body_section(label: &str, body: Option<&str>) {
+    match body {
+        Some(body) if !body.is_empty() => {
+            println!("{}", label.bold());
+            println!("{}", body);
+        }
+        _ => println!("{} {}", label.bold(), "(empty)".dim()),
+    }
+}
+
 fn print_organizations(organizations: &[api::Organization], selected_org: Option<&str>) {
     if organizations.is_empty() {
-        println!("No organizations found.");
+        println!("{}", "No organizations found.".dim());
         return;
     }
 
-    println!("Organizations:");
+    println!("{}", "Organizations:".bold());
     for org in organizations {
-        let marker = if selected_org.is_some_and(|id| id == org.id) {
-            "*"
+        let selected = selected_org.is_some_and(|id| id == org.id);
+        if selected {
+            println!("  {} {}  {}", "*".green(), org.id, org.name.as_str().bold());
         } else {
-            " "
-        };
-        println!("{} {}  {}", marker, org.id, org.name);
+            println!("    {}  {}", org.id.as_str().dim(), org.name);
+        }
     }
 }
 
 fn print_endpoints(endpoints: &[api::DebugEndpointSummary]) {
     if endpoints.is_empty() {
-        println!("No debug endpoints found.");
+        println!("{}", "No debug endpoints found.".dim());
         return;
     }
 
     println!(
-        "{:<36}  {:<20}  {:<10}  {:<40}  Name",
-        "ID", "Slug", "Status", "Webhook URL"
+        "{}",
+        format!(
+            "{:<36}  {:<20}  {:<10}  {:<40}  Name",
+            "ID", "Slug", "Status", "Webhook URL"
+        )
+        .dim()
     );
     for endpoint in endpoints {
+        let status = if endpoint.status == "active" {
+            endpoint.status.as_str().green().to_string()
+        } else {
+            endpoint.status.as_str().yellow().to_string()
+        };
         println!(
             "{:<36}  {:<20}  {:<10}  {:<40}  {}",
-            endpoint.id, endpoint.slug, endpoint.status, endpoint.webhook_url, endpoint.name
+            endpoint.id,
+            endpoint.slug.as_str().bold(),
+            status,
+            endpoint.webhook_url,
+            endpoint.name
         );
     }
 }
 
 fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
     if response.data.is_empty() {
-        println!("No requests found.");
+        println!("{}", "No requests found.".dim());
     } else {
-        println!("{:<36}  {:<7}  {:<40}  Remote", "ID", "Method", "URL");
+        println!(
+            "{}",
+            format!("{:<36}  {:<7}  {:<40}  Remote", "ID", "Method", "URL").dim()
+        );
         for request in &response.data {
             println!(
                 "{:<36}  {:<7}  {:<40}  {}",
-                request.id, request.method, request.url, request.remote_addr
+                request.id,
+                request.method.as_str().bold(),
+                request.url,
+                request.remote_addr.as_str().dim()
             );
         }
     }
 
-    println!(
-        "Page {}/{} (page_size={}, total={})",
-        response.pagination.page,
-        response.pagination.total_pages,
-        response.pagination.page_size,
-        response.pagination.total_count
-    );
+    print_pagination(&response.pagination);
 }
 
 fn print_endpoint_request_detail(request: &api::DebugRequestDetail) {
-    println!("Request ID: {}", request.id);
-    println!("Method: {}", request.method);
+    println!("{} {}", "Request ID:".bold(), request.id);
+    println!("{} {}", "Method:".bold(), request.method.as_str().bold());
     if let Some(path) = request.path.as_deref() {
-        println!("Path: {}", path);
+        println!("{} {}", "Path:".bold(), path);
     }
-    println!("URL: {}", request.url);
+    println!("{} {}", "URL:".bold(), request.url);
 
     if let Some(status_remote) = request.remote_addr.as_deref() {
-        println!("Remote Address: {}", status_remote);
+        println!("{} {}", "Remote Address:".bold(), status_remote);
     }
     if let Some(content_length) = request.content_length {
-        println!("Content Length: {}", content_length);
+        println!("{} {}", "Content Length:".bold(), content_length);
     }
     if let Some(created_at) = request.created_at.as_deref() {
-        println!("Created At: {}", created_at);
+        println!("{} {}", "Created At:".bold(), created_at.dim());
     }
 
-    if request.headers.is_empty() {
-        println!("Headers: (none)");
-    } else {
-        println!("Headers:");
-        for (key, value) in &request.headers {
-            println!("  {}: {}", key, value);
-        }
-    }
+    println!();
+    print_key_value_map("Headers:", &request.headers, ": ");
 
-    if request.query_params.is_empty() {
-        println!("Query Params: (none)");
-    } else {
-        println!("Query Params:");
-        for (key, value) in &request.query_params {
-            println!("  {}={}", key, value);
-        }
-    }
+    println!();
+    print_key_value_map("Query Params:", &request.query_params, "=");
 
-    match request.body.as_deref().or(request.body_preview.as_deref()) {
-        Some(body) if !body.is_empty() => {
-            println!("Body:");
-            println!("{}", body);
-        }
-        _ => println!("Body: (empty)"),
-    }
+    println!();
+    print_body_section(
+        "Body:",
+        request.body.as_deref().or(request.body_preview.as_deref()),
+    );
 }
 
 fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsResponse) {
     if response.data.is_empty() {
-        println!("No forwards found.");
+        println!("{}", "No forwards found.".dim());
     } else {
         println!(
-            "{:<36}  {:<7}  {:<6}  {:<8}  Target",
-            "ID", "Method", "Status", "Duration"
+            "{}",
+            format!(
+                "{:<36}  {:<7}  {:<6}  {:<8}  Target",
+                "ID", "Method", "Status", "Duration"
+            )
+            .dim()
         );
         for forward in &response.data {
             let status = forward
                 .status_code
-                .map(|code| code.to_string())
+                .map(style_status_code)
                 .unwrap_or_else(|| "-".to_string());
             let duration = forward
                 .duration_ms
@@ -1261,85 +1378,79 @@ fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsRespon
                 forward.id, forward.method, status, duration, forward.target_url
             );
             if let Some(error) = forward.error_message.as_deref() {
-                println!("  error: {}", error);
+                println!("  {} {}", "error:".red(), error);
             }
         }
     }
 
-    println!(
-        "Page {}/{} (page_size={}, total={})",
-        response.pagination.page,
-        response.pagination.total_pages,
-        response.pagination.page_size,
-        response.pagination.total_count
-    );
+    print_pagination(&response.pagination);
 }
 
 fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
-    println!("Forward ID: {}", forward.id);
-    println!("Request ID: {}", forward.debug_request_id);
-    println!("Target URL: {}", forward.target_url);
-    println!("Method: {}", forward.method);
+    println!("{} {}", "Forward ID:".bold(), forward.id);
+    println!("{} {}", "Request ID:".bold(), forward.debug_request_id);
+    println!("{} {}", "Target URL:".bold(), forward.target_url);
+    println!("{} {}", "Method:".bold(), forward.method.as_str().bold());
     if let Some(status_code) = forward.status_code {
-        println!("Status: {}", status_code);
+        println!("{} {}", "Status:".bold(), style_status_code(status_code));
     } else {
-        println!("Status: (pending)");
+        println!("{} {}", "Status:".bold(), "(pending)".yellow());
     }
     if let Some(duration_ms) = forward.duration_ms {
-        println!("Duration: {}ms", duration_ms);
+        println!("{} {}ms", "Duration:".bold(), duration_ms);
     }
     if let Some(attempted_at) = forward.attempted_at.as_deref() {
-        println!("Attempted At: {}", attempted_at);
+        println!("{} {}", "Attempted At:".bold(), attempted_at.dim());
     }
     if let Some(error_message) = forward.error_message.as_deref() {
-        println!("Error: {}", error_message);
+        println!("{} {}", "Error:".red().bold(), error_message);
     }
 
-    if forward.request_headers.is_empty() {
-        println!("Request Headers: (none)");
-    } else {
-        println!("Request Headers:");
-        for (key, value) in &forward.request_headers {
-            println!("  {}: {}", key, value);
-        }
-    }
+    println!();
+    print_key_value_map("Request Headers:", &forward.request_headers, ": ");
 
-    if let Some(request_body) = forward.request_body.as_deref()
-        && !request_body.is_empty()
+    if forward
+        .request_body
+        .as_deref()
+        .is_some_and(|b| !b.is_empty())
     {
-        println!("Request Body:");
-        println!("{}", request_body);
+        println!();
+        print_body_section("Request Body:", forward.request_body.as_deref());
     }
 
-    if forward.response_headers.is_empty() {
-        println!("Response Headers: (none)");
-    } else {
-        println!("Response Headers:");
-        for (key, value) in &forward.response_headers {
-            println!("  {}: {}", key, value);
-        }
-    }
+    println!();
+    print_key_value_map("Response Headers:", &forward.response_headers, ": ");
 
-    if let Some(response_body) = forward.response_body.as_deref()
-        && !response_body.is_empty()
+    if forward
+        .response_body
+        .as_deref()
+        .is_some_and(|b| !b.is_empty())
     {
-        println!("Response Body:");
-        println!("{}", response_body);
+        println!();
+        print_body_section("Response Body:", forward.response_body.as_deref());
     }
 }
 
 fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
     if response.static_tunnels.is_empty() {
-        println!("No static tunnels found.");
+        println!("{}", "No static tunnels found.".dim());
     } else {
-        println!("{:<36}  {:<24}  Name", "ID", "Slug");
+        println!("{}", format!("{:<36}  {:<24}  Name", "ID", "Slug").dim());
         for tunnel in &response.static_tunnels {
             let name = tunnel.name.as_deref().unwrap_or("");
-            println!("{:<36}  {:<24}  {}", tunnel.id, tunnel.slug, name);
+            println!(
+                "{:<36}  {:<24}  {}",
+                tunnel.id,
+                tunnel.slug.as_str().bold(),
+                name
+            );
         }
     }
 
-    println!("Used {}/{} static tunnels", response.used, response.limit);
+    println!(
+        "{}",
+        format!("Used {}/{} static tunnels", response.used, response.limit).dim()
+    );
 }
 
 fn spawn_tunnel_forwarder_manager(
@@ -1586,24 +1697,36 @@ async fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-fn display_error(err: &anyhow::Error) {
-    eprintln!("Error: {}", err);
-    if let Some(api_err) = err.downcast_ref::<errors::ApiError>()
-        && let Some(hint) = api_err.hint()
-    {
-        eprintln!("Hint: {}", hint);
-    } else if let Some(tunnel_err) = err.downcast_ref::<errors::TunnelError>()
-        && let Some(hint) = tunnel_err.hint()
-    {
-        eprintln!("Hint: {}", hint);
-    } else if let Some(config_err) = err.downcast_ref::<errors::ConfigError>()
-        && let Some(hint) = config_err.hint()
-    {
-        eprintln!("Hint: {}", hint);
+fn style_status_code(code: u16) -> String {
+    let s = code.to_string();
+    match code {
+        200..=299 => s.green().to_string(),
+        300..=399 => s.yellow().to_string(),
+        400..=599 => s.red().to_string(),
+        _ => s,
     }
-    // Print the error chain
+}
+
+fn error_hint(err: &anyhow::Error) -> Option<&str> {
+    if let Some(e) = err.downcast_ref::<errors::ApiError>() {
+        return e.hint();
+    }
+    if let Some(e) = err.downcast_ref::<errors::TunnelError>() {
+        return e.hint();
+    }
+    if let Some(e) = err.downcast_ref::<errors::ConfigError>() {
+        return e.hint();
+    }
+    None
+}
+
+fn display_error(err: &anyhow::Error) {
+    eprintln!("{} {}", "Error:".red().bold(), err);
+    if let Some(hint) = error_hint(err) {
+        eprintln!("{} {}", "Hint:".yellow().bold(), hint);
+    }
     for cause in err.chain().skip(1) {
-        eprintln!("Caused by: {}", cause);
+        eprintln!("{} {}", "Caused by:".dim(), cause);
     }
 }
 
