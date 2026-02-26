@@ -1,6 +1,6 @@
 [package]
 name = "hooklistener-cli"
-version = "0.1.3"
+version = "0.3.14"
 edition = "2024"
 autobins = false
 description = "A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers"
