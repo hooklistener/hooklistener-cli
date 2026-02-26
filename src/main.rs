@@ -11,6 +11,7 @@ mod ui;
 mod updater;
 
 use anyhow::{Result, anyhow};
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use crossterm::{
@@ -1276,21 +1277,32 @@ fn print_body_section(label: &str, body: Option<&str>) {
     }
 }
 
+/// Create a pre-configured table with the standard preset and dynamic content arrangement.
+fn new_table(headers: &[&str]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(headers.to_vec());
+    table
+}
+
 fn print_organizations(organizations: &[api::Organization], selected_org: Option<&str>) {
     if organizations.is_empty() {
         println!("{}", "No organizations found.".dim());
         return;
     }
 
-    println!("{}", "Organizations:".bold());
+    let mut table = new_table(&["", "ID", "Name"]);
     for org in organizations {
-        let selected = selected_org.is_some_and(|id| id == org.id);
-        if selected {
-            println!("  {} {}  {}", "*".green(), org.id, org.name.as_str().bold());
+        let marker = if selected_org.is_some_and(|id| id == org.id) {
+            "*"
         } else {
-            println!("    {}  {}", org.id.as_str().dim(), org.name);
-        }
+            ""
+        };
+        table.add_row(vec![marker, &org.id, &org.name]);
     }
+    println!("{table}");
 }
 
 fn print_endpoints(endpoints: &[api::DebugEndpointSummary]) {
@@ -1299,50 +1311,35 @@ fn print_endpoints(endpoints: &[api::DebugEndpointSummary]) {
         return;
     }
 
-    println!(
-        "{}",
-        format!(
-            "{:<36}  {:<20}  {:<10}  {:<40}  Name",
-            "ID", "Slug", "Status", "Webhook URL"
-        )
-        .dim()
-    );
+    let mut table = new_table(&["ID", "Slug", "Status", "Webhook URL", "Name"]);
     for endpoint in endpoints {
-        let status = if endpoint.status == "active" {
-            endpoint.status.as_str().green().to_string()
-        } else {
-            endpoint.status.as_str().yellow().to_string()
-        };
-        println!(
-            "{:<36}  {:<20}  {:<10}  {:<40}  {}",
-            endpoint.id,
-            endpoint.slug.as_str().bold(),
-            status,
-            endpoint.webhook_url,
-            endpoint.name
-        );
+        table.add_row(vec![
+            &endpoint.id,
+            &endpoint.slug,
+            &endpoint.status,
+            &endpoint.webhook_url,
+            &endpoint.name,
+        ]);
     }
+    println!("{table}");
 }
 
 fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
     if response.data.is_empty() {
         println!("{}", "No requests found.".dim());
-    } else {
-        println!(
-            "{}",
-            format!("{:<36}  {:<7}  {:<40}  Remote", "ID", "Method", "URL").dim()
-        );
-        for request in &response.data {
-            println!(
-                "{:<36}  {:<7}  {:<40}  {}",
-                request.id,
-                request.method.as_str().bold(),
-                request.url,
-                request.remote_addr.as_str().dim()
-            );
-        }
+        return;
     }
 
+    let mut table = new_table(&["ID", "Method", "URL", "Remote"]);
+    for request in &response.data {
+        table.add_row(vec![
+            &request.id,
+            &request.method,
+            &request.url,
+            &request.remote_addr,
+        ]);
+    }
+    println!("{table}");
     print_pagination(&response.pagination);
 }
 
@@ -1380,34 +1377,32 @@ fn print_endpoint_request_detail(request: &api::DebugRequestDetail) {
 fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsResponse) {
     if response.data.is_empty() {
         println!("{}", "No forwards found.".dim());
-    } else {
-        println!(
-            "{}",
-            format!(
-                "{:<36}  {:<7}  {:<6}  {:<8}  Target",
-                "ID", "Method", "Status", "Duration"
-            )
-            .dim()
-        );
-        for forward in &response.data {
-            let status = forward
-                .status_code
-                .map(style_status_code)
-                .unwrap_or_else(|| "-".to_string());
-            let duration = forward
-                .duration_ms
-                .map(|ms| format!("{}ms", ms))
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "{:<36}  {:<7}  {:<6}  {:<8}  {}",
-                forward.id, forward.method, status, duration, forward.target_url
-            );
-            if let Some(error) = forward.error_message.as_deref() {
-                println!("  {} {}", "error:".red(), error);
-            }
-        }
+        return;
     }
 
+    let mut table = new_table(&["ID", "Method", "Status", "Duration", "Target"]);
+    for forward in &response.data {
+        let status = forward
+            .status_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into());
+        let duration = forward
+            .duration_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".into());
+        let target = match forward.error_message.as_deref() {
+            Some(err) => format!("{}\n  error: {err}", forward.target_url),
+            None => forward.target_url.clone(),
+        };
+        table.add_row(vec![
+            forward.id.as_str(),
+            &forward.method,
+            &status,
+            &duration,
+            &target,
+        ]);
+    }
+    println!("{table}");
     print_pagination(&response.pagination);
 }
 
@@ -1457,19 +1452,13 @@ fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
 }
 
 fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
-    if response.static_tunnels.is_empty() {
-        println!("{}", "No static tunnels found.".dim());
-    } else {
-        println!("{}", format!("{:<36}  {:<24}  Name", "ID", "Slug").dim());
+    if !response.static_tunnels.is_empty() {
+        let mut table = new_table(&["ID", "Slug", "Name"]);
         for tunnel in &response.static_tunnels {
             let name = tunnel.name.as_deref().unwrap_or("");
-            println!(
-                "{:<36}  {:<24}  {}",
-                tunnel.id,
-                tunnel.slug.as_str().bold(),
-                name
-            );
+            table.add_row(vec![tunnel.id.as_str(), &tunnel.slug, name]);
         }
+        println!("{table}");
     }
 
     println!(
@@ -1541,12 +1530,15 @@ async fn run_tunnel_forwarder_connection(
     }
 }
 
-async fn run_app<B: ratatui::backend::Backend>(
+async fn run_app<B: ratatui::backend::Backend + Send>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     mut tunnel_rx: mpsc::Receiver<TunnelEvent>,
     tunnel_reconnect_tx: Option<mpsc::UnboundedSender<()>>,
-) -> Result<()> {
+) -> Result<()> 
+where
+    <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
+{
     // Ensure proper terminal cleanup on any exit
     let _cleanup = TerminalCleanup;
 

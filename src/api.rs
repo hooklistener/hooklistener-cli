@@ -1,7 +1,7 @@
 use crate::models::{ForwardResponse, WebhookRequest};
 use anyhow::{Context, Result, anyhow};
 use reqwest::{
-    Client, Response,
+    Client, Response, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
@@ -530,7 +530,15 @@ impl ApiClient {
             _ => reqwest::Method::GET,
         };
 
-        let mut request_builder = self.client.request(method, target_url);
+        // Build URL with query parameters
+        let mut url = target_url.parse::<Url>()?;
+        if !original_request.query_params.is_empty() {
+            for (key, value) in &original_request.query_params {
+                url.query_pairs_mut().append_pair(key, &value.to_string());
+            }
+        }
+
+        let mut request_builder = self.client.request(method, url);
 
         // Add headers (excluding host-related ones)
         for (key, value) in &original_request.headers {
@@ -542,11 +550,6 @@ impl ApiClient {
             {
                 request_builder = request_builder.header(key, value);
             }
-        }
-
-        // Add query parameters
-        if !original_request.query_params.is_empty() {
-            request_builder = request_builder.query(&original_request.query_params);
         }
 
         // Add body if present (for POST, PUT, PATCH requests)
