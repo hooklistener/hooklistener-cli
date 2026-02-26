@@ -1,0 +1,20 @@
+# cargo-release configuration
+# Usage: cargo release <version>  (e.g. cargo release 0.3.15)
+# Install: cargo install cargo-release
+
+# Create and push the git tag
+tag = true
+tag-prefix = "v"
+tag-message = "Release v{{version}}"
+
+# Commit the version bump
+commit-message = "Release v{{version}}"
+
+# Push commit and tag to remote
+push = true
+
+# Run cargo publish (we let CI handle publishing instead)
+publish = false
+
+# Update Cargo.lock when bumping version
+dependent-version = "fix"
