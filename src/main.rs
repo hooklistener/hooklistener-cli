@@ -11,9 +11,9 @@ mod ui;
 mod updater;
 
 use anyhow::{Result, anyhow};
-use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
 use crossterm::{
     cursor::{MoveToColumn, Show},
     event::{self, Event, KeyEventKind},
@@ -1535,7 +1535,7 @@ async fn run_app<B: ratatui::backend::Backend + Send>(
     app: &mut App,
     mut tunnel_rx: mpsc::Receiver<TunnelEvent>,
     tunnel_reconnect_tx: Option<mpsc::UnboundedSender<()>>,
-) -> Result<()> 
+) -> Result<()>
 where
     <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
 {
