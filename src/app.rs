@@ -855,8 +855,7 @@ mod tests {
     fn make_config() -> Config {
         Config {
             access_token: Some("test-token".to_string()),
-            token_expires_at: None,
-            selected_organization_id: None,
+            ..Config::default()
         }
     }
 

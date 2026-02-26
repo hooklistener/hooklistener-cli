@@ -135,3 +135,23 @@ impl ConfigError {
         }
     }
 }
+
+#[derive(Debug, Error)]
+pub enum UpdateError {
+    #[error("Failed to check for updates: {0}")]
+    CheckFailed(String),
+
+    #[error("Failed to update: {0}")]
+    UpdateFailed(String),
+}
+
+impl UpdateError {
+    pub fn hint(&self) -> Option<&str> {
+        match self {
+            UpdateError::CheckFailed(_) => Some("Check your internet connection and try again."),
+            UpdateError::UpdateFailed(_) => {
+                Some("Try updating manually or check file permissions.")
+            }
+        }
+    }
+}

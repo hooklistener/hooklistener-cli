@@ -4,11 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub access_token: Option<String>,
     pub token_expires_at: Option<DateTime<Utc>>,
     pub selected_organization_id: Option<String>,
+    #[serde(default)]
+    pub last_update_check: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub latest_known_version: Option<String>,
 }
 
 impl Config {
@@ -23,11 +27,7 @@ impl Config {
             let config: Config = serde_json::from_str(&content)?;
             Ok(config)
         } else {
-            Ok(Config {
-                access_token: None,
-                token_expires_at: None,
-                selected_organization_id: None,
-            })
+            Ok(Config::default())
         }
     }
 
@@ -79,9 +79,7 @@ impl Config {
 
     #[cfg(test)]
     pub fn clear_all(&mut self) {
-        self.access_token = None;
-        self.token_expires_at = None;
-        self.selected_organization_id = None;
+        *self = Config::default();
     }
 }
 
@@ -97,11 +95,7 @@ mod tests {
 
     #[test]
     fn test_no_token_is_invalid() {
-        let config = Config {
-            access_token: None,
-            token_expires_at: None,
-            selected_organization_id: None,
-        };
+        let config = Config::default();
         assert!(!config.is_token_valid());
     }
 
@@ -109,8 +103,7 @@ mod tests {
     fn test_token_without_expiry_is_invalid() {
         let config = Config {
             access_token: Some("tok".to_string()),
-            token_expires_at: None,
-            selected_organization_id: None,
+            ..Config::default()
         };
         assert!(!config.is_token_valid());
     }
@@ -120,7 +113,7 @@ mod tests {
         let config = Config {
             access_token: Some("tok".to_string()),
             token_expires_at: Some(Utc::now() - Duration::hours(1)),
-            selected_organization_id: None,
+            ..Config::default()
         };
         assert!(!config.is_token_valid());
     }
@@ -130,18 +123,14 @@ mod tests {
         let config = Config {
             access_token: Some("tok".to_string()),
             token_expires_at: Some(Utc::now() + Duration::hours(1)),
-            selected_organization_id: None,
+            ..Config::default()
         };
         assert!(config.is_token_valid());
     }
 
     #[test]
     fn test_set_access_token() {
-        let mut config = Config {
-            access_token: None,
-            token_expires_at: None,
-            selected_organization_id: None,
-        };
+        let mut config = Config::default();
         let expires = Utc::now() + Duration::hours(24);
         config.set_access_token("my_token".to_string(), expires);
         assert_eq!(config.access_token.as_deref(), Some("my_token"));
@@ -154,6 +143,7 @@ mod tests {
             access_token: Some("tok".to_string()),
             token_expires_at: Some(Utc::now()),
             selected_organization_id: Some("org-1".to_string()),
+            ..Config::default()
         };
         config.clear_token();
         assert!(config.access_token.is_none());
@@ -167,6 +157,7 @@ mod tests {
             access_token: Some("tok".to_string()),
             token_expires_at: Some(Utc::now()),
             selected_organization_id: Some("org-1".to_string()),
+            ..Config::default()
         };
         config.clear_all();
         assert!(config.access_token.is_none());
@@ -176,11 +167,7 @@ mod tests {
 
     #[test]
     fn test_set_selected_organization() {
-        let mut config = Config {
-            access_token: None,
-            token_expires_at: None,
-            selected_organization_id: None,
-        };
+        let mut config = Config::default();
         config.set_selected_organization("org-42".to_string());
         assert_eq!(config.selected_organization_id.as_deref(), Some("org-42"));
     }
@@ -195,6 +182,7 @@ mod tests {
             access_token: Some("roundtrip_token".to_string()),
             token_expires_at: Some(expires),
             selected_organization_id: Some("org-rt".to_string()),
+            ..Config::default()
         };
         config.save_to(&path).unwrap();
 

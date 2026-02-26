@@ -8,6 +8,7 @@ mod models;
 mod syntax;
 mod tunnel;
 mod ui;
+mod updater;
 
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -120,6 +121,8 @@ enum Commands {
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+    /// Update hooklistener to the latest version
+    Update,
     /// Start HTTP tunnel to forward requests to local server
     Tunnel {
         /// Local port to forward requests to
@@ -345,7 +348,7 @@ fn normalize_http_method(method: Option<String>) -> Result<Option<String>> {
     Ok(Some(normalized))
 }
 
-fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
@@ -367,6 +370,16 @@ async fn main() -> Result<()> {
         println!();
         return Ok(());
     };
+
+    // Spawn background version check for non-interactive, non-update commands
+    let update_handle =
+        if !json && !matches!(command, Commands::Update | Commands::Completions { .. }) {
+            config::Config::load()
+                .ok()
+                .and_then(|cfg| updater::spawn_version_check(&cfg))
+        } else {
+            None
+        };
 
     match command {
         Commands::Login { force } => {
@@ -993,6 +1006,9 @@ async fn main() -> Result<()> {
                 CompletionShell::Elvish => generate(Elvish, &mut command, bin_name, &mut stdout),
             }
         }
+        Commands::Update => {
+            updater::run_self_update(json).await?;
+        }
         Commands::Tunnel {
             port,
             host,
@@ -1061,6 +1077,15 @@ async fn main() -> Result<()> {
                 display_error(&err);
             }
         }
+    }
+
+    // Await background version check and show notification if update is available
+    if let Some(handle) = update_handle
+        && let Ok(Ok(Some(new_version))) =
+            tokio::time::timeout(Duration::from_millis(500), handle).await
+    {
+        updater::persist_check_result(Some(&new_version));
+        updater::print_update_notification(&new_version);
     }
 
     Ok(())
@@ -1717,6 +1742,9 @@ fn error_hint(err: &anyhow::Error) -> Option<&str> {
     if let Some(e) = err.downcast_ref::<errors::ConfigError>() {
         return e.hint();
     }
+    if let Some(e) = err.downcast_ref::<errors::UpdateError>() {
+        return e.hint();
+    }
     None
 }
 
@@ -1763,9 +1791,8 @@ mod tests {
 
     fn make_config(selected_org: Option<&str>) -> config::Config {
         config::Config {
-            access_token: None,
-            token_expires_at: None,
             selected_organization_id: selected_org.map(String::from),
+            ..config::Config::default()
         }
     }
 
