@@ -4,11 +4,11 @@
 
 # Create and push the git tag
 tag = true
-tag-prefix = "v"
+tag-prefix = ""
 tag-message = "Release v{{version}}"
 
 # Commit the version bump
-commit-message = "Release v{{version}}"
+pre-release-commit-message = "Release v{{version}}"
 
 # Push commit and tag to remote
 push = true
