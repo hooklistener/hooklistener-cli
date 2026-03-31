@@ -214,9 +214,202 @@ struct DataResponse<T> {
     data: T,
 }
 
+// ── Anonymous Endpoint models ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnonEndpointCreated {
+    pub id: String,
+    pub viewer_token: String,
+    pub expires_at: String,
+    pub webhook_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnonEndpointStatus {
+    pub id: String,
+    pub active: bool,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnonEvent {
+    pub id: String,
+    pub endpoint_id: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_map_or_default")]
+    pub headers: HashMap<String, Value>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub inserted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnonEventsResponse {
+    pub data: Vec<AnonEvent>,
+    pub pagination: Pagination,
+}
+
+// ── Shared Request models ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedRequestSummary {
+    pub id: String,
+    pub share_token: String,
+    #[serde(default)]
+    pub share_url: Option<String>,
+    pub debug_request_id: String,
+    #[serde(default)]
+    pub include_forwards: bool,
+    #[serde(default)]
+    pub password_protected: bool,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub view_count: u64,
+    #[serde(default)]
+    pub last_viewed_at: Option<String>,
+    #[serde(default)]
+    pub created_by_user_id: Option<String>,
+    #[serde(default)]
+    pub inserted_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+// ── Uptime Monitor models ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UptimeMonitor {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    #[serde(default = "default_method")]
+    pub method: String,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub expected_status_code: Option<u16>,
+    #[serde(default)]
+    pub body_contains: Option<String>,
+    #[serde(default)]
+    pub check_interval: Option<u32>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub current_status: Option<String>,
+    #[serde(default)]
+    pub last_checked_at: Option<String>,
+    #[serde(default)]
+    pub last_status_change_at: Option<String>,
+    #[serde(default)]
+    pub consecutive_failures: Option<u32>,
+    #[serde(default)]
+    pub failure_threshold: Option<u32>,
+    #[serde(default)]
+    pub email_enabled: bool,
+    #[serde(default)]
+    pub slack_enabled: bool,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+fn default_method() -> String {
+    "get".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UptimeCheck {
+    pub id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub response_time_ms: Option<u64>,
+    #[serde(default)]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub checked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UptimeChecksStats {
+    #[serde(default)]
+    pub uptime_percentage: Option<f64>,
+    #[serde(default)]
+    pub avg_response_time_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UptimeChecksResponse {
+    pub data: Vec<UptimeCheck>,
+    pub pagination: Pagination,
+    #[serde(default)]
+    pub stats: Option<UptimeChecksStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenRefreshResponse {
+    pub access_token: String,
+    pub expires_in: u64,
+}
+
 pub struct ApiClient {
     client: Client,
     base_url: Option<String>,
+}
+
+pub fn default_base_url() -> String {
+    std::env::var("HOOKLISTENER_API_URL")
+        .unwrap_or_else(|_| "https://app.hooklistener.com".to_string())
+}
+
+/// Refresh an expired CLI access token using a refresh token (no auth needed).
+pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenRefreshResponse> {
+    let base_url = default_base_url();
+    let url = format!("{}/api/v1/auth/refresh", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "refresh_token": refresh_token });
+
+    let client = Client::new();
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to refresh access token")?;
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!("Token refresh failed (HTTP {}): {}", status, text));
+    }
+
+    serde_json::from_str(&text).context("Failed to parse refresh response")
+}
+
+/// Revoke a CLI refresh token server-side (best-effort, no auth needed).
+pub async fn revoke_refresh_token(refresh_token: &str) -> Result<()> {
+    let base_url = default_base_url();
+    let url = format!("{}/api/v1/auth/revoke", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "refresh_token": refresh_token });
+
+    let client = Client::new();
+    let _ = client.post(&url).json(&body).send().await;
+    Ok(())
 }
 
 impl ApiClient {
@@ -225,6 +418,14 @@ impl ApiClient {
             client: Client::new(),
             base_url: None,
         }
+    }
+
+    /// Create a client with no authentication (for anonymous endpoints).
+    pub fn unauthenticated() -> Result<Self> {
+        Ok(Self {
+            client: Client::new(),
+            base_url: Some(default_base_url()),
+        })
     }
 
     pub fn with_organization(
@@ -250,12 +451,9 @@ impl ApiClient {
             .build()
             .context("Failed to build API client")?;
 
-        let base_url = std::env::var("HOOKLISTENER_API_URL")
-            .unwrap_or_else(|_| "https://app.hooklistener.com".to_string());
-
         Ok(Self {
             client,
-            base_url: Some(base_url),
+            base_url: Some(default_base_url()),
         })
     }
 
@@ -317,6 +515,23 @@ impl ApiClient {
         let response = self
             .client
             .post(url)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to {}", context))?;
+        self.parse_json_response(response, context).await
+    }
+
+    async fn patch_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+        context: &str,
+    ) -> Result<T> {
+        let url = self.api_url(path)?;
+        let response = self
+            .client
+            .patch(url)
             .json(body)
             .send()
             .await
@@ -509,6 +724,161 @@ impl ApiClient {
             organization_id, slug_id
         );
         self.delete_json(&path, "delete static tunnel").await
+    }
+
+    // ── Uptime Monitor methods ──────────────────────────────────────────────
+
+    pub async fn list_uptime_monitors(&self) -> Result<Vec<UptimeMonitor>> {
+        let response: DataResponse<Vec<UptimeMonitor>> = self
+            .get_json("/api/v1/uptime-monitors", "list uptime monitors")
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn get_uptime_monitor(&self, id: &str) -> Result<UptimeMonitor> {
+        let path = format!("/api/v1/uptime-monitors/{}", id);
+        let response: DataResponse<UptimeMonitor> =
+            self.get_json(&path, "get uptime monitor").await?;
+        Ok(response.data)
+    }
+
+    pub async fn create_uptime_monitor(&self, params: &Value) -> Result<UptimeMonitor> {
+        let body = serde_json::json!({ "uptime_monitor": params });
+        let response: DataResponse<UptimeMonitor> = self
+            .post_json("/api/v1/uptime-monitors", &body, "create uptime monitor")
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn update_uptime_monitor(
+        &self,
+        id: &str,
+        params: &Value,
+    ) -> Result<UptimeMonitor> {
+        let path = format!("/api/v1/uptime-monitors/{}", id);
+        let body = serde_json::json!({ "uptime_monitor": params });
+        let response: DataResponse<UptimeMonitor> = self
+            .patch_json(&path, &body, "update uptime monitor")
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn delete_uptime_monitor(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/uptime-monitors/{}", id);
+        self.delete_empty(&path, "delete uptime monitor").await
+    }
+
+    pub async fn list_uptime_checks(
+        &self,
+        monitor_id: &str,
+        page: u32,
+        page_size: u32,
+    ) -> Result<UptimeChecksResponse> {
+        let path = format!(
+            "/api/v1/uptime-monitors/{}/checks?page={}&page_size={}",
+            monitor_id, page, page_size
+        );
+        self.get_json(&path, "list uptime checks").await
+    }
+
+    // ── Anonymous Endpoint methods ────────────────────────────────────────────
+
+    pub async fn create_anon_endpoint(
+        &self,
+        ttl_seconds: Option<u64>,
+    ) -> Result<AnonEndpointCreated> {
+        let mut body = serde_json::Map::new();
+        if let Some(ttl) = ttl_seconds {
+            body.insert("ttl_seconds".to_string(), Value::Number(ttl.into()));
+        }
+        self.post_json("/api/v1/anon/endpoints", &Value::Object(body), "create anonymous endpoint")
+            .await
+    }
+
+    pub async fn get_anon_endpoint(&self, id: &str) -> Result<AnonEndpointStatus> {
+        let path = format!("/api/v1/anon/endpoints/{}", id);
+        self.get_json(&path, "get anonymous endpoint").await
+    }
+
+    pub async fn list_anon_events(
+        &self,
+        endpoint_id: &str,
+        page: u32,
+        page_size: u32,
+    ) -> Result<AnonEventsResponse> {
+        let path = format!(
+            "/api/v1/anon/endpoints/{}/events?page={}&page_size={}",
+            endpoint_id, page, page_size
+        );
+        self.get_json(&path, "list anonymous endpoint events").await
+    }
+
+    pub async fn get_anon_event(
+        &self,
+        endpoint_id: &str,
+        event_id: &str,
+    ) -> Result<AnonEvent> {
+        let path = format!(
+            "/api/v1/anon/endpoints/{}/events/{}",
+            endpoint_id, event_id
+        );
+        self.get_json(&path, "get anonymous endpoint event").await
+    }
+
+    // ── Shared Request methods ──────────────────────────────────────────────
+
+    pub async fn create_shared_request(
+        &self,
+        debug_request_id: &str,
+        expires_in_hours: Option<u64>,
+        password: Option<&str>,
+        include_forwards: bool,
+    ) -> Result<SharedRequestSummary> {
+        let path = format!("/api/v1/debug-requests/{}/share", debug_request_id);
+        let mut share_body = serde_json::Map::new();
+        if let Some(hours) = expires_in_hours {
+            share_body.insert(
+                "expires_in_hours".to_string(),
+                Value::Number(hours.into()),
+            );
+        }
+        if let Some(pw) = password {
+            share_body.insert("password".to_string(), Value::String(pw.to_string()));
+        }
+        share_body.insert("include_forwards".to_string(), Value::Bool(include_forwards));
+
+        let body = Value::Object(
+            [("share".to_string(), Value::Object(share_body))]
+                .into_iter()
+                .collect(),
+        );
+
+        let response: DataResponse<SharedRequestSummary> = self
+            .post_json(&path, &body, "create shared request")
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn list_shared_requests(
+        &self,
+        debug_request_id: &str,
+    ) -> Result<Vec<SharedRequestSummary>> {
+        let path = format!("/api/v1/debug-requests/{}/shares", debug_request_id);
+        let response: DataResponse<Vec<SharedRequestSummary>> =
+            self.get_json(&path, "list shared requests").await?;
+        Ok(response.data)
+    }
+
+    pub async fn get_shared_request(&self, token: &str) -> Result<Value> {
+        let path = format!("/api/v1/shared/r/{}", token);
+        let response: DataResponse<Value> =
+            self.get_json(&path, "get shared request").await?;
+        Ok(response.data)
+    }
+
+    pub async fn revoke_shared_request(&self, token: &str) -> Result<()> {
+        let path = format!("/api/v1/shared/r/{}", token);
+        self.delete_empty(&path, "revoke shared request").await
     }
 
     pub async fn forward_request(

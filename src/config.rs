@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub access_token: Option<String>,
     pub token_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub refresh_token_expires_at: Option<DateTime<Utc>>,
     pub selected_organization_id: Option<String>,
     #[serde(default)]
     pub last_update_check: Option<DateTime<Utc>>,
@@ -54,9 +58,17 @@ impl Config {
         Ok(home.join("hooklistener").join("config.json"))
     }
 
-    pub fn set_access_token(&mut self, access_token: String, expires_at: DateTime<Utc>) {
+    pub fn set_tokens(
+        &mut self,
+        access_token: String,
+        expires_at: DateTime<Utc>,
+        refresh_token: Option<String>,
+        refresh_expires_at: Option<DateTime<Utc>>,
+    ) {
         self.access_token = Some(access_token);
         self.token_expires_at = Some(expires_at);
+        self.refresh_token = refresh_token;
+        self.refresh_token_expires_at = refresh_expires_at;
     }
 
     pub fn is_token_valid(&self) -> bool {
@@ -67,9 +79,19 @@ impl Config {
         }
     }
 
+    pub fn is_refresh_token_valid(&self) -> bool {
+        if let (Some(_), Some(expires_at)) = (&self.refresh_token, &self.refresh_token_expires_at) {
+            Utc::now() < *expires_at
+        } else {
+            false
+        }
+    }
+
     pub fn clear_token(&mut self) {
         self.access_token = None;
         self.token_expires_at = None;
+        self.refresh_token = None;
+        self.refresh_token_expires_at = None;
     }
 
     #[cfg(test)]
@@ -129,12 +151,20 @@ mod tests {
     }
 
     #[test]
-    fn test_set_access_token() {
+    fn test_set_tokens() {
         let mut config = Config::default();
-        let expires = Utc::now() + Duration::hours(24);
-        config.set_access_token("my_token".to_string(), expires);
+        let expires = Utc::now() + Duration::hours(1);
+        let refresh_expires = Utc::now() + Duration::days(30);
+        config.set_tokens(
+            "my_token".to_string(),
+            expires,
+            Some("my_refresh".to_string()),
+            Some(refresh_expires),
+        );
         assert_eq!(config.access_token.as_deref(), Some("my_token"));
         assert_eq!(config.token_expires_at, Some(expires));
+        assert_eq!(config.refresh_token.as_deref(), Some("my_refresh"));
+        assert_eq!(config.refresh_token_expires_at, Some(refresh_expires));
     }
 
     #[test]
@@ -142,12 +172,16 @@ mod tests {
         let mut config = Config {
             access_token: Some("tok".to_string()),
             token_expires_at: Some(Utc::now()),
+            refresh_token: Some("ref".to_string()),
+            refresh_token_expires_at: Some(Utc::now()),
             selected_organization_id: Some("org-1".to_string()),
             ..Config::default()
         };
         config.clear_token();
         assert!(config.access_token.is_none());
         assert!(config.token_expires_at.is_none());
+        assert!(config.refresh_token.is_none());
+        assert!(config.refresh_token_expires_at.is_none());
         assert_eq!(config.selected_organization_id.as_deref(), Some("org-1"));
     }
 

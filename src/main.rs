@@ -116,6 +116,21 @@ enum Commands {
         #[command(subcommand)]
         action: StaticTunnelAction,
     },
+    /// Anonymous (temporary) debug endpoints — no login required
+    Anon {
+        #[command(subcommand)]
+        action: AnonAction,
+    },
+    /// Share captured requests via public links
+    Share {
+        #[command(subcommand)]
+        action: ShareAction,
+    },
+    /// Uptime monitoring for your endpoints
+    Monitor {
+        #[command(subcommand)]
+        action: MonitorAction,
+    },
     /// Generate shell completion scripts
     Completions {
         /// Target shell
@@ -312,6 +327,187 @@ enum StaticTunnelAction {
     Delete {
         /// Static tunnel ID
         slug_id: String,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnonAction {
+    /// Create a temporary anonymous endpoint (no login required)
+    Create {
+        /// Time-to-live in seconds (default: 86400 = 24 hours)
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Show status of an anonymous endpoint
+    Show {
+        /// Anonymous endpoint ID
+        id: String,
+    },
+    /// List captured events for an anonymous endpoint
+    Events {
+        /// Anonymous endpoint ID
+        endpoint_id: String,
+        /// Viewer token (returned when the endpoint was created)
+        #[arg(long)]
+        token: String,
+        /// Page number
+        #[arg(long, default_value = "1")]
+        page: u32,
+        /// Page size
+        #[arg(long, default_value = "50")]
+        page_size: u32,
+    },
+    /// Show a single captured event
+    Event {
+        /// Anonymous endpoint ID
+        endpoint_id: String,
+        /// Event ID
+        event_id: String,
+        /// Viewer token (returned when the endpoint was created)
+        #[arg(long)]
+        token: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ShareAction {
+    /// Create a shareable link for a captured request
+    Create {
+        /// Debug request ID to share
+        debug_request_id: String,
+        /// Expiration in hours (e.g. 24)
+        #[arg(long)]
+        expires_in_hours: Option<u64>,
+        /// Optional password to protect the share
+        #[arg(long)]
+        password: Option<String>,
+        /// Include forwards in the shared view
+        #[arg(long)]
+        include_forwards: bool,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// List all shares for a captured request
+    List {
+        /// Debug request ID
+        debug_request_id: String,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// View a shared request by its share token (public, no login required)
+    Show {
+        /// Share token
+        token: String,
+    },
+    /// Revoke a shared request link
+    Revoke {
+        /// Share token to revoke
+        token: String,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MonitorAction {
+    /// Create a new uptime monitor
+    Create {
+        /// Monitor display name
+        name: String,
+        /// URL to monitor (must be http:// or https://)
+        url: String,
+        /// HTTP method (get, post, put, patch, delete, head)
+        #[arg(long, default_value = "get")]
+        method: String,
+        /// Expected HTTP status code
+        #[arg(long, default_value = "200")]
+        expected_status: u16,
+        /// Check interval in minutes (1, 5, 10, 30, 60)
+        #[arg(long, default_value = "5")]
+        interval: u32,
+        /// String the response body must contain
+        #[arg(long)]
+        body_contains: Option<String>,
+        /// Request body to send (for POST/PUT/PATCH)
+        #[arg(long)]
+        body: Option<String>,
+        /// Number of consecutive failures before alerting
+        #[arg(long, default_value = "2")]
+        failure_threshold: u32,
+        /// Enable email notifications
+        #[arg(long, default_value = "true")]
+        email: bool,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// List all uptime monitors
+    List {
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Show details of an uptime monitor
+    Show {
+        /// Monitor ID
+        id: String,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Update an uptime monitor
+    Update {
+        /// Monitor ID
+        id: String,
+        /// New name
+        #[arg(long)]
+        name: Option<String>,
+        /// New URL
+        #[arg(long)]
+        url: Option<String>,
+        /// HTTP method
+        #[arg(long)]
+        method: Option<String>,
+        /// Expected HTTP status code
+        #[arg(long)]
+        expected_status: Option<u16>,
+        /// Check interval in minutes (1, 5, 10, 30, 60)
+        #[arg(long)]
+        interval: Option<u32>,
+        /// Enable or disable the monitor
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// Number of consecutive failures before alerting
+        #[arg(long)]
+        failure_threshold: Option<u32>,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Delete an uptime monitor
+    Delete {
+        /// Monitor ID
+        id: String,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Show recent check history for a monitor
+    Checks {
+        /// Monitor ID
+        id: String,
+        /// Page number
+        #[arg(long, default_value = "1")]
+        page: u32,
+        /// Page size
+        #[arg(long, default_value = "50")]
+        page_size: u32,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
         org: Option<String>,
@@ -620,6 +816,10 @@ async fn main() -> Result<()> {
                     println!("{}", "Already logged out.".dim());
                 }
             } else {
+                // Best-effort revoke refresh token server-side
+                if let Some(ref refresh_token) = config.refresh_token {
+                    let _ = api::revoke_refresh_token(refresh_token).await;
+                }
                 config.clear_token();
                 config.save()?;
                 if json {
@@ -633,8 +833,8 @@ async fn main() -> Result<()> {
         }
         Commands::Org { action } => match action {
             OrgAction::List => {
-                let config = config::Config::load()?;
-                let token = access_token_from_config(&config)?;
+                let mut config = config::Config::load()?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, None)?;
                 let organizations = client.list_organizations().await?;
                 if json {
@@ -648,7 +848,7 @@ async fn main() -> Result<()> {
             }
             OrgAction::Use { id } => {
                 let mut config = config::Config::load()?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, None)?;
                 let organizations = client.list_organizations().await?;
                 let organization_name = organizations
@@ -691,9 +891,9 @@ async fn main() -> Result<()> {
         },
         Commands::Endpoint { action } => match action {
             EndpointAction::Create { name, slug, org } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let endpoint = client.create_endpoint(&name, slug.as_deref()).await?;
                 if json {
@@ -708,9 +908,9 @@ async fn main() -> Result<()> {
                 }
             }
             EndpointAction::List { org } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let endpoints = client.list_endpoints().await?;
                 if json {
@@ -724,9 +924,9 @@ async fn main() -> Result<()> {
                 }
             }
             EndpointAction::Show { endpoint_id, org } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let endpoint = client.get_endpoint(&endpoint_id).await?;
                 if json {
@@ -740,9 +940,9 @@ async fn main() -> Result<()> {
                 }
             }
             EndpointAction::Delete { endpoint_id, org } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 client.delete_endpoint(&endpoint_id).await?;
                 if json {
@@ -765,9 +965,9 @@ async fn main() -> Result<()> {
                 page_size,
                 org,
             } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let requests = client
                     .list_endpoint_requests(&endpoint_id, page, page_size)
@@ -789,9 +989,9 @@ async fn main() -> Result<()> {
                 request_id,
                 org,
             } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let request = client
                     .get_endpoint_request(&endpoint_id, &request_id)
@@ -813,9 +1013,9 @@ async fn main() -> Result<()> {
                 request_id,
                 org,
             } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 client
                     .delete_endpoint_request(&endpoint_id, &request_id)
@@ -846,9 +1046,9 @@ async fn main() -> Result<()> {
                 method,
                 org,
             } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let normalized_method = normalize_http_method(method)?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let response = client
@@ -885,9 +1085,9 @@ async fn main() -> Result<()> {
                 page_size,
                 org,
             } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let forwards = client
                     .list_endpoint_request_forwards(&endpoint_id, &request_id, page, page_size)
@@ -907,9 +1107,9 @@ async fn main() -> Result<()> {
                 }
             }
             EndpointAction::Forward { forward_id, org } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let forward = client.get_forward(&forward_id).await?;
                 if json {
@@ -925,9 +1125,9 @@ async fn main() -> Result<()> {
         },
         Commands::StaticTunnel { action } => match action {
             StaticTunnelAction::List { org } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let tunnels = client.list_static_tunnels(&organization_id).await?;
                 if json {
@@ -941,9 +1141,9 @@ async fn main() -> Result<()> {
                 }
             }
             StaticTunnelAction::Create { slug, name, org } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let created = client
                     .create_static_tunnel(&organization_id, &slug, name.as_deref())
@@ -965,9 +1165,9 @@ async fn main() -> Result<()> {
                 }
             }
             StaticTunnelAction::Delete { slug_id, org } => {
-                let config = config::Config::load()?;
+                let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
-                let token = access_token_from_config(&config)?;
+                let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let response = client
                     .delete_static_tunnel(&organization_id, &slug_id)
@@ -986,6 +1186,392 @@ async fn main() -> Result<()> {
                             .message
                             .unwrap_or_else(|| "Static tunnel deleted.".to_string())
                     );
+                }
+            }
+        },
+        Commands::Anon { action } => match action {
+            AnonAction::Create { ttl } => {
+                let client = ApiClient::unauthenticated()?;
+                let endpoint = client.create_anon_endpoint(ttl).await?;
+                if json {
+                    print_json(&endpoint)?;
+                } else {
+                    println!("✅ Created anonymous endpoint:");
+                    println!("  {} {}", "ID:".bold(), endpoint.id);
+                    println!(
+                        "  {} {}",
+                        "Webhook URL:".bold(),
+                        endpoint.webhook_url.as_str().underlined()
+                    );
+                    println!("  {} {}", "Expires At:".bold(), endpoint.expires_at.dim());
+                    println!();
+                    println!(
+                        "  {} {}",
+                        "Viewer Token:".bold(),
+                        endpoint.viewer_token.as_str().yellow()
+                    );
+                    println!(
+                        "  {}",
+                        "Save this token! You need it to list captured events.".dim()
+                    );
+                }
+            }
+            AnonAction::Show { id } => {
+                let client = ApiClient::unauthenticated()?;
+                let status = client.get_anon_endpoint(&id).await?;
+                if json {
+                    print_json(&status)?;
+                } else {
+                    println!("  {} {}", "ID:".bold(), status.id);
+                    let active_str = if status.active {
+                        "active".green().to_string()
+                    } else {
+                        "expired".red().to_string()
+                    };
+                    println!("  {} {}", "Status:".bold(), active_str);
+                    if let Some(expires) = status.expires_at.as_deref() {
+                        println!("  {} {}", "Expires At:".bold(), expires.dim());
+                    }
+                    if let Some(url) = status.webhook_url.as_deref() {
+                        println!("  {} {}", "Webhook URL:".bold(), url.underlined());
+                    }
+                    if let Some(error) = status.error.as_deref() {
+                        println!("  {} {}", "Error:".red().bold(), error);
+                    }
+                }
+            }
+            AnonAction::Events {
+                endpoint_id,
+                token,
+                page,
+                page_size,
+            } => {
+                let client = ApiClient::with_organization(token, None)?;
+                let response = client.list_anon_events(&endpoint_id, page, page_size).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "endpoint_id": endpoint_id,
+                        "events": response
+                    }))?;
+                } else {
+                    print_context("Endpoint:", &endpoint_id);
+                    print_anon_events(&response);
+                }
+            }
+            AnonAction::Event {
+                endpoint_id,
+                event_id,
+                token,
+            } => {
+                let client = ApiClient::with_organization(token, None)?;
+                let event = client.get_anon_event(&endpoint_id, &event_id).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "endpoint_id": endpoint_id,
+                        "event": event
+                    }))?;
+                } else {
+                    print_context("Endpoint:", &endpoint_id);
+                    print_anon_event_detail(&event);
+                }
+            }
+        },
+        Commands::Share { action } => match action {
+            ShareAction::Create {
+                debug_request_id,
+                expires_in_hours,
+                password,
+                include_forwards,
+                org,
+            } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+                let shared = client
+                    .create_shared_request(
+                        &debug_request_id,
+                        expires_in_hours,
+                        password.as_deref(),
+                        include_forwards,
+                    )
+                    .await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "organization_id": organization_id,
+                        "shared_request": shared
+                    }))?;
+                } else {
+                    print_context("Organization:", &organization_id);
+                    println!("✅ Created shared link:");
+                    println!("  {} {}", "Share Token:".bold(), shared.share_token);
+                    if let Some(url) = shared.share_url.as_deref() {
+                        println!("  {} {}", "Share URL:".bold(), url.underlined());
+                    }
+                    println!("  {} {}", "Request ID:".bold(), shared.debug_request_id);
+                    if shared.password_protected {
+                        println!(
+                            "  {} {}",
+                            "Password:".bold(),
+                            "protected".yellow()
+                        );
+                    }
+                    if let Some(expires) = shared.expires_at.as_deref() {
+                        println!("  {} {}", "Expires At:".bold(), expires.dim());
+                    }
+                    println!(
+                        "  {} {}",
+                        "Include Forwards:".bold(),
+                        shared.include_forwards
+                    );
+                }
+            }
+            ShareAction::List {
+                debug_request_id,
+                org,
+            } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+                let shares = client.list_shared_requests(&debug_request_id).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "organization_id": organization_id,
+                        "debug_request_id": debug_request_id,
+                        "shares": shares
+                    }))?;
+                } else {
+                    print_context("Organization:", &organization_id);
+                    print_context("Request:", &debug_request_id);
+                    print_shared_requests(&shares);
+                }
+            }
+            ShareAction::Show { token } => {
+                let client = ApiClient::unauthenticated()?;
+                let data = client.get_shared_request(&token).await?;
+                if json {
+                    print_json(&data)?;
+                } else {
+                    // Check if it's a protected share
+                    if data.get("protected").and_then(|v| v.as_bool()) == Some(true) {
+                        println!(
+                            "{} This share is password-protected.",
+                            "🔒".bold()
+                        );
+                        if let Some(expires) = data.get("expires_at").and_then(|v| v.as_str()) {
+                            println!("  {} {}", "Expires At:".bold(), expires.dim());
+                        }
+                        println!(
+                            "\n  {}",
+                            "Use the web UI or API to authenticate with the password.".dim()
+                        );
+                    } else {
+                        print_shared_request_full(&data);
+                    }
+                }
+            }
+            ShareAction::Revoke { token, org } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let access_token = ensure_valid_token(&mut config).await?;
+                let client =
+                    ApiClient::with_organization(access_token, Some(organization_id.clone()))?;
+                client.revoke_shared_request(&token).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "status": "revoked",
+                        "organization_id": organization_id,
+                        "share_token": token
+                    }))?;
+                } else {
+                    println!(
+                        "🗑  Revoked share: {} {}",
+                        token.bold(),
+                        format!("(organization {})", organization_id).dim()
+                    );
+                }
+            }
+        },
+        Commands::Monitor { action } => match action {
+            MonitorAction::Create {
+                name,
+                url,
+                method,
+                expected_status,
+                interval,
+                body_contains,
+                body,
+                failure_threshold,
+                email,
+                org,
+            } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+
+                let mut params = serde_json::json!({
+                    "name": name,
+                    "url": url,
+                    "method": method.to_lowercase(),
+                    "expected_status_code": expected_status,
+                    "check_interval": interval,
+                    "failure_threshold": failure_threshold,
+                    "email_enabled": email,
+                });
+                if let Some(bc) = body_contains {
+                    params["body_contains"] = serde_json::Value::String(bc);
+                }
+                if let Some(b) = body {
+                    params["body"] = serde_json::Value::String(b);
+                }
+
+                let monitor = client.create_uptime_monitor(&params).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "organization_id": organization_id,
+                        "monitor": monitor
+                    }))?;
+                } else {
+                    print_context("Organization:", &organization_id);
+                    println!("✅ Created uptime monitor:");
+                    print_monitor_detail(&monitor);
+                }
+            }
+            MonitorAction::List { org } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+                let monitors = client.list_uptime_monitors().await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "organization_id": organization_id,
+                        "monitors": monitors
+                    }))?;
+                } else {
+                    print_context("Organization:", &organization_id);
+                    print_monitors(&monitors);
+                }
+            }
+            MonitorAction::Show { id, org } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+                let monitor = client.get_uptime_monitor(&id).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "organization_id": organization_id,
+                        "monitor": monitor
+                    }))?;
+                } else {
+                    print_context("Organization:", &organization_id);
+                    print_monitor_detail(&monitor);
+                }
+            }
+            MonitorAction::Update {
+                id,
+                name,
+                url,
+                method,
+                expected_status,
+                interval,
+                enabled,
+                failure_threshold,
+                org,
+            } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+
+                let mut params = serde_json::Map::new();
+                if let Some(v) = name {
+                    params.insert("name".into(), serde_json::Value::String(v));
+                }
+                if let Some(v) = url {
+                    params.insert("url".into(), serde_json::Value::String(v));
+                }
+                if let Some(v) = method {
+                    params.insert(
+                        "method".into(),
+                        serde_json::Value::String(v.to_lowercase()),
+                    );
+                }
+                if let Some(v) = expected_status {
+                    params.insert("expected_status_code".into(), v.into());
+                }
+                if let Some(v) = interval {
+                    params.insert("check_interval".into(), v.into());
+                }
+                if let Some(v) = enabled {
+                    params.insert("enabled".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = failure_threshold {
+                    params.insert("failure_threshold".into(), v.into());
+                }
+
+                if params.is_empty() {
+                    return Err(anyhow!("No fields to update. Use --name, --url, --method, --expected-status, --interval, --enabled, or --failure-threshold."));
+                }
+
+                let monitor = client
+                    .update_uptime_monitor(&id, &serde_json::Value::Object(params))
+                    .await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "organization_id": organization_id,
+                        "monitor": monitor
+                    }))?;
+                } else {
+                    print_context("Organization:", &organization_id);
+                    println!("✅ Updated monitor:");
+                    print_monitor_detail(&monitor);
+                }
+            }
+            MonitorAction::Delete { id, org } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+                client.delete_uptime_monitor(&id).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "status": "deleted",
+                        "organization_id": organization_id,
+                        "monitor_id": id
+                    }))?;
+                } else {
+                    println!(
+                        "🗑  Deleted monitor: {} {}",
+                        id.bold(),
+                        format!("(organization {})", organization_id).dim()
+                    );
+                }
+            }
+            MonitorAction::Checks {
+                id,
+                page,
+                page_size,
+                org,
+            } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+                let response = client.list_uptime_checks(&id, page, page_size).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "organization_id": organization_id,
+                        "monitor_id": id,
+                        "checks": response
+                    }))?;
+                } else {
+                    print_context("Organization:", &organization_id);
+                    print_context("Monitor:", &id);
+                    print_uptime_checks(&response);
                 }
             }
         },
@@ -1113,9 +1699,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
         config.save()?;
     }
 
-    let base_url = std::env::var("HOOKLISTENER_API_URL")
-        .unwrap_or_else(|_| "https://app.hooklistener.com".to_string());
-    let mut device_flow = auth::DeviceCodeFlow::new(base_url);
+    let mut device_flow = auth::DeviceCodeFlow::new(api::default_base_url());
 
     let user_code = device_flow.initiate_device_flow().await?;
     let display_code = device_flow
@@ -1145,10 +1729,21 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
     loop {
         // Poll the API
         match device_flow.poll_for_authorization().await {
-            Ok(Some(access_token)) => {
+            Ok(Some(token_response)) => {
                 execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-                let expires_at = Utc::now() + ChronoDuration::days(SESSION_TOKEN_VALIDITY_DAYS);
-                config.set_access_token(access_token, expires_at);
+                let access_expires_at = match token_response.expires_in {
+                    Some(secs) => Utc::now() + ChronoDuration::seconds(secs as i64),
+                    None => Utc::now() + ChronoDuration::days(SESSION_TOKEN_VALIDITY_DAYS),
+                };
+                let refresh_expires_at = token_response
+                    .refresh_expires_in
+                    .map(|secs| Utc::now() + ChronoDuration::seconds(secs as i64));
+                config.set_tokens(
+                    token_response.access_token,
+                    access_expires_at,
+                    token_response.refresh_token,
+                    refresh_expires_at,
+                );
                 config.save()?;
                 println!("  ✅ Authentication successful!\n");
                 println!(
@@ -1212,17 +1807,35 @@ fn resolve_tunnel_org(cli_org: Option<String>, config: &config::Config) -> Optio
     cli_org.or_else(|| config.selected_organization_id.clone())
 }
 
-fn access_token_from_config(config: &config::Config) -> Result<String> {
-    if !config.is_token_valid() {
-        return Err(anyhow!(
-            "Not authenticated. Please run `hooklistener login` first."
-        ));
+async fn ensure_valid_token(config: &mut config::Config) -> Result<String> {
+    // 1. If access token is still valid, return it
+    if config.is_token_valid() {
+        return config
+            .access_token
+            .clone()
+            .ok_or_else(|| anyhow!("No access token found. Please run `hooklistener login`."));
     }
 
-    config
-        .access_token
-        .clone()
-        .ok_or_else(|| anyhow!("No access token found. Please run `hooklistener login`."))
+    // 2. If refresh token is valid, try refreshing
+    if let Some(ref refresh_token) = config.refresh_token.clone()
+        && config.is_refresh_token_valid()
+        && let Ok(response) = api::refresh_access_token(refresh_token).await
+    {
+        let expires_at = Utc::now() + ChronoDuration::seconds(response.expires_in as i64);
+        config.set_tokens(
+            response.access_token.clone(),
+            expires_at,
+            config.refresh_token.clone(),
+            config.refresh_token_expires_at,
+        );
+        config.save()?;
+        return Ok(response.access_token);
+    }
+
+    // 3. No valid tokens
+    Err(anyhow!(
+        "Session expired. Please run `hooklistener login` to re-authenticate."
+    ))
 }
 
 fn require_organization(cli_org: Option<String>, config: &config::Config) -> Result<String> {
@@ -1465,6 +2078,324 @@ fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
         "{}",
         format!("Used {}/{} static tunnels", response.used, response.limit).dim()
     );
+}
+
+fn print_anon_events(response: &api::AnonEventsResponse) {
+    if response.data.is_empty() {
+        println!("{}", "No events captured yet.".dim());
+    } else {
+        println!(
+            "{}",
+            format!("{:<36}  {:<7}  Received At", "ID", "Method").dim()
+        );
+        for event in &response.data {
+            println!(
+                "{:<36}  {:<7}  {}",
+                event.id,
+                event.method.as_str().bold(),
+                event.inserted_at.as_deref().unwrap_or("-").dim()
+            );
+        }
+    }
+    print_pagination(&response.pagination);
+}
+
+fn print_anon_event_detail(event: &api::AnonEvent) {
+    println!("{} {}", "Event ID:".bold(), event.id);
+    println!("{} {}", "Endpoint ID:".bold(), event.endpoint_id);
+    println!("{} {}", "Method:".bold(), event.method.as_str().bold());
+    if let Some(status) = event.status.as_deref() {
+        println!("{} {}", "Status:".bold(), status);
+    }
+    if let Some(inserted_at) = event.inserted_at.as_deref() {
+        println!("{} {}", "Received At:".bold(), inserted_at.dim());
+    }
+
+    println!();
+    print_key_value_map("Headers:", &event.headers, ": ");
+
+    println!();
+    print_body_section("Body:", event.body.as_deref());
+}
+
+fn print_shared_requests(shares: &[api::SharedRequestSummary]) {
+    if shares.is_empty() {
+        println!("{}", "No shares found.".dim());
+        return;
+    }
+
+    println!(
+        "{}",
+        format!(
+            "{:<36}  {:<32}  {:<5}  {:<6}  {:<10}  Expires At",
+            "ID", "Token", "Fwds", "Views", "Protected"
+        )
+        .dim()
+    );
+    for share in shares {
+        let protected = if share.password_protected {
+            "yes".yellow().to_string()
+        } else {
+            "no".to_string()
+        };
+        let expires = share.expires_at.as_deref().unwrap_or("-");
+        println!(
+            "{:<36}  {:<32}  {:<5}  {:<6}  {:<10}  {}",
+            share.id,
+            share.share_token.as_str().bold(),
+            if share.include_forwards { "yes" } else { "no" },
+            share.view_count,
+            protected,
+            expires.dim()
+        );
+    }
+}
+
+fn print_shared_request_full(data: &serde_json::Value) {
+    if let Some(token) = data.get("share_token").and_then(|v| v.as_str()) {
+        println!("{} {}", "Share Token:".bold(), token);
+    }
+    if let Some(expires) = data.get("expires_at").and_then(|v| v.as_str()) {
+        println!("{} {}", "Expires At:".bold(), expires.dim());
+    }
+    if let Some(views) = data.get("view_count").and_then(|v| v.as_u64()) {
+        println!("{} {}", "Views:".bold(), views);
+    }
+
+    if let Some(request) = data.get("debug_request") {
+        println!();
+        println!("{}", "── Debug Request ──".bold());
+        if let Some(id) = request.get("id").and_then(|v| v.as_str()) {
+            println!("  {} {}", "ID:".bold(), id);
+        }
+        if let Some(method) = request.get("method").and_then(|v| v.as_str()) {
+            println!("  {} {}", "Method:".bold(), method.bold());
+        }
+        if let Some(url) = request.get("url").and_then(|v| v.as_str()) {
+            println!("  {} {}", "URL:".bold(), url);
+        }
+        if let Some(remote) = request.get("remote_addr").and_then(|v| v.as_str()) {
+            println!("  {} {}", "Remote:".bold(), remote.dim());
+        }
+        if let Some(created) = request.get("created_at").and_then(|v| v.as_str()) {
+            println!("  {} {}", "Created At:".bold(), created.dim());
+        }
+
+        // Headers
+        if let Some(headers) = request.get("headers").and_then(|v| v.as_object())
+            && !headers.is_empty()
+        {
+            println!();
+            println!("  {}", "Headers:".bold());
+            for (key, value) in headers {
+                println!("    {}: {}", key.as_str().dim(), value);
+            }
+        }
+
+        // Body
+        let body = request
+            .get("body")
+            .and_then(|v| v.as_str())
+            .or_else(|| request.get("body_preview").and_then(|v| v.as_str()));
+        if let Some(body) = body
+            && !body.is_empty()
+        {
+            println!();
+            println!("  {}", "Body:".bold());
+            println!("  {}", body);
+        }
+    }
+
+    if let Some(forwards) = data.get("forwards").and_then(|v| v.as_array())
+        && !forwards.is_empty()
+    {
+        println!();
+        println!("{}", "── Forwards ──".bold());
+        for fwd in forwards {
+            let target = fwd.get("target_url").and_then(|v| v.as_str()).unwrap_or("-");
+            let method = fwd.get("method").and_then(|v| v.as_str()).unwrap_or("-");
+            let status = fwd
+                .get("status_code")
+                .and_then(|v| v.as_u64())
+                .map(|c| style_status_code(c as u16))
+                .unwrap_or_else(|| "-".to_string());
+            let duration = fwd
+                .get("duration_ms")
+                .and_then(|v| v.as_u64())
+                .map(|ms| format!("{}ms", ms))
+                .unwrap_or_else(|| "-".to_string());
+            println!("  {} {} → {} ({})", method.bold(), status, target, duration);
+        }
+    }
+}
+
+fn style_monitor_status(status: Option<&str>) -> String {
+    match status {
+        Some("up") => "up".green().to_string(),
+        Some("down") => "down".red().to_string(),
+        Some(s) => s.yellow().to_string(),
+        None => "pending".yellow().to_string(),
+    }
+}
+
+fn print_monitors(monitors: &[api::UptimeMonitor]) {
+    if monitors.is_empty() {
+        println!("{}", "No uptime monitors found.".dim());
+        return;
+    }
+
+    println!(
+        "{}",
+        format!(
+            "{:<36}  {:<8}  {:<7}  {:<5}  {:<24}  Name",
+            "ID", "Status", "Method", "Int", "URL"
+        )
+        .dim()
+    );
+    for m in monitors {
+        let status = style_monitor_status(m.current_status.as_deref());
+        let enabled_marker = if m.enabled { "" } else { " (disabled)" };
+        let interval = m.check_interval.map(|i| format!("{}m", i)).unwrap_or_default();
+        // Truncate URL for table display
+        let url_display = if m.url.len() > 24 {
+            format!("{}…", &m.url[..23])
+        } else {
+            m.url.clone()
+        };
+        println!(
+            "{:<36}  {:<8}  {:<7}  {:<5}  {:<24}  {}{}",
+            m.id,
+            status,
+            m.method.to_uppercase().bold(),
+            interval,
+            url_display,
+            m.name,
+            enabled_marker.dim()
+        );
+    }
+}
+
+fn print_monitor_detail(m: &api::UptimeMonitor) {
+    println!("{} {}", "ID:".bold(), m.id);
+    println!("{} {}", "Name:".bold(), m.name);
+    println!("{} {}", "URL:".bold(), m.url.as_str().underlined());
+    println!("{} {}", "Method:".bold(), m.method.to_uppercase().bold());
+
+    let status = style_monitor_status(m.current_status.as_deref());
+    let enabled = if m.enabled {
+        "yes".green().to_string()
+    } else {
+        "no (paused)".yellow().to_string()
+    };
+    println!("{} {}", "Status:".bold(), status);
+    println!("{} {}", "Enabled:".bold(), enabled);
+
+    if let Some(code) = m.expected_status_code {
+        println!("{} {}", "Expected Status:".bold(), code);
+    }
+    if let Some(ref bc) = m.body_contains {
+        println!("{} {}", "Body Contains:".bold(), bc);
+    }
+    if let Some(interval) = m.check_interval {
+        println!("{} {}m", "Check Interval:".bold(), interval);
+    }
+    if let Some(threshold) = m.failure_threshold {
+        println!("{} {}", "Failure Threshold:".bold(), threshold);
+    }
+    if let Some(failures) = m.consecutive_failures {
+        println!("{} {}", "Consecutive Failures:".bold(), failures);
+    }
+
+    println!(
+        "{} email={}, slack={}",
+        "Notifications:".bold(),
+        if m.email_enabled { "on" } else { "off" },
+        if m.slack_enabled { "on" } else { "off" }
+    );
+
+    if let Some(ref checked) = m.last_checked_at {
+        println!("{} {}", "Last Checked:".bold(), checked.as_str().dim());
+    }
+    if let Some(ref changed) = m.last_status_change_at {
+        println!("{} {}", "Last Status Change:".bold(), changed.as_str().dim());
+    }
+    if let Some(ref created) = m.created_at {
+        println!("{} {}", "Created At:".bold(), created.as_str().dim());
+    }
+}
+
+fn print_uptime_checks(response: &api::UptimeChecksResponse) {
+    // Stats summary
+    if let Some(ref stats) = response.stats {
+        let uptime = stats
+            .uptime_percentage
+            .map(|p| {
+                let s = format!("{:.2}%", p);
+                if p >= 99.9 {
+                    s.green().to_string()
+                } else if p >= 95.0 {
+                    s.yellow().to_string()
+                } else {
+                    s.red().to_string()
+                }
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let avg_rt = stats
+            .avg_response_time_ms
+            .map(|ms| format!("{:.0}ms", ms))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{} {}  {} {}",
+            "Uptime:".bold(),
+            uptime,
+            "Avg Response:".bold(),
+            avg_rt
+        );
+        println!();
+    }
+
+    if response.data.is_empty() {
+        println!("{}", "No checks recorded yet.".dim());
+    } else {
+        println!(
+            "{}",
+            format!(
+                "{:<36}  {:<6}  {:<8}  {:<10}  Checked At",
+                "ID", "Status", "Code", "Response"
+            )
+            .dim()
+        );
+        for check in &response.data {
+            let status = match check.status.as_str() {
+                "up" => "up".green().to_string(),
+                "down" => "down".red().to_string(),
+                s => s.to_string(),
+            };
+            let code = check
+                .status_code
+                .map(style_status_code)
+                .unwrap_or_else(|| "-".to_string());
+            let rt = check
+                .response_time_ms
+                .map(|ms| format!("{}ms", ms))
+                .unwrap_or_else(|| "-".to_string());
+            let checked = check.checked_at.as_deref().unwrap_or("-");
+
+            println!(
+                "{:<36}  {:<6}  {:<8}  {:<10}  {}",
+                check.id,
+                status,
+                code,
+                rt,
+                checked.dim()
+            );
+            if let Some(ref err) = check.error_message {
+                println!("  {} {}", "error:".red(), err);
+            }
+        }
+    }
+
+    print_pagination(&response.pagination);
 }
 
 fn spawn_tunnel_forwarder_manager(
@@ -1827,12 +2758,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn access_token_from_config_returns_error_when_invalid() {
-        let config = make_config(Some("org-config"));
-        let err = access_token_from_config(&config).unwrap_err();
+    #[tokio::test]
+    async fn ensure_valid_token_returns_error_when_expired() {
+        let mut config = make_config(Some("org-config"));
+        let err = ensure_valid_token(&mut config).await.unwrap_err();
         assert!(
-            err.to_string().contains("Not authenticated"),
+            err.to_string().contains("Session expired"),
             "unexpected error: {}",
             err
         );
