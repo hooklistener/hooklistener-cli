@@ -750,11 +750,7 @@ impl ApiClient {
         Ok(response.data)
     }
 
-    pub async fn update_uptime_monitor(
-        &self,
-        id: &str,
-        params: &Value,
-    ) -> Result<UptimeMonitor> {
+    pub async fn update_uptime_monitor(&self, id: &str, params: &Value) -> Result<UptimeMonitor> {
         let path = format!("/api/v1/uptime-monitors/{}", id);
         let body = serde_json::json!({ "uptime_monitor": params });
         let response: DataResponse<UptimeMonitor> = self
@@ -791,8 +787,12 @@ impl ApiClient {
         if let Some(ttl) = ttl_seconds {
             body.insert("ttl_seconds".to_string(), Value::Number(ttl.into()));
         }
-        self.post_json("/api/v1/anon/endpoints", &Value::Object(body), "create anonymous endpoint")
-            .await
+        self.post_json(
+            "/api/v1/anon/endpoints",
+            &Value::Object(body),
+            "create anonymous endpoint",
+        )
+        .await
     }
 
     pub async fn get_anon_endpoint(&self, id: &str) -> Result<AnonEndpointStatus> {
@@ -813,15 +813,8 @@ impl ApiClient {
         self.get_json(&path, "list anonymous endpoint events").await
     }
 
-    pub async fn get_anon_event(
-        &self,
-        endpoint_id: &str,
-        event_id: &str,
-    ) -> Result<AnonEvent> {
-        let path = format!(
-            "/api/v1/anon/endpoints/{}/events/{}",
-            endpoint_id, event_id
-        );
+    pub async fn get_anon_event(&self, endpoint_id: &str, event_id: &str) -> Result<AnonEvent> {
+        let path = format!("/api/v1/anon/endpoints/{}/events/{}", endpoint_id, event_id);
         self.get_json(&path, "get anonymous endpoint event").await
     }
 
@@ -837,15 +830,15 @@ impl ApiClient {
         let path = format!("/api/v1/debug-requests/{}/share", debug_request_id);
         let mut share_body = serde_json::Map::new();
         if let Some(hours) = expires_in_hours {
-            share_body.insert(
-                "expires_in_hours".to_string(),
-                Value::Number(hours.into()),
-            );
+            share_body.insert("expires_in_hours".to_string(), Value::Number(hours.into()));
         }
         if let Some(pw) = password {
             share_body.insert("password".to_string(), Value::String(pw.to_string()));
         }
-        share_body.insert("include_forwards".to_string(), Value::Bool(include_forwards));
+        share_body.insert(
+            "include_forwards".to_string(),
+            Value::Bool(include_forwards),
+        );
 
         let body = Value::Object(
             [("share".to_string(), Value::Object(share_body))]
@@ -871,8 +864,7 @@ impl ApiClient {
 
     pub async fn get_shared_request(&self, token: &str) -> Result<Value> {
         let path = format!("/api/v1/shared/r/{}", token);
-        let response: DataResponse<Value> =
-            self.get_json(&path, "get shared request").await?;
+        let response: DataResponse<Value> = self.get_json(&path, "get shared request").await?;
         Ok(response.data)
     }
 

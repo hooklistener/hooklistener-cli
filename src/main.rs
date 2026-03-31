@@ -1247,7 +1247,9 @@ async fn main() -> Result<()> {
                 page_size,
             } => {
                 let client = ApiClient::with_organization(token, None)?;
-                let response = client.list_anon_events(&endpoint_id, page, page_size).await?;
+                let response = client
+                    .list_anon_events(&endpoint_id, page, page_size)
+                    .await?;
                 if json {
                     print_json(&serde_json::json!({
                         "endpoint_id": endpoint_id,
@@ -1310,11 +1312,7 @@ async fn main() -> Result<()> {
                     }
                     println!("  {} {}", "Request ID:".bold(), shared.debug_request_id);
                     if shared.password_protected {
-                        println!(
-                            "  {} {}",
-                            "Password:".bold(),
-                            "protected".yellow()
-                        );
+                        println!("  {} {}", "Password:".bold(), "protected".yellow());
                     }
                     if let Some(expires) = shared.expires_at.as_deref() {
                         println!("  {} {}", "Expires At:".bold(), expires.dim());
@@ -1355,10 +1353,7 @@ async fn main() -> Result<()> {
                 } else {
                     // Check if it's a protected share
                     if data.get("protected").and_then(|v| v.as_bool()) == Some(true) {
-                        println!(
-                            "{} This share is password-protected.",
-                            "🔒".bold()
-                        );
+                        println!("{} This share is password-protected.", "🔒".bold());
                         if let Some(expires) = data.get("expires_at").and_then(|v| v.as_str()) {
                             println!("  {} {}", "Expires At:".bold(), expires.dim());
                         }
@@ -1495,10 +1490,7 @@ async fn main() -> Result<()> {
                     params.insert("url".into(), serde_json::Value::String(v));
                 }
                 if let Some(v) = method {
-                    params.insert(
-                        "method".into(),
-                        serde_json::Value::String(v.to_lowercase()),
-                    );
+                    params.insert("method".into(), serde_json::Value::String(v.to_lowercase()));
                 }
                 if let Some(v) = expected_status {
                     params.insert("expected_status_code".into(), v.into());
@@ -1514,7 +1506,9 @@ async fn main() -> Result<()> {
                 }
 
                 if params.is_empty() {
-                    return Err(anyhow!("No fields to update. Use --name, --url, --method, --expected-status, --interval, --enabled, or --failure-threshold."));
+                    return Err(anyhow!(
+                        "No fields to update. Use --name, --url, --method, --expected-status, --interval, --enabled, or --failure-threshold."
+                    ));
                 }
 
                 let monitor = client
@@ -2212,7 +2206,10 @@ fn print_shared_request_full(data: &serde_json::Value) {
         println!();
         println!("{}", "── Forwards ──".bold());
         for fwd in forwards {
-            let target = fwd.get("target_url").and_then(|v| v.as_str()).unwrap_or("-");
+            let target = fwd
+                .get("target_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
             let method = fwd.get("method").and_then(|v| v.as_str()).unwrap_or("-");
             let status = fwd
                 .get("status_code")
@@ -2255,7 +2252,10 @@ fn print_monitors(monitors: &[api::UptimeMonitor]) {
     for m in monitors {
         let status = style_monitor_status(m.current_status.as_deref());
         let enabled_marker = if m.enabled { "" } else { " (disabled)" };
-        let interval = m.check_interval.map(|i| format!("{}m", i)).unwrap_or_default();
+        let interval = m
+            .check_interval
+            .map(|i| format!("{}m", i))
+            .unwrap_or_default();
         // Truncate URL for table display
         let url_display = if m.url.len() > 24 {
             format!("{}…", &m.url[..23])
@@ -2317,7 +2317,11 @@ fn print_monitor_detail(m: &api::UptimeMonitor) {
         println!("{} {}", "Last Checked:".bold(), checked.as_str().dim());
     }
     if let Some(ref changed) = m.last_status_change_at {
-        println!("{} {}", "Last Status Change:".bold(), changed.as_str().dim());
+        println!(
+            "{} {}",
+            "Last Status Change:".bold(),
+            changed.as_str().dim()
+        );
     }
     if let Some(ref created) = m.created_at {
         println!("{} {}", "Created At:".bold(), created.as_str().dim());
