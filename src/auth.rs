@@ -12,6 +12,12 @@ pub struct DeviceCodeResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<u64>,
+    #[serde(default)]
+    pub refresh_expires_in: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,7 +71,7 @@ impl DeviceCodeFlow {
         Ok(device_response.user_code)
     }
 
-    pub async fn poll_for_authorization(&self) -> Result<Option<String>> {
+    pub async fn poll_for_authorization(&self) -> Result<Option<TokenResponse>> {
         let device_code = self
             .device_code
             .as_ref()
@@ -83,7 +89,12 @@ impl DeviceCodeFlow {
                 let text = response.text().await?;
 
                 if let Ok(token_response) = serde_json::from_str::<TokenResponse>(&text) {
-                    Ok(Some(token_response.access_token))
+                    if token_response.access_token.is_empty() {
+                        // No access_token means it parsed a pending response
+                        Err(anyhow!("Unexpected response format"))
+                    } else {
+                        Ok(Some(token_response))
+                    }
                 } else if let Ok(pending_response) = serde_json::from_str::<PendingResponse>(&text)
                 {
                     if pending_response.error == "authorization_pending" {
@@ -185,14 +196,17 @@ mod tests {
             .mock("GET", "/api/v1/device?device_code=dev123")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"access_token":"tok_secret_abc"}"#)
+            .with_body(r#"{"access_token":"tok_secret_abc","refresh_token":"ref_tok","expires_in":3600,"refresh_expires_in":2592000,"token_type":"Bearer"}"#)
             .create_async()
             .await;
 
         let mut flow = DeviceCodeFlow::new(server.url());
         flow.device_code = Some("dev123".to_string());
         let result = flow.poll_for_authorization().await.unwrap();
-        assert_eq!(result, Some("tok_secret_abc".to_string()));
+        let token_response = result.unwrap();
+        assert_eq!(token_response.access_token, "tok_secret_abc");
+        assert_eq!(token_response.refresh_token.as_deref(), Some("ref_tok"));
+        assert_eq!(token_response.expires_in, Some(3600));
         mock.assert_async().await;
     }
 
