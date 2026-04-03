@@ -38,7 +38,7 @@ cargo clippy
 
 ## Dependencies
 
-- **ratatui** (^0.29.0) - Terminal UI library for building rich command-line interfaces
+- **ratatui** (^0.30.0) - Terminal UI library for building rich command-line interfaces
 
 ## Development Notes
 
