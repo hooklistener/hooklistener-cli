@@ -59,7 +59,7 @@ impl InstallMethod {
     fn upgrade_command(&self) -> &str {
         match self {
             InstallMethod::Homebrew => "brew upgrade hooklistener",
-            InstallMethod::Npm => "npm update -g hooklistener-cli",
+            InstallMethod::Npm => "npm update -g hooklistener",
             InstallMethod::Cargo => "cargo install hooklistener-cli",
             InstallMethod::DirectBinary => "hooklistener update",
         }
@@ -281,7 +281,7 @@ mod tests {
         );
         assert_eq!(
             InstallMethod::Npm.upgrade_command(),
-            "npm update -g hooklistener-cli"
+            "npm update -g hooklistener"
         );
         assert_eq!(
             InstallMethod::Cargo.upgrade_command(),
