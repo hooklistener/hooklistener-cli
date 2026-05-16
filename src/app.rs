@@ -287,18 +287,15 @@ impl App {
                         self.forward_url_input.clear();
                         self.state = AppState::InputForwardUrl;
                     }
-                    KeyCode::Char('r') => {
+                    KeyCode::Char('r')
                         if !self.forward_url_input.is_empty()
                             && self.is_valid_url(&self.forward_url_input)
-                            && self.selected_request.is_some()
-                        {
-                            self.state = AppState::ForwardingRequest;
-                        }
+                            && self.selected_request.is_some() =>
+                    {
+                        self.state = AppState::ForwardingRequest;
                     }
-                    KeyCode::Char('e') => {
-                        if self.selected_request.is_some() {
-                            self.state = AppState::ExportMenu;
-                        }
+                    KeyCode::Char('e') if self.selected_request.is_some() => {
+                        self.state = AppState::ExportMenu;
                     }
                     KeyCode::Tab | KeyCode::Right => {
                         self.current_tab = (self.current_tab + 1) % self.num_detail_tabs();
@@ -313,17 +310,11 @@ impl App {
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         match self.current_tab {
-                            1 => {
-                                // Headers tab
-                                if self.headers_scroll_offset > 0 {
-                                    self.headers_scroll_offset -= 1;
-                                }
+                            1 if self.headers_scroll_offset > 0 => {
+                                self.headers_scroll_offset -= 1;
                             }
-                            2 => {
-                                // Body tab
-                                if self.body_scroll_offset > 0 {
-                                    self.body_scroll_offset -= 1;
-                                }
+                            2 if self.body_scroll_offset > 0 => {
+                                self.body_scroll_offset -= 1;
                             }
                             3 => {
                                 // Response tab: body first, then headers
@@ -525,82 +516,72 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => {
                     self.should_quit = true;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if self.tunnel_selected_index > 0 {
-                        self.tunnel_selected_index -= 1;
-                    }
+                KeyCode::Up | KeyCode::Char('k') if self.tunnel_selected_index > 0 => {
+                    self.tunnel_selected_index -= 1;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down | KeyCode::Char('j')
                     if !self.tunnel_requests.is_empty()
-                        && self.tunnel_selected_index < self.tunnel_requests.len() - 1
-                    {
-                        self.tunnel_selected_index += 1;
-                    }
+                        && self.tunnel_selected_index < self.tunnel_requests.len() - 1 =>
+                {
+                    self.tunnel_selected_index += 1;
                 }
                 KeyCode::PageUp => {
                     self.tunnel_selected_index = self.tunnel_selected_index.saturating_sub(10);
                 }
-                KeyCode::PageDown => {
-                    if !self.tunnel_requests.is_empty() {
-                        self.tunnel_selected_index =
-                            (self.tunnel_selected_index + 10).min(self.tunnel_requests.len() - 1);
-                    }
+                KeyCode::PageDown if !self.tunnel_requests.is_empty() => {
+                    self.tunnel_selected_index =
+                        (self.tunnel_selected_index + 10).min(self.tunnel_requests.len() - 1);
                 }
                 KeyCode::Home => {
                     self.tunnel_selected_index = 0;
                 }
-                KeyCode::End => {
-                    if !self.tunnel_requests.is_empty() {
-                        self.tunnel_selected_index = self.tunnel_requests.len() - 1;
-                    }
+                KeyCode::End if !self.tunnel_requests.is_empty() => {
+                    self.tunnel_selected_index = self.tunnel_requests.len() - 1;
                 }
-                KeyCode::Enter => {
-                    if !self.tunnel_requests.is_empty() {
-                        // Reversed list: index 0 = newest = last element in deque
-                        let reversed_idx =
-                            self.tunnel_requests.len() - 1 - self.tunnel_selected_index;
-                        if let Some(tunnel_req) = self.tunnel_requests.get(reversed_idx) {
-                            // Build a WebhookRequest from the TunnelRequest
-                            let webhook_req = WebhookRequest {
-                                id: tunnel_req.request_id.clone(),
-                                timestamp: 0,
-                                remote_addr: "Tunnel".to_string(),
-                                headers: tunnel_req.headers.clone(),
-                                content_length: tunnel_req
-                                    .body
-                                    .as_ref()
-                                    .map(|b| b.len() as i64)
-                                    .unwrap_or(0),
-                                method: tunnel_req.method.clone(),
-                                url: tunnel_req.path.clone(),
-                                path: Some(tunnel_req.path.clone()),
-                                query_params: parse_query_string(&tunnel_req.query_string),
-                                created_at: chrono::Utc::now().to_rfc3339(),
-                                body_preview: tunnel_req.body.clone(),
-                                body: tunnel_req.body.clone(),
-                            };
-                            self.selected_request = Some(webhook_req);
+                KeyCode::Enter if !self.tunnel_requests.is_empty() => {
+                    // Reversed list: index 0 = newest = last element in deque
+                    let reversed_idx = self.tunnel_requests.len() - 1 - self.tunnel_selected_index;
+                    if let Some(tunnel_req) = self.tunnel_requests.get(reversed_idx) {
+                        // Build a WebhookRequest from the TunnelRequest
+                        let webhook_req = WebhookRequest {
+                            id: tunnel_req.request_id.clone(),
+                            timestamp: 0,
+                            remote_addr: "Tunnel".to_string(),
+                            headers: tunnel_req.headers.clone(),
+                            content_length: tunnel_req
+                                .body
+                                .as_ref()
+                                .map(|b| b.len() as i64)
+                                .unwrap_or(0),
+                            method: tunnel_req.method.clone(),
+                            url: tunnel_req.path.clone(),
+                            path: Some(tunnel_req.path.clone()),
+                            query_params: parse_query_string(&tunnel_req.query_string),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            body_preview: tunnel_req.body.clone(),
+                            body: tunnel_req.body.clone(),
+                        };
+                        self.selected_request = Some(webhook_req);
 
-                            // Build response data if available
-                            let duration_ms = tunnel_req.completed_at.map(|completed| {
-                                completed.duration_since(tunnel_req.received_at).as_millis() as u64
-                            });
-                            self.selected_tunnel_response = Some(TunnelResponseData {
-                                status: tunnel_req.status,
-                                headers: tunnel_req.response_headers.clone().unwrap_or_default(),
-                                body: tunnel_req.response_body.clone(),
-                                duration_ms,
-                                error: tunnel_req.error.clone(),
-                            });
+                        // Build response data if available
+                        let duration_ms = tunnel_req.completed_at.map(|completed| {
+                            completed.duration_since(tunnel_req.received_at).as_millis() as u64
+                        });
+                        self.selected_tunnel_response = Some(TunnelResponseData {
+                            status: tunnel_req.status,
+                            headers: tunnel_req.response_headers.clone().unwrap_or_default(),
+                            body: tunnel_req.response_body.clone(),
+                            duration_ms,
+                            error: tunnel_req.error.clone(),
+                        });
 
-                            self.current_tab = 0;
-                            self.headers_scroll_offset = 0;
-                            self.body_scroll_offset = 0;
-                            self.response_headers_scroll_offset = 0;
-                            self.response_scroll_offset = 0;
-                            self.detail_return_state = Some(DetailReturnTarget::Tunneling);
-                            self.state = AppState::ShowRequestDetail;
-                        }
+                        self.current_tab = 0;
+                        self.headers_scroll_offset = 0;
+                        self.body_scroll_offset = 0;
+                        self.response_headers_scroll_offset = 0;
+                        self.response_scroll_offset = 0;
+                        self.detail_return_state = Some(DetailReturnTarget::Tunneling);
+                        self.state = AppState::ShowRequestDetail;
                     }
                 }
                 KeyCode::Char('c') => {
@@ -692,12 +673,11 @@ impl App {
                 _ => {}
             },
             AppState::InputForwardUrl => match key.code {
-                KeyCode::Enter => {
+                KeyCode::Enter
                     if !self.forward_url_input.is_empty()
-                        && self.is_valid_url(&self.forward_url_input)
-                    {
-                        self.state = AppState::ForwardingRequest;
-                    }
+                        && self.is_valid_url(&self.forward_url_input) =>
+                {
+                    self.state = AppState::ForwardingRequest;
                 }
                 KeyCode::Char(c) => {
                     self.forward_url_input.push(c);

@@ -472,23 +472,25 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(header, chunks[0]);
 
     // Statistics
-    let avg_duration = if app.tunnel_stats.success > 0 {
-        app.tunnel_stats.total_duration_ms / app.tunnel_stats.success
-    } else {
-        0
-    };
+    let avg_duration = app
+        .tunnel_stats
+        .total_duration_ms
+        .checked_div(app.tunnel_stats.success)
+        .unwrap_or(0);
 
-    let success_rate = if app.tunnel_stats.total > 0 {
-        (app.tunnel_stats.success * 100) / app.tunnel_stats.total
-    } else {
-        0
-    };
+    let success_rate = app
+        .tunnel_stats
+        .success
+        .saturating_mul(100)
+        .checked_div(app.tunnel_stats.total)
+        .unwrap_or(0);
 
-    let failed_rate = if app.tunnel_stats.total > 0 {
-        (app.tunnel_stats.failed * 100) / app.tunnel_stats.total
-    } else {
-        0
-    };
+    let failed_rate = app
+        .tunnel_stats
+        .failed
+        .saturating_mul(100)
+        .checked_div(app.tunnel_stats.total)
+        .unwrap_or(0);
 
     let stats_text = vec![
         Line::from(vec![

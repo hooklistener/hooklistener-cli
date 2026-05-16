@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
+use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -135,7 +136,7 @@ impl Logger {
             .collect();
 
         // Sort by modification time (newest first)
-        log_files.sort_by(|a, b| b.1.cmp(&a.1));
+        log_files.sort_by_key(|(_, modified)| Reverse(*modified));
 
         // Remove old files if we have too many
         let mut removed_count = 0;
