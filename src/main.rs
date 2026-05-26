@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod errors;
 mod logger;
+mod logo;
 mod models;
 mod syntax;
 mod tunnel;
@@ -28,7 +29,10 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::{mpsc, watch},
+    time::sleep,
+};
 use tracing::error;
 
 use api::ApiClient;
@@ -652,7 +656,8 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let res = run_app(&mut terminal, &mut app, event_rx, None).await;
+            let logo_rx = logo::spawn_logo_animation();
+            let res = run_app(&mut terminal, &mut app, event_rx, None, None, Some(logo_rx)).await;
 
             restore_terminal(&mut terminal)?;
 
@@ -1646,10 +1651,18 @@ async fn main() -> Result<()> {
                 port,
                 selected_org,
                 slug,
-                event_tx,
+                event_tx.clone(),
             );
 
-            let res = run_app(&mut terminal, &mut app, event_rx, Some(reconnect_tx)).await;
+            let res = run_app(
+                &mut terminal,
+                &mut app,
+                event_rx,
+                Some(reconnect_tx),
+                Some(event_tx),
+                Some(logo::spawn_logo_animation()),
+            )
+            .await;
 
             restore_terminal(&mut terminal)?;
 
@@ -2465,11 +2478,35 @@ async fn run_tunnel_forwarder_connection(
     }
 }
 
+fn spawn_tunnel_replay(
+    replay_request: app::TunnelReplayRequest,
+    event_tx: mpsc::Sender<TunnelEvent>,
+) {
+    tokio::spawn(async move {
+        let request_id = replay_request.request_id.clone();
+        let replay_result = replay_request.send().await;
+        let event = match replay_result {
+            Ok(outcome) => TunnelEvent::ReplayCompleted {
+                request_id,
+                status: outcome.status,
+                duration_ms: outcome.duration_ms,
+            },
+            Err(error) => TunnelEvent::ReplayFailed {
+                request_id,
+                error: error.to_string(),
+            },
+        };
+        let _ = event_tx.send(event).await;
+    });
+}
+
 async fn run_app<B: ratatui::backend::Backend + Send>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     mut tunnel_rx: mpsc::Receiver<TunnelEvent>,
     tunnel_reconnect_tx: Option<mpsc::UnboundedSender<()>>,
+    tunnel_event_tx: Option<mpsc::Sender<TunnelEvent>>,
+    mut logo_rx: Option<watch::Receiver<String>>,
 ) -> Result<()>
 where
     <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
@@ -2478,6 +2515,14 @@ where
     let _cleanup = TerminalCleanup;
 
     loop {
+        if let Some(logo_rx) = logo_rx.as_mut() {
+            let should_update_logo =
+                app.logo_frame.is_none() || logo_rx.has_changed().unwrap_or(false);
+            if should_update_logo {
+                app.logo_frame = Some(logo_rx.borrow_and_update().clone());
+            }
+        }
+
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         // Update animations
@@ -2546,16 +2591,9 @@ where
                         query_string,
                         response_headers: None,
                         response_body: None,
+                        pinned: false,
                     };
-                    app.tunnel_requests.push_back(tunnel_request);
-                    if app.tunnel_requests.len() > app::MAX_TUNNEL_REQUESTS {
-                        app.tunnel_requests.pop_front();
-                        // Clamp selected index if it now exceeds the new length
-                        if !app.tunnel_requests.is_empty() {
-                            app.tunnel_selected_index =
-                                app.tunnel_selected_index.min(app.tunnel_requests.len() - 1);
-                        }
-                    }
+                    app.push_tunnel_request(tunnel_request);
                     app.tunnel_stats.total += 1;
                 }
                 TunnelEvent::RequestForwarded {
@@ -2576,8 +2614,7 @@ where
                         req.response_headers = Some(response_headers);
                         req.response_body = app::truncate_body(response_body);
                     }
-                    app.tunnel_stats.success += 1;
-                    app.tunnel_stats.total_duration_ms += duration_ms;
+                    app.tunnel_stats.record_response(status, duration_ms);
                 }
                 TunnelEvent::RequestFailed { request_id, error } => {
                     // Update the request in the list
@@ -2590,6 +2627,22 @@ where
                         req.completed_at = Some(std::time::Instant::now());
                     }
                     app.tunnel_stats.failed += 1;
+                }
+                TunnelEvent::ReplayCompleted {
+                    request_id,
+                    status,
+                    duration_ms,
+                } => {
+                    app.tunnel_status_message = Some((
+                        format!("Replayed {} {} {}ms", request_id, status, duration_ms),
+                        std::time::Instant::now(),
+                    ));
+                }
+                TunnelEvent::ReplayFailed { request_id, error } => {
+                    app.tunnel_status_message = Some((
+                        format!("Replay {} failed: {}", request_id, error),
+                        std::time::Instant::now(),
+                    ));
                 }
                 TunnelEvent::ForwardSuccess => {
                     app.listening_stats.successful_forwards += 1;
@@ -2638,6 +2691,15 @@ where
                 && tx.send(()).is_err()
             {
                 app.tunnel_error = Some("Failed to request tunnel reconnect".to_string());
+            }
+
+            if let Some(replay_request) = app.take_tunnel_replay_request() {
+                if let Some(tx) = tunnel_event_tx.as_ref() {
+                    spawn_tunnel_replay(replay_request, tx.clone());
+                } else {
+                    app.tunnel_status_message =
+                        Some(("Replay unavailable".to_string(), std::time::Instant::now()));
+                }
             }
 
             if matches!(app.state, AppState::ForwardingRequest) {

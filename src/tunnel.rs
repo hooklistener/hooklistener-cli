@@ -11,6 +11,10 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, warn};
 
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
+
 /// Extract the string representation of a JSON value.
 /// Returns the inner string for `Value::String`, otherwise uses `to_string()`.
 fn json_value_to_string(v: &serde_json::Value) -> String {
@@ -18,6 +22,33 @@ fn json_value_to_string(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         _ => v.to_string(),
     }
+}
+
+fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.as_str().to_string(),
+                value.to_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn encode_response_body(bytes: &[u8]) -> (String, &'static str) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), "raw"),
+        Err(_) => (URL_SAFE_NO_PAD.encode(bytes), "base64"),
+    }
+}
+
+fn with_forward_id(mut payload: serde_json::Value, forward_id: Option<&str>) -> serde_json::Value {
+    if let Some(forward_id) = forward_id {
+        payload["forward_id"] = serde_json::Value::String(forward_id.to_string());
+    }
+
+    payload
 }
 
 /// Phoenix Channel message structure
@@ -34,6 +65,8 @@ struct ChannelMessage {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TunnelWebhookRequest {
     pub id: String,
+    #[serde(default)]
+    pub forward_id: Option<String>,
     pub method: String,
     pub path: String,
     #[serde(default)]
@@ -70,6 +103,15 @@ pub enum TunnelEvent {
         response_body: Option<String>,
     },
     RequestFailed {
+        request_id: String,
+        error: String,
+    },
+    ReplayCompleted {
+        request_id: String,
+        status: u16,
+        duration_ms: u64,
+    },
+    ReplayFailed {
         request_id: String,
         error: String,
     },
@@ -423,16 +465,7 @@ impl TunnelClient {
         Ok(())
     }
 
-    async fn handle_message(
-        &self,
-        text: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
-    ) -> Result<()> {
+    async fn handle_message(&self, text: &str, write: &mut WsWrite) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
 
         debug!(
@@ -510,12 +543,7 @@ impl TunnelClient {
     async fn forward_webhook(
         &self,
         request: TunnelWebhookRequest,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        write: &mut WsWrite,
     ) -> Result<()> {
         info!(
             request_id = %request.id,
@@ -569,9 +597,16 @@ impl TunnelClient {
         }
 
         // Send request
+        let start_time = std::time::Instant::now();
         match req_builder.send().await {
             Ok(response) => {
                 let status = response.status();
+                let status_code = status.as_u16();
+                let response_headers = response_headers_to_map(response.headers());
+                let response_bytes = response.bytes().await.unwrap_or_default();
+                let (response_body, response_body_encoding) = encode_response_body(&response_bytes);
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+
                 info!(
                     request_id = %request.id,
                     status = %status,
@@ -581,21 +616,25 @@ impl TunnelClient {
                 let _ = self.event_tx.send(TunnelEvent::ForwardSuccess).await;
 
                 // Send acknowledgment back to server
-                let ack_message = ChannelMessage {
-                    topic: format!("cli:tunnel:{}", self.endpoint_slug),
-                    event: "request_ack".to_string(),
-                    payload: serde_json::json!({
-                        "request_id": request.id,
+                let payload = with_forward_id(
+                    serde_json::json!({
+                        "request_id": &request.id,
                         "status": "proxied",
-                        "proxied_to": target_with_query,
+                        "proxied_to": &target_with_query,
+                        "status_code": status_code,
+                        "response_headers": response_headers,
+                        "response_body": response_body,
+                        "response_body_encoding": response_body_encoding,
+                        "duration_ms": duration_ms,
                     }),
-                    reference: None,
-                };
+                    request.forward_id.as_deref(),
+                );
 
-                let ack_json = serde_json::to_string(&ack_message)?;
-                write.send(Message::Text(ack_json.into())).await?;
+                self.send_request_ack(write, payload).await?;
             }
             Err(e) => {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+
                 error!(
                     request_id = %request.id,
                     error = %e,
@@ -605,22 +644,38 @@ impl TunnelClient {
                 let _ = self.event_tx.send(TunnelEvent::ForwardError).await;
 
                 // Send error acknowledgment
-                let ack_message = ChannelMessage {
-                    topic: format!("cli:tunnel:{}", self.endpoint_slug),
-                    event: "request_ack".to_string(),
-                    payload: serde_json::json!({
-                        "request_id": request.id,
+                let payload = with_forward_id(
+                    serde_json::json!({
+                        "request_id": &request.id,
                         "status": "error",
+                        "proxied_to": &target_with_query,
                         "error": e.to_string(),
+                        "duration_ms": duration_ms,
                     }),
-                    reference: None,
-                };
+                    request.forward_id.as_deref(),
+                );
 
-                let ack_json = serde_json::to_string(&ack_message)?;
-                write.send(Message::Text(ack_json.into())).await?;
+                self.send_request_ack(write, payload).await?;
             }
         }
 
+        Ok(())
+    }
+
+    async fn send_request_ack(
+        &self,
+        write: &mut WsWrite,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let ack_message = ChannelMessage {
+            topic: format!("cli:tunnel:{}", self.endpoint_slug),
+            event: "request_ack".to_string(),
+            payload,
+            reference: None,
+        };
+
+        let ack_json = serde_json::to_string(&ack_message)?;
+        write.send(Message::Text(ack_json.into())).await?;
         Ok(())
     }
 
@@ -1373,6 +1428,7 @@ mod tests {
     fn test_tunnel_webhook_request_full_payload() {
         let json = r#"{
             "id": "req-1",
+            "forward_id": "fwd-1",
             "method": "POST",
             "path": "/webhook",
             "query_params": {"foo": "bar"},
@@ -1381,6 +1437,7 @@ mod tests {
         }"#;
         let req: TunnelWebhookRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.id, "req-1");
+        assert_eq!(req.forward_id.as_deref(), Some("fwd-1"));
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/webhook");
         assert!(req.body.is_some());
@@ -1391,6 +1448,7 @@ mod tests {
         let json = r#"{"id":"req-2","method":"GET","path":"/"}"#;
         let req: TunnelWebhookRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.id, "req-2");
+        assert!(req.forward_id.is_none());
         assert!(req.body.is_none());
         assert!(req.headers.is_empty());
         assert!(req.query_params.is_empty());

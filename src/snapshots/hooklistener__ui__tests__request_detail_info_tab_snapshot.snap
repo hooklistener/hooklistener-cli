@@ -1,0 +1,27 @@
+---
+source: src/ui.rs
+expression: snapshot
+---
+
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Info │ Headers │ Body                                                                                    │
+ └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ┌ Request Information ─────────────────────────────────────────────────────────────────────────────────────┐
+ │Method              POST                                                                                  │
+ │URL                 /webhooks/github/push?installation_id=1001947732&delivery=1c07ce58-51df-11f1-902c-ae6e│
+ │                      f7f4b5d5                                                                            │
+ │Remote IP           Tunnel                                                                                │
+ │Timestamp           2026-05-28T13:40:26.091627790Z                                                        │
+ │Content Length      10354                                                                                 │
+ │Request ID          req-visual-0001abcdef                                                                 │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Request  Tab Tabs | ↑↓ Scroll | F Forward | R Replay | E Export | B Back | Q Quit             API connected

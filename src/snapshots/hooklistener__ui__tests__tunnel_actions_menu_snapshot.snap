@@ -1,0 +1,31 @@
+---
+source: src/ui.rs
+expression: snapshot
+---
+
+ ┌ HTTP Tunnel ───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ hooklistener  ● connected  ephemeral                                                                               │
+ │ https://snap.hook.events  →  localhost:3000                                                                        │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+  Statistics ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Requests 1  2xx 1  4xx 0  5xx 0  E┌ Actions ────────────────────────────────────┐ Live
+                                    │  req-sn  POST /webhooks/orders?source=insta │
+  Live Requests (1) | Enter expand |│                                             │────────────────────────────────────
+   ID       Age    Method   Path    │  Tab    View pinned only                    │ Duration   Size     From
+                                    │  D      Details                             │
+ ▸ req-sn   now    POST     /webhook│  P      Pin request                         │ 42ms       34b      --
+                                    │  R      Replay                              │
+                                    │  U      Copy request URL                    │
+                                    │  I      Copy request ID                     │
+                                    │  C      Copy base URL                       │
+                                    │  Ctrl+R Reconnect tunnel                    │
+                                    │                                             │
+                                    │  Esc  Close                                 │
+                                    └─────────────────────────────────────────────┘
+
+
+
+
+
+
+ Tunnel (1)  ↑↓ Select | Enter Expand | Tab Pins | P Pin | A Actions | / Filter | Q Quit                 API connected

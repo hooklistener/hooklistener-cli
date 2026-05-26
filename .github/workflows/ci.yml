@@ -50,8 +50,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-      - name: Run tests
+      - name: Run tests (includes insta snapshots)
+        env:
+          INSTA_UPDATE: new
         run: cargo test --all-targets --all-features --locked
+      - name: Upload pending insta snapshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pending-insta-snapshots
+          path: |
+            **/*.snap.new
+          if-no-files-found: ignore
 
   audit:
     name: Cargo Audit

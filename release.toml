@@ -5,6 +5,7 @@
 # Create and push the git tag
 tag = true
 tag-prefix = ""
+tag-name = "v{{version}}"
 tag-message = "Release v{{version}}"
 
 # Commit the version bump
