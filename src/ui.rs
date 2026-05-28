@@ -1880,9 +1880,7 @@ fn wrap_styled_line(
         }
     }
 
-    if current.is_empty() && wrapped.is_empty() {
-        push_wrapped_line(&mut wrapped, &mut current, line_style, alignment);
-    } else if !current.is_empty() {
+    if !current.is_empty() || wrapped.is_empty() {
         push_wrapped_line(&mut wrapped, &mut current, line_style, alignment);
     }
 
