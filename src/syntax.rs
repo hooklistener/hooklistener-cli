@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -19,22 +21,37 @@ mod colors {
 pub struct JsonHighlighter;
 
 impl JsonHighlighter {
+    /// Pretty-print JSON content when it parses cleanly.
+    pub fn format_json_for_display(json_str: &str) -> Cow<'_, str> {
+        let trimmed = json_str.trim();
+        if !Self::looks_like_json(trimmed) {
+            return Cow::Borrowed(json_str);
+        }
+
+        serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .map(Cow::Owned)
+            .unwrap_or(Cow::Borrowed(json_str))
+    }
+
     /// Highlights JSON content and returns formatted Lines
-    pub fn highlight_json(json_str: &str) -> Vec<Line<'_>> {
+    pub fn highlight_json(json_str: &str) -> Vec<Line<'static>> {
         if json_str.trim().is_empty() {
             return vec![Line::from("")];
         }
 
-        // Try to detect if this looks like JSON
-        let trimmed = json_str.trim();
-        if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        let display_text = Self::format_json_for_display(json_str);
+        let text = display_text.as_ref();
+        let trimmed = text.trim();
+        if !Self::looks_like_json(trimmed) {
             // Not JSON, return as plain text
-            return Self::plain_text_lines(json_str);
+            return Self::plain_text_lines(text);
         }
 
         let mut lines = Vec::new();
         let mut current_line = Vec::new();
-        let chars: Vec<char> = json_str.chars().collect();
+        let chars: Vec<char> = text.chars().collect();
         let mut i = 0;
 
         while i < chars.len() {
@@ -135,6 +152,10 @@ impl JsonHighlighter {
         lines
     }
 
+    fn looks_like_json(trimmed: &str) -> bool {
+        trimmed.starts_with('{') || trimmed.starts_with('[')
+    }
+
     /// Parse a JSON string starting from a quote
     fn parse_string(chars: &[char], start: usize) -> (String, usize) {
         let mut result = String::new();
@@ -230,7 +251,7 @@ impl JsonHighlighter {
     }
 
     /// Convert plain text to lines without syntax highlighting
-    fn plain_text_lines(text: &str) -> Vec<Line<'_>> {
+    fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
         text.lines()
             .map(|line| {
                 Line::from(Span::styled(
@@ -300,5 +321,14 @@ mod tests {
         let json_array = r#"[{"id": 1}, {"id": 2}, {"id": 3}]"#;
         let lines = JsonHighlighter::highlight_json(json_array);
         assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn test_compact_json_is_pretty_printed_for_display() {
+        let json = r#"{"name":"test","nested":{"ok":true}}"#;
+        let display = JsonHighlighter::format_json_for_display(json);
+
+        assert!(display.contains("\n  \"name\""));
+        assert!(display.contains("\n  \"nested\""));
     }
 }

@@ -2,12 +2,32 @@ use crate::api::ApiClient;
 use crate::config::Config;
 use crate::errors::ApiError;
 use crate::models::{ForwardResponse, WebhookRequest};
-use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crate::syntax::JsonHighlighter;
+use anyhow::{Result, anyhow};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashMap, VecDeque};
 
 pub const MAX_TUNNEL_REQUESTS: usize = 500;
 pub const MAX_BODY_SIZE: usize = 256 * 1024;
+pub const TRUNCATED_BODY_MARKER: &str = "\n...(truncated)";
+
+fn is_truncated_body(body: Option<&str>) -> bool {
+    body.is_some_and(|body| body.ends_with(TRUNCATED_BODY_MARKER))
+}
+
+fn format_path_with_query(path: &str, query_string: &str) -> String {
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    };
+
+    if query_string.is_empty() {
+        path
+    } else {
+        format!("{}?{}", path, query_string)
+    }
+}
 
 #[derive(Debug)]
 pub enum AppState {
@@ -36,11 +56,28 @@ pub struct TunnelStats {
     pub total: u64,
     pub success: u64,
     pub failed: u64,
+    pub status_2xx: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
     pub total_duration_ms: u64,
     #[allow(dead_code)]
     pub bytes_in: u64,
     #[allow(dead_code)]
     pub bytes_out: u64,
+}
+
+impl TunnelStats {
+    pub fn record_response(&mut self, status: u16, duration_ms: u64) {
+        self.success += 1;
+        self.total_duration_ms += duration_ms;
+
+        match status {
+            200..=299 => self.status_2xx += 1,
+            400..=499 => self.status_4xx += 1,
+            500..=599 => self.status_5xx += 1,
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +94,7 @@ pub struct TunnelRequest {
     pub query_string: String,
     pub response_headers: Option<HashMap<String, String>>,
     pub response_body: Option<String>,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +104,74 @@ pub struct TunnelResponseData {
     pub body: Option<String>,
     pub duration_ms: Option<u64>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TunnelReplayRequest {
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub query_string: String,
+    pub headers: HashMap<String, String>,
+    pub body: Option<String>,
+    pub local_host: String,
+    pub local_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TunnelReplayOutcome {
+    pub status: u16,
+    pub duration_ms: u64,
+}
+
+impl TunnelReplayRequest {
+    pub fn target_url(&self) -> String {
+        format!(
+            "http://{}:{}{}",
+            self.local_host,
+            self.local_port,
+            format_path_with_query(&self.path, &self.query_string)
+        )
+    }
+
+    pub async fn send(&self) -> Result<TunnelReplayOutcome> {
+        if is_truncated_body(self.body.as_deref()) {
+            return Err(anyhow!("request body was truncated and cannot be replayed"));
+        }
+
+        let method = reqwest::Method::from_bytes(self.method.as_bytes())
+            .map_err(|_| anyhow!("unsupported method: {}", self.method))?;
+        let target = self.target_url();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let mut request = client.request(method, target);
+
+        for (key, value) in &self.headers {
+            let key_lower = key.to_lowercase();
+            if matches!(key_lower.as_str(), "host" | "content-length") {
+                continue;
+            }
+            if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                && let Ok(header_value) = reqwest::header::HeaderValue::from_str(value)
+            {
+                request = request.header(header_name, header_value);
+            }
+        }
+
+        if let Some(body) = &self.body
+            && !body.is_empty()
+        {
+            request = request.body(body.clone());
+        }
+
+        let started_at = std::time::Instant::now();
+        let response = request.send().await?;
+        Ok(TunnelReplayOutcome {
+            status: response.status().as_u16(),
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,7 +190,7 @@ pub fn truncate_body(body: Option<String>) -> Option<String> {
             }
 
             let mut truncated = b[..cutoff].to_string();
-            truncated.push_str("\n...(truncated)");
+            truncated.push_str(TRUNCATED_BODY_MARKER);
             truncated
         } else {
             b
@@ -93,6 +199,7 @@ pub fn truncate_body(body: Option<String>) -> Option<String> {
 }
 
 const VIEWPORT_LINES: usize = 20;
+const DETAIL_SCROLL_WRAP_WIDTH: usize = 100;
 
 fn parse_query_string(query_string: &str) -> HashMap<String, String> {
     if query_string.is_empty() {
@@ -120,8 +227,34 @@ fn parse_query_string(query_string: &str) -> HashMap<String, String> {
 
 /// Compute the maximum scroll offset for a text body given a fixed viewport.
 fn max_body_scroll(text: &str) -> usize {
-    let line_count = text.lines().count();
+    let display_text = JsonHighlighter::format_json_for_display(text);
+    let line_count = visual_line_count(display_text.as_ref(), DETAIL_SCROLL_WRAP_WIDTH);
     line_count.saturating_sub(VIEWPORT_LINES)
+}
+
+fn max_headers_scroll(headers: &HashMap<String, String>) -> usize {
+    let entry_bound = headers.len().saturating_sub(1);
+    let visual_bound = headers
+        .iter()
+        .map(|(key, value)| {
+            visual_line_count(&format!("{}: {}", key, value), DETAIL_SCROLL_WRAP_WIDTH)
+        })
+        .sum::<usize>()
+        .saturating_sub(VIEWPORT_LINES);
+
+    entry_bound.max(visual_bound)
+}
+
+fn visual_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut count = 0;
+
+    for line in text.lines() {
+        let line_width = line.chars().count().max(1);
+        count += line_width.div_ceil(width);
+    }
+
+    count.max(1)
 }
 
 pub struct App {
@@ -136,6 +269,7 @@ pub struct App {
     pub body_scroll_offset: usize,
     pub should_quit: bool,
     pub loading_frame: usize,
+    pub logo_frame: Option<String>,
 
     // Listening mode state (debug endpoints)
     pub listening_requests: Vec<WebhookRequest>,
@@ -153,6 +287,7 @@ pub struct App {
     pub tunnel_requests: VecDeque<TunnelRequest>,
     pub tunnel_stats: TunnelStats,
     pub tunnel_selected_index: usize,
+    pub tunnel_expanded_request_id: Option<String>,
     pub detail_return_state: Option<DetailReturnTarget>,
     pub selected_tunnel_response: Option<TunnelResponseData>,
     pub response_headers_scroll_offset: usize,
@@ -164,6 +299,9 @@ pub struct App {
     pub tunnel_requested_slug: Option<String>,
     pub tunnel_is_static: bool,
     pub tunnel_reconnect_requested: bool,
+    pub tunnel_replay_requested: Option<TunnelReplayRequest>,
+    pub tunnel_actions_open: bool,
+    pub tunnel_pinned_only: bool,
 
     // Status messages (auto-expire)
     pub tunnel_status_message: Option<(String, std::time::Instant)>,
@@ -193,6 +331,7 @@ impl App {
             body_scroll_offset: 0,
             should_quit: false,
             loading_frame: 0,
+            logo_frame: None,
             listening_requests: Vec::new(),
             listening_stats: ListeningStats::default(),
             listening_connected: false,
@@ -206,6 +345,7 @@ impl App {
             tunnel_requests: VecDeque::new(),
             tunnel_stats: TunnelStats::default(),
             tunnel_selected_index: 0,
+            tunnel_expanded_request_id: None,
             detail_return_state: None,
             selected_tunnel_response: None,
             response_headers_scroll_offset: 0,
@@ -217,6 +357,9 @@ impl App {
             tunnel_requested_slug: None,
             tunnel_is_static: false,
             tunnel_reconnect_requested: false,
+            tunnel_replay_requested: None,
+            tunnel_actions_open: false,
+            tunnel_pinned_only: false,
             tunnel_status_message: None,
             status_message: None,
             search_active: false,
@@ -255,7 +398,7 @@ impl App {
     fn max_response_headers_scroll(&self) -> usize {
         self.selected_tunnel_response
             .as_ref()
-            .map(|r| r.headers.len().saturating_sub(1))
+            .map(|r| max_headers_scroll(&r.headers))
             .unwrap_or(0)
     }
 
@@ -330,7 +473,7 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') => match self.current_tab {
                         1 => {
                             if let Some(request) = &self.selected_request {
-                                let max = request.headers.len().saturating_sub(1);
+                                let max = max_headers_scroll(&request.headers);
                                 if self.headers_scroll_offset < max {
                                     self.headers_scroll_offset += 1;
                                 }
@@ -378,7 +521,7 @@ impl App {
                     KeyCode::PageDown => match self.current_tab {
                         1 => {
                             if let Some(request) = &self.selected_request {
-                                let max = request.headers.len().saturating_sub(1);
+                                let max = max_headers_scroll(&request.headers);
                                 self.headers_scroll_offset =
                                     (self.headers_scroll_offset + 10).min(max);
                             }
@@ -419,8 +562,7 @@ impl App {
                     KeyCode::End => match self.current_tab {
                         1 => {
                             if let Some(request) = &self.selected_request {
-                                self.headers_scroll_offset =
-                                    request.headers.len().saturating_sub(1);
+                                self.headers_scroll_offset = max_headers_scroll(&request.headers);
                             }
                         }
                         2 => {
@@ -513,105 +655,144 @@ impl App {
                 }
             }
             AppState::Tunneling => match key.code {
+                _ if self.tunnel_actions_open => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => {}
+                        KeyCode::Char('q') => {
+                            self.should_quit = true;
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            self.open_selected_tunnel_request_detail();
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            self.request_tunnel_reconnect();
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            self.request_selected_tunnel_replay();
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            self.copy_tunnel_base_url();
+                        }
+                        KeyCode::Char('u') | KeyCode::Char('U') => {
+                            self.copy_selected_tunnel_request_url();
+                        }
+                        KeyCode::Char('i') | KeyCode::Char('I') => {
+                            self.copy_selected_tunnel_request_id();
+                        }
+                        KeyCode::Char('p') | KeyCode::Char('P') => {
+                            self.toggle_selected_tunnel_request_pin();
+                        }
+                        KeyCode::Tab => {
+                            self.toggle_tunnel_pinned_view();
+                        }
+                        _ => return Ok(()),
+                    }
+                    self.tunnel_actions_open = false;
+                }
+                _ if self.search_active => match key.code {
+                    KeyCode::Esc => {
+                        self.search_active = false;
+                        self.search_query.clear();
+                        self.tunnel_selected_index = 0;
+                        self.tunnel_expanded_request_id = None;
+                    }
+                    KeyCode::Enter => {
+                        self.search_active = false;
+                    }
+                    KeyCode::Backspace => {
+                        self.search_query.pop();
+                        self.tunnel_selected_index = 0;
+                        self.tunnel_expanded_request_id = None;
+                    }
+                    KeyCode::Char(c) => {
+                        self.search_query.push(c);
+                        self.tunnel_selected_index = 0;
+                        self.tunnel_expanded_request_id = None;
+                    }
+                    _ => {}
+                },
+                KeyCode::Esc if !self.search_query.is_empty() => {
+                    self.search_query.clear();
+                    self.tunnel_selected_index = 0;
+                    self.tunnel_expanded_request_id = None;
+                }
                 KeyCode::Char('q') | KeyCode::Esc => {
                     self.should_quit = true;
                 }
+                KeyCode::Char('/') => {
+                    self.search_active = true;
+                    self.search_query.clear();
+                    self.tunnel_selected_index = 0;
+                    self.tunnel_expanded_request_id = None;
+                    self.tunnel_actions_open = false;
+                }
                 KeyCode::Up | KeyCode::Char('k') if self.tunnel_selected_index > 0 => {
                     self.tunnel_selected_index -= 1;
+                    self.tunnel_expanded_request_id = None;
                 }
-                KeyCode::Down | KeyCode::Char('j')
-                    if !self.tunnel_requests.is_empty()
-                        && self.tunnel_selected_index < self.tunnel_requests.len() - 1 =>
-                {
-                    self.tunnel_selected_index += 1;
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let filtered = self.visible_tunnel_request_indices();
+                    if !filtered.is_empty() && self.tunnel_selected_index < filtered.len() - 1 {
+                        self.tunnel_selected_index += 1;
+                        self.tunnel_expanded_request_id = None;
+                    }
                 }
                 KeyCode::PageUp => {
                     self.tunnel_selected_index = self.tunnel_selected_index.saturating_sub(10);
+                    self.tunnel_expanded_request_id = None;
                 }
-                KeyCode::PageDown if !self.tunnel_requests.is_empty() => {
-                    self.tunnel_selected_index =
-                        (self.tunnel_selected_index + 10).min(self.tunnel_requests.len() - 1);
+                KeyCode::PageDown => {
+                    let filtered = self.visible_tunnel_request_indices();
+                    if !filtered.is_empty() {
+                        self.tunnel_selected_index =
+                            (self.tunnel_selected_index + 10).min(filtered.len() - 1);
+                        self.tunnel_expanded_request_id = None;
+                    }
                 }
                 KeyCode::Home => {
                     self.tunnel_selected_index = 0;
+                    self.tunnel_expanded_request_id = None;
                 }
-                KeyCode::End if !self.tunnel_requests.is_empty() => {
-                    self.tunnel_selected_index = self.tunnel_requests.len() - 1;
-                }
-                KeyCode::Enter if !self.tunnel_requests.is_empty() => {
-                    // Reversed list: index 0 = newest = last element in deque
-                    let reversed_idx = self.tunnel_requests.len() - 1 - self.tunnel_selected_index;
-                    if let Some(tunnel_req) = self.tunnel_requests.get(reversed_idx) {
-                        // Build a WebhookRequest from the TunnelRequest
-                        let webhook_req = WebhookRequest {
-                            id: tunnel_req.request_id.clone(),
-                            timestamp: 0,
-                            remote_addr: "Tunnel".to_string(),
-                            headers: tunnel_req.headers.clone(),
-                            content_length: tunnel_req
-                                .body
-                                .as_ref()
-                                .map(|b| b.len() as i64)
-                                .unwrap_or(0),
-                            method: tunnel_req.method.clone(),
-                            url: tunnel_req.path.clone(),
-                            path: Some(tunnel_req.path.clone()),
-                            query_params: parse_query_string(&tunnel_req.query_string),
-                            created_at: chrono::Utc::now().to_rfc3339(),
-                            body_preview: tunnel_req.body.clone(),
-                            body: tunnel_req.body.clone(),
-                        };
-                        self.selected_request = Some(webhook_req);
-
-                        // Build response data if available
-                        let duration_ms = tunnel_req.completed_at.map(|completed| {
-                            completed.duration_since(tunnel_req.received_at).as_millis() as u64
-                        });
-                        self.selected_tunnel_response = Some(TunnelResponseData {
-                            status: tunnel_req.status,
-                            headers: tunnel_req.response_headers.clone().unwrap_or_default(),
-                            body: tunnel_req.response_body.clone(),
-                            duration_ms,
-                            error: tunnel_req.error.clone(),
-                        });
-
-                        self.current_tab = 0;
-                        self.headers_scroll_offset = 0;
-                        self.body_scroll_offset = 0;
-                        self.response_headers_scroll_offset = 0;
-                        self.response_scroll_offset = 0;
-                        self.detail_return_state = Some(DetailReturnTarget::Tunneling);
-                        self.state = AppState::ShowRequestDetail;
+                KeyCode::End => {
+                    let filtered = self.visible_tunnel_request_indices();
+                    if !filtered.is_empty() {
+                        self.tunnel_selected_index = filtered.len() - 1;
+                        self.tunnel_expanded_request_id = None;
                     }
                 }
-                KeyCode::Char('c') => {
-                    if let Some(subdomain) = &self.tunnel_subdomain {
-                        let url = format!("https://{}", subdomain);
-                        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&url)) {
-                            Ok(_) => {
-                                self.tunnel_status_message = Some((
-                                    "URL copied to clipboard!".into(),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            Err(e) => {
-                                self.tunnel_status_message = Some((
-                                    format!("Failed to copy: {}", e),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
-                    }
+                KeyCode::Tab => {
+                    self.toggle_tunnel_pinned_view();
                 }
-                KeyCode::Char('r') => {
-                    self.tunnel_reconnect_requested = true;
-                    self.tunnel_connected = false;
-                    self.tunnel_connected_at = None;
-                    self.tunnel_error = Some("Manual reconnect requested...".to_string());
-                    self.tunnel_status_message = Some((
-                        "Restarting tunnel connection...".into(),
-                        std::time::Instant::now(),
-                    ));
+                KeyCode::Enter => {
+                    self.toggle_selected_tunnel_request_expansion();
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    self.open_selected_tunnel_request_detail();
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.tunnel_actions_open = true;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.request_tunnel_reconnect();
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.request_selected_tunnel_replay();
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.copy_tunnel_base_url();
+                }
+                KeyCode::Char('u') | KeyCode::Char('U') => {
+                    self.copy_selected_tunnel_request_url();
+                }
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    self.copy_selected_tunnel_request_id();
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.toggle_selected_tunnel_request_pin();
                 }
                 _ => {}
             },
@@ -803,6 +984,427 @@ impl App {
             .collect()
     }
 
+    fn contains_query(value: &str, query: &str) -> bool {
+        value.to_lowercase().contains(query)
+    }
+
+    fn tunnel_status_matches(request: &TunnelRequest, query: &str) -> bool {
+        request
+            .status
+            .is_some_and(|status| status.to_string().contains(query))
+            || request
+                .error
+                .as_deref()
+                .is_some_and(|error| Self::contains_query(error, query))
+            || (request.error.is_some() && "error".contains(query))
+            || (request.status.is_none() && request.error.is_none() && "pending".contains(query))
+    }
+
+    fn tunnel_headers_match(request: &TunnelRequest, query: &str) -> bool {
+        request.headers.iter().any(|(key, value)| {
+            Self::contains_query(key, query) || Self::contains_query(value, query)
+        })
+    }
+
+    fn tunnel_request_matches_field(request: &TunnelRequest, field: &str, query: &str) -> bool {
+        match field {
+            "method" => Self::contains_query(&request.method, query),
+            "path" | "url" => {
+                Self::contains_query(&request.path, query)
+                    || Self::contains_query(&request.query_string, query)
+            }
+            "status" => Self::tunnel_status_matches(request, query),
+            "body" => {
+                request
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| Self::contains_query(body, query))
+                    || request
+                        .response_body
+                        .as_deref()
+                        .is_some_and(|body| Self::contains_query(body, query))
+            }
+            "header" | "headers" | "from" | "ip" => Self::tunnel_headers_match(request, query),
+            "error" => request
+                .error
+                .as_deref()
+                .is_some_and(|error| Self::contains_query(error, query)),
+            "pinned" | "pin" => {
+                Self::parse_bool_filter(query).is_some_and(|expected| request.pinned == expected)
+            }
+            _ => false,
+        }
+    }
+
+    fn tunnel_request_matches_query(request: &TunnelRequest, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+
+        if matches!(query.as_str(), "pinned" | "pin") {
+            return request.pinned;
+        }
+
+        if let Some((field, value)) = query.split_once(':') {
+            let value = value.trim();
+            if !value.is_empty() && Self::tunnel_request_matches_field(request, field.trim(), value)
+            {
+                return true;
+            }
+        }
+
+        Self::contains_query(&request.method, &query)
+            || Self::contains_query(&request.path, &query)
+            || Self::contains_query(&request.query_string, &query)
+            || Self::tunnel_status_matches(request, &query)
+            || Self::tunnel_headers_match(request, &query)
+            || request
+                .body
+                .as_deref()
+                .is_some_and(|body| Self::contains_query(body, &query))
+            || request
+                .response_body
+                .as_deref()
+                .is_some_and(|body| Self::contains_query(body, &query))
+    }
+
+    fn parse_bool_filter(value: &str) -> Option<bool> {
+        match value.trim() {
+            "true" | "yes" | "1" | "on" => Some(true),
+            "false" | "no" | "0" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    pub fn filter_tunnel_requests(requests: &VecDeque<TunnelRequest>, query: &str) -> Vec<usize> {
+        requests
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, request)| Self::tunnel_request_matches_query(request, query))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub fn visible_tunnel_request_indices(&self) -> Vec<usize> {
+        Self::filter_tunnel_requests(&self.tunnel_requests, &self.search_query)
+            .into_iter()
+            .filter(|request_index| {
+                !self.tunnel_pinned_only
+                    || self
+                        .tunnel_requests
+                        .get(*request_index)
+                        .is_some_and(|request| request.pinned)
+            })
+            .collect()
+    }
+
+    fn find_visible_tunnel_request_position(&self, request_id: &str) -> Option<usize> {
+        self.visible_tunnel_request_indices()
+            .iter()
+            .position(|request_index| {
+                self.tunnel_requests
+                    .get(*request_index)
+                    .is_some_and(|request| request.request_id == request_id)
+            })
+    }
+
+    fn selected_tunnel_request_index(&self) -> Option<usize> {
+        self.visible_tunnel_request_indices()
+            .get(self.tunnel_selected_index)
+            .copied()
+    }
+
+    fn selected_tunnel_request(&self) -> Option<&TunnelRequest> {
+        self.selected_tunnel_request_index()
+            .and_then(|request_index| self.tunnel_requests.get(request_index))
+    }
+
+    fn selected_tunnel_request_id(&self) -> Option<String> {
+        self.selected_tunnel_request()
+            .map(|request| request.request_id.clone())
+    }
+
+    pub fn is_tunnel_follow_pinned(&self) -> bool {
+        self.tunnel_selected_index != 0 || self.tunnel_expanded_request_id.is_some()
+    }
+
+    pub fn tunnel_pinned_count(&self) -> usize {
+        self.tunnel_requests
+            .iter()
+            .filter(|request| request.pinned)
+            .count()
+    }
+
+    fn tunnel_request_public_path(request: &TunnelRequest) -> String {
+        format_path_with_query(&request.path, &request.query_string)
+    }
+
+    fn selected_tunnel_request_url(&self) -> Option<String> {
+        let subdomain = self
+            .tunnel_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|subdomain| !subdomain.is_empty())?
+            .trim_end_matches('/');
+        let request = self.selected_tunnel_request()?;
+
+        Some(format!(
+            "https://{}{}",
+            subdomain,
+            Self::tunnel_request_public_path(request)
+        ))
+    }
+
+    fn selected_tunnel_replay_request(&self) -> Option<TunnelReplayRequest> {
+        let request = self.selected_tunnel_request()?;
+
+        Some(TunnelReplayRequest {
+            request_id: request.request_id.clone(),
+            method: request.method.clone(),
+            path: request.path.clone(),
+            query_string: request.query_string.clone(),
+            headers: request.headers.clone(),
+            body: request.body.clone(),
+            local_host: self.tunnel_local_host.clone(),
+            local_port: self.tunnel_local_port,
+        })
+    }
+
+    fn request_selected_tunnel_replay(&mut self) {
+        let Some(replay_request) = self.selected_tunnel_replay_request() else {
+            self.set_tunnel_status("No request selected to replay");
+            return;
+        };
+
+        if is_truncated_body(replay_request.body.as_deref()) {
+            self.set_tunnel_status("Replay unavailable: body truncated");
+            return;
+        }
+
+        self.tunnel_replay_requested = Some(replay_request);
+        self.set_tunnel_status("Replaying selected request...");
+    }
+
+    fn request_tunnel_reconnect(&mut self) {
+        self.tunnel_reconnect_requested = true;
+        self.tunnel_connected = false;
+        self.tunnel_connected_at = None;
+        self.tunnel_error = Some("Manual reconnect requested...".to_string());
+        self.set_tunnel_status("Restarting tunnel connection...");
+    }
+
+    fn copy_tunnel_base_url(&mut self) {
+        if let Some(subdomain) = &self.tunnel_subdomain {
+            let url = format!("https://{}", subdomain);
+            self.copy_tunnel_text_to_clipboard(&url, "Base URL copied to clipboard!");
+        } else {
+            self.set_tunnel_status("Tunnel URL is not ready yet");
+        }
+    }
+
+    fn copy_selected_tunnel_request_url(&mut self) {
+        if let Some(url) = self.selected_tunnel_request_url() {
+            self.copy_tunnel_text_to_clipboard(&url, "Request URL copied to clipboard!");
+        } else {
+            self.set_tunnel_status("No request URL selected to copy");
+        }
+    }
+
+    fn copy_selected_tunnel_request_id(&mut self) {
+        if let Some(request_id) = self.selected_tunnel_request_id() {
+            self.copy_tunnel_text_to_clipboard(&request_id, "Request ID copied to clipboard!");
+        } else {
+            self.set_tunnel_status("No request ID selected to copy");
+        }
+    }
+
+    fn toggle_selected_tunnel_request_pin(&mut self) {
+        let Some(request_index) = self.selected_tunnel_request_index() else {
+            self.set_tunnel_status("No request selected to pin");
+            return;
+        };
+
+        let Some(request) = self.tunnel_requests.get_mut(request_index) else {
+            return;
+        };
+        request.pinned = !request.pinned;
+        let request_id = request.request_id.clone();
+        let pinned = request.pinned;
+
+        let status_message = if pinned {
+            "Request pinned"
+        } else {
+            "Request unpinned"
+        };
+        self.set_tunnel_status(status_message);
+
+        if let Some(position) = self.find_visible_tunnel_request_position(&request_id) {
+            self.tunnel_selected_index = position;
+        } else {
+            self.clamp_tunnel_selection();
+            if self.tunnel_expanded_request_id.as_deref() == Some(request_id.as_str()) {
+                self.tunnel_expanded_request_id = None;
+            }
+        }
+    }
+
+    fn toggle_tunnel_pinned_view(&mut self) {
+        let selected_request_id = self.selected_tunnel_request_id();
+        self.tunnel_pinned_only = !self.tunnel_pinned_only;
+
+        if let Some(selected_request_id) = selected_request_id
+            && let Some(position) = self.find_visible_tunnel_request_position(&selected_request_id)
+        {
+            self.tunnel_selected_index = position;
+        } else {
+            self.clamp_tunnel_selection();
+        }
+
+        if let Some(expanded_id) = &self.tunnel_expanded_request_id
+            && self
+                .find_visible_tunnel_request_position(expanded_id)
+                .is_none()
+        {
+            self.tunnel_expanded_request_id = None;
+        }
+
+        let status_message = if self.tunnel_pinned_only {
+            "Showing pinned requests"
+        } else {
+            "Showing all requests"
+        };
+        self.set_tunnel_status(status_message);
+    }
+
+    fn copy_tunnel_text_to_clipboard(&mut self, text: &str, success_message: &'static str) {
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+            Ok(_) => {
+                self.set_tunnel_status(success_message);
+            }
+            Err(e) => {
+                self.set_tunnel_status(format!("Failed to copy: {}", e));
+            }
+        }
+    }
+
+    fn set_tunnel_status(&mut self, message: impl Into<String>) {
+        self.tunnel_status_message = Some((message.into(), std::time::Instant::now()));
+    }
+
+    fn clamp_tunnel_selection(&mut self) {
+        let filtered_len = self.visible_tunnel_request_indices().len();
+        if filtered_len == 0 {
+            self.tunnel_selected_index = 0;
+        } else {
+            self.tunnel_selected_index = self.tunnel_selected_index.min(filtered_len - 1);
+        }
+    }
+
+    pub fn push_tunnel_request(&mut self, request: TunnelRequest) {
+        let selected_request_id = if self.is_tunnel_follow_pinned() {
+            self.selected_tunnel_request_id()
+        } else {
+            None
+        };
+
+        self.tunnel_requests.push_back(request);
+        if self.tunnel_requests.len() > MAX_TUNNEL_REQUESTS {
+            self.tunnel_requests.pop_front();
+        }
+
+        if let Some(expanded_id) = &self.tunnel_expanded_request_id
+            && !self
+                .tunnel_requests
+                .iter()
+                .any(|request| request.request_id == *expanded_id)
+        {
+            self.tunnel_expanded_request_id = None;
+        }
+
+        if let Some(selected_request_id) = selected_request_id
+            && let Some(position) = self.find_visible_tunnel_request_position(&selected_request_id)
+        {
+            self.tunnel_selected_index = position;
+            return;
+        }
+
+        self.clamp_tunnel_selection();
+    }
+
+    fn toggle_selected_tunnel_request_expansion(&mut self) {
+        let Some(request_index) = self.selected_tunnel_request_index() else {
+            return;
+        };
+        let Some(request) = self.tunnel_requests.get(request_index) else {
+            return;
+        };
+
+        if self.tunnel_expanded_request_id.as_deref() == Some(request.request_id.as_str()) {
+            self.tunnel_expanded_request_id = None;
+        } else {
+            self.tunnel_expanded_request_id = Some(request.request_id.clone());
+        }
+    }
+
+    fn open_selected_tunnel_request_detail(&mut self) {
+        if let Some(request_index) = self.selected_tunnel_request_index() {
+            self.open_tunnel_request_detail(request_index);
+        } else {
+            self.tunnel_status_message = Some((
+                "No request selected for details".into(),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+
+    fn open_tunnel_request_detail(&mut self, request_index: usize) {
+        let Some(tunnel_req) = self.tunnel_requests.get(request_index).cloned() else {
+            return;
+        };
+        let public_path = Self::tunnel_request_public_path(&tunnel_req);
+
+        let webhook_req = WebhookRequest {
+            id: tunnel_req.request_id,
+            timestamp: 0,
+            remote_addr: "Tunnel".to_string(),
+            headers: tunnel_req.headers,
+            content_length: tunnel_req
+                .body
+                .as_ref()
+                .map(|b| b.len() as i64)
+                .unwrap_or(0),
+            method: tunnel_req.method,
+            url: public_path,
+            path: Some(tunnel_req.path),
+            query_params: parse_query_string(&tunnel_req.query_string),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            body_preview: tunnel_req.body.clone(),
+            body: tunnel_req.body,
+        };
+        self.selected_request = Some(webhook_req);
+
+        let duration_ms = tunnel_req
+            .completed_at
+            .map(|completed| completed.duration_since(tunnel_req.received_at).as_millis() as u64);
+        self.selected_tunnel_response = Some(TunnelResponseData {
+            status: tunnel_req.status,
+            headers: tunnel_req.response_headers.unwrap_or_default(),
+            body: tunnel_req.response_body,
+            duration_ms,
+            error: tunnel_req.error,
+        });
+
+        self.current_tab = 0;
+        self.headers_scroll_offset = 0;
+        self.body_scroll_offset = 0;
+        self.response_headers_scroll_offset = 0;
+        self.response_scroll_offset = 0;
+        self.detail_return_state = Some(DetailReturnTarget::Tunneling);
+        self.state = AppState::ShowRequestDetail;
+    }
+
     pub fn tick(&mut self) {
         // Update loading animation frame
         self.loading_frame = (self.loading_frame + 1) % 8;
@@ -824,6 +1426,10 @@ impl App {
 
     pub fn take_tunnel_reconnect_request(&mut self) -> bool {
         std::mem::take(&mut self.tunnel_reconnect_requested)
+    }
+
+    pub fn take_tunnel_replay_request(&mut self) -> Option<TunnelReplayRequest> {
+        self.tunnel_replay_requested.take()
     }
 }
 
@@ -848,10 +1454,42 @@ mod tests {
         }
     }
 
+    fn key_event_with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
     fn make_app_with_state(state: AppState) -> App {
         let mut app = App::with_config(make_config());
         app.state = state;
         app
+    }
+
+    fn make_tunnel_request(
+        id: &str,
+        method: &str,
+        path: &str,
+        status: Option<u16>,
+    ) -> TunnelRequest {
+        TunnelRequest {
+            request_id: id.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            received_at: std::time::Instant::now(),
+            status,
+            completed_at: status.map(|_| std::time::Instant::now()),
+            error: None,
+            headers: HashMap::new(),
+            body: None,
+            query_string: String::new(),
+            response_headers: None,
+            response_body: None,
+            pinned: false,
+        }
     }
 
     // is_valid_url tests
@@ -907,6 +1545,119 @@ mod tests {
     fn test_with_config_defaults_to_listening() {
         let app = App::with_config(make_config());
         assert!(matches!(app.state, AppState::Listening));
+    }
+
+    #[test]
+    fn test_tunnel_stats_record_response_tracks_status_buckets() {
+        let mut stats = TunnelStats::default();
+
+        stats.record_response(200, 20);
+        stats.record_response(404, 30);
+        stats.record_response(503, 40);
+
+        assert_eq!(stats.success, 3);
+        assert_eq!(stats.status_2xx, 1);
+        assert_eq!(stats.status_4xx, 1);
+        assert_eq!(stats.status_5xx, 1);
+        assert_eq!(stats.total_duration_ms, 90);
+    }
+
+    #[test]
+    fn test_filter_tunnel_requests_empty_query_returns_newest_first() {
+        let mut requests = VecDeque::new();
+        requests.push_back(make_tunnel_request("old", "GET", "/old", Some(200)));
+        requests.push_back(make_tunnel_request("new", "POST", "/new", Some(201)));
+
+        assert_eq!(App::filter_tunnel_requests(&requests, ""), vec![1, 0]);
+    }
+
+    #[test]
+    fn test_filter_tunnel_requests_supports_field_queries() {
+        let mut requests = VecDeque::new();
+        requests.push_back(make_tunnel_request("ok", "GET", "/health", Some(200)));
+        requests.push_back(make_tunnel_request(
+            "fail",
+            "POST",
+            "/webhooks/stripe",
+            Some(500),
+        ));
+        requests[0].pinned = true;
+
+        assert_eq!(
+            App::filter_tunnel_requests(&requests, "method:post"),
+            vec![1]
+        );
+        assert_eq!(
+            App::filter_tunnel_requests(&requests, "status:500"),
+            vec![1]
+        );
+        assert_eq!(
+            App::filter_tunnel_requests(&requests, "path:health"),
+            vec![0]
+        );
+        assert_eq!(
+            App::filter_tunnel_requests(&requests, "pinned:true"),
+            vec![0]
+        );
+        assert_eq!(
+            App::filter_tunnel_requests(&requests, "pinned:false"),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_visible_tunnel_request_indices_respects_pinned_view() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        let mut pinned = make_tunnel_request("pinned", "GET", "/important", Some(200));
+        pinned.pinned = true;
+        app.tunnel_requests
+            .push_back(make_tunnel_request("normal", "GET", "/normal", Some(200)));
+        app.tunnel_requests.push_back(pinned);
+
+        assert_eq!(app.visible_tunnel_request_indices(), vec![1, 0]);
+
+        app.tunnel_pinned_only = true;
+        assert_eq!(app.visible_tunnel_request_indices(), vec![1]);
+    }
+
+    #[test]
+    fn test_slash_activates_search_in_tunneling() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+
+        app.handle_key_event(key_event(KeyCode::Char('/'))).unwrap();
+        app.handle_key_event(key_event(KeyCode::Char('p'))).unwrap();
+
+        assert!(app.search_active);
+        assert_eq!(app.search_query, "p");
+        assert_eq!(app.tunnel_selected_index, 0);
+    }
+
+    #[test]
+    fn test_esc_from_tunneling_clears_inactive_filter() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.search_query = "status:500".to_string();
+        app.tunnel_selected_index = 2;
+
+        app.handle_key_event(key_event(KeyCode::Esc)).unwrap();
+
+        assert!(!app.should_quit);
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.tunnel_selected_index, 0);
+    }
+
+    #[test]
+    fn test_enter_from_tunneling_expands_filtered_selection() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests
+            .push_back(make_tunnel_request("get", "GET", "/health", Some(200)));
+        app.tunnel_requests
+            .push_back(make_tunnel_request("post", "POST", "/webhooks", Some(202)));
+        app.search_query = "method:get".to_string();
+
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(app.state, AppState::Tunneling));
+        assert_eq!(app.tunnel_expanded_request_id.as_deref(), Some("get"));
     }
 
     // handle_key_event state transitions
@@ -974,9 +1725,13 @@ mod tests {
     }
 
     #[test]
-    fn test_r_from_tunneling_requests_reconnect() {
+    fn test_ctrl_r_from_tunneling_requests_reconnect() {
         let mut app = make_app_with_state(AppState::Tunneling);
-        app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
+        app.handle_key_event(key_event_with_modifiers(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ))
+        .unwrap();
         assert!(app.take_tunnel_reconnect_request());
         assert!(app.tunnel_status_message.is_some());
         assert!(app.tunnel_error.is_some());
@@ -1009,7 +1764,377 @@ mod tests {
     }
 
     #[test]
-    fn test_enter_from_tunneling_opens_detail() {
+    fn test_enter_from_tunneling_toggles_expanded_request() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests
+            .push_back(make_tunnel_request("req-1", "POST", "/webhook", Some(200)));
+
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+        assert_eq!(app.tunnel_expanded_request_id.as_deref(), Some("req-1"));
+
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+        assert_eq!(app.tunnel_expanded_request_id, None);
+    }
+
+    #[test]
+    fn test_p_from_tunneling_toggles_selected_pin() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests
+            .push_back(make_tunnel_request("req-1", "POST", "/webhook", Some(200)));
+
+        app.handle_key_event(key_event(KeyCode::Char('p'))).unwrap();
+        assert!(app.tunnel_requests[0].pinned);
+        assert_eq!(app.tunnel_pinned_count(), 1);
+        assert_eq!(
+            app.tunnel_status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("Request pinned")
+        );
+
+        app.handle_key_event(key_event(KeyCode::Char('p'))).unwrap();
+        assert!(!app.tunnel_requests[0].pinned);
+        assert_eq!(app.tunnel_pinned_count(), 0);
+    }
+
+    #[test]
+    fn test_p_from_tunneling_without_selection_sets_status_message() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+
+        app.handle_key_event(key_event(KeyCode::Char('p'))).unwrap();
+
+        assert_eq!(
+            app.tunnel_status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("No request selected to pin")
+        );
+    }
+
+    #[test]
+    fn test_tab_from_tunneling_toggles_pinned_view_and_preserves_pinned_selection() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        let mut pinned = make_tunnel_request("pinned", "GET", "/important", Some(200));
+        pinned.pinned = true;
+        app.tunnel_requests.push_back(pinned);
+        app.tunnel_requests
+            .push_back(make_tunnel_request("normal", "GET", "/normal", Some(200)));
+        app.tunnel_selected_index = 1;
+
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+
+        assert!(app.tunnel_pinned_only);
+        assert_eq!(app.tunnel_selected_index, 0);
+        assert_eq!(app.selected_tunnel_request_id().as_deref(), Some("pinned"));
+        assert_eq!(
+            app.tunnel_status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("Showing pinned requests")
+        );
+
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+
+        assert!(!app.tunnel_pinned_only);
+        assert_eq!(app.tunnel_selected_index, 1);
+        assert_eq!(app.selected_tunnel_request_id().as_deref(), Some("pinned"));
+    }
+
+    #[test]
+    fn test_tab_from_tunneling_selects_first_pin_when_selection_is_unpinned() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        let mut pinned = make_tunnel_request("pinned", "GET", "/important", Some(200));
+        pinned.pinned = true;
+        app.tunnel_requests.push_back(pinned);
+        app.tunnel_requests
+            .push_back(make_tunnel_request("normal", "GET", "/normal", Some(200)));
+        app.tunnel_selected_index = 0;
+
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+
+        assert!(app.tunnel_pinned_only);
+        assert_eq!(app.selected_tunnel_request_id().as_deref(), Some("pinned"));
+    }
+
+    #[test]
+    fn test_push_tunnel_request_follows_newest_when_at_top() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests
+            .push_back(make_tunnel_request("old", "GET", "/old", Some(200)));
+
+        app.push_tunnel_request(make_tunnel_request("new", "GET", "/new", Some(201)));
+
+        assert_eq!(app.tunnel_selected_index, 0);
+        assert_eq!(app.selected_tunnel_request_id().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn test_push_tunnel_request_preserves_selected_older_request() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests
+            .push_back(make_tunnel_request("old", "GET", "/old", Some(200)));
+        app.tunnel_requests
+            .push_back(make_tunnel_request("current", "GET", "/current", Some(201)));
+        app.tunnel_selected_index = 1;
+
+        app.push_tunnel_request(make_tunnel_request("new", "GET", "/new", Some(202)));
+
+        assert_eq!(app.tunnel_selected_index, 2);
+        assert_eq!(app.selected_tunnel_request_id().as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn test_push_tunnel_request_preserves_expanded_top_request() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests.push_back(make_tunnel_request(
+            "current",
+            "POST",
+            "/webhook",
+            Some(200),
+        ));
+        app.tunnel_expanded_request_id = Some("current".to_string());
+
+        app.push_tunnel_request(make_tunnel_request("new", "POST", "/new", Some(201)));
+
+        assert_eq!(app.tunnel_selected_index, 1);
+        assert_eq!(app.selected_tunnel_request_id().as_deref(), Some("current"));
+        assert_eq!(app.tunnel_expanded_request_id.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn test_tunnel_follow_state_is_live_at_top() {
+        let app = make_app_with_state(AppState::Tunneling);
+
+        assert!(!app.is_tunnel_follow_pinned());
+    }
+
+    #[test]
+    fn test_tunnel_follow_state_is_pinned_for_older_or_expanded_request() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_selected_index = 1;
+
+        assert!(app.is_tunnel_follow_pinned());
+
+        app.tunnel_selected_index = 0;
+        app.tunnel_expanded_request_id = Some("req-1".to_string());
+
+        assert!(app.is_tunnel_follow_pinned());
+    }
+
+    #[test]
+    fn test_selected_tunnel_request_url_includes_path_and_query() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_subdomain = Some("abc123.hook.events".to_string());
+        let mut request = make_tunnel_request("req-1", "GET", "search", Some(200));
+        request.query_string = "q=hello%20world".to_string();
+        app.tunnel_requests.push_back(request);
+
+        assert_eq!(
+            app.selected_tunnel_request_url().as_deref(),
+            Some("https://abc123.hook.events/search?q=hello%20world")
+        );
+    }
+
+    #[test]
+    fn test_selected_tunnel_request_url_uses_filtered_selection() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_subdomain = Some("abc123.hook.events".to_string());
+        app.tunnel_requests
+            .push_back(make_tunnel_request("get", "GET", "/health", Some(200)));
+        app.tunnel_requests
+            .push_back(make_tunnel_request("post", "POST", "/webhook", Some(202)));
+        app.search_query = "method:get".to_string();
+
+        assert_eq!(
+            app.selected_tunnel_request_url().as_deref(),
+            Some("https://abc123.hook.events/health")
+        );
+        assert_eq!(app.selected_tunnel_request_id().as_deref(), Some("get"));
+    }
+
+    #[test]
+    fn test_selected_tunnel_request_url_missing_without_subdomain_or_request() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_requests
+            .push_back(make_tunnel_request("req-1", "GET", "/health", Some(200)));
+
+        assert_eq!(app.selected_tunnel_request_url(), None);
+
+        app.tunnel_subdomain = Some("abc123.hook.events".to_string());
+        app.search_query = "method:post".to_string();
+
+        assert_eq!(app.selected_tunnel_request_url(), None);
+    }
+
+    #[test]
+    fn test_r_from_tunneling_requests_selected_replay() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_local_host = "127.0.0.1".to_string();
+        app.tunnel_local_port = 4567;
+        let mut request = make_tunnel_request("req-1", "POST", "/webhook", Some(200));
+        request.query_string = "debug=true".to_string();
+        request
+            .headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        request.body = Some("{\"ok\":true}".to_string());
+        app.tunnel_requests.push_back(request);
+
+        app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
+
+        let replay = app
+            .take_tunnel_replay_request()
+            .expect("selected tunnel request should be queued for replay");
+        assert_eq!(replay.request_id, "req-1");
+        assert_eq!(replay.method, "POST");
+        assert_eq!(
+            replay.target_url(),
+            "http://127.0.0.1:4567/webhook?debug=true"
+        );
+        assert_eq!(replay.body.as_deref(), Some("{\"ok\":true}"));
+        assert!(!app.take_tunnel_reconnect_request());
+    }
+
+    #[test]
+    fn test_r_from_tunneling_without_selection_sets_status_message() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+
+        app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
+
+        assert!(app.take_tunnel_replay_request().is_none());
+        assert_eq!(
+            app.tunnel_status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("No request selected to replay")
+        );
+    }
+
+    #[test]
+    fn test_r_from_tunneling_refuses_truncated_body_replay() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        let mut request = make_tunnel_request("req-1", "POST", "/webhook", Some(200));
+        request.body = Some(format!("partial{}", TRUNCATED_BODY_MARKER));
+        app.tunnel_requests.push_back(request);
+
+        app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
+
+        assert!(app.take_tunnel_replay_request().is_none());
+        assert_eq!(
+            app.tunnel_status_message
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            Some("Replay unavailable: body truncated")
+        );
+    }
+
+    #[test]
+    fn test_a_from_tunneling_opens_actions() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+
+        app.handle_key_event(key_event(KeyCode::Char('a'))).unwrap();
+
+        assert!(app.tunnel_actions_open);
+    }
+
+    #[test]
+    fn test_esc_closes_tunnel_actions_without_quitting() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_actions_open = true;
+
+        app.handle_key_event(key_event(KeyCode::Esc)).unwrap();
+
+        assert!(!app.tunnel_actions_open);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn test_q_from_action_menu_quits() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_actions_open = true;
+
+        app.handle_key_event(key_event(KeyCode::Char('q'))).unwrap();
+
+        assert!(!app.tunnel_actions_open);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_action_menu_r_requests_replay_and_closes() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_actions_open = true;
+        app.tunnel_requests
+            .push_back(make_tunnel_request("req-1", "GET", "/health", Some(200)));
+
+        app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
+
+        assert!(!app.tunnel_actions_open);
+        assert_eq!(
+            app.take_tunnel_replay_request()
+                .map(|request| request.request_id),
+            Some("req-1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_action_menu_p_toggles_pin_and_closes() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_actions_open = true;
+        app.tunnel_requests
+            .push_back(make_tunnel_request("req-1", "GET", "/health", Some(200)));
+
+        app.handle_key_event(key_event(KeyCode::Char('p'))).unwrap();
+
+        assert!(!app.tunnel_actions_open);
+        assert!(app.tunnel_requests[0].pinned);
+    }
+
+    #[test]
+    fn test_action_menu_tab_toggles_pinned_view_and_closes() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_actions_open = true;
+
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+
+        assert!(!app.tunnel_actions_open);
+        assert!(app.tunnel_pinned_only);
+    }
+
+    #[test]
+    fn test_action_menu_ctrl_r_requests_reconnect_and_closes() {
+        let mut app = make_app_with_state(AppState::Tunneling);
+        app.tunnel_actions_open = true;
+
+        app.handle_key_event(key_event_with_modifiers(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ))
+        .unwrap();
+
+        assert!(!app.tunnel_actions_open);
+        assert!(app.take_tunnel_reconnect_request());
+    }
+
+    #[test]
+    fn test_tunnel_replay_request_target_url_normalizes_path() {
+        let replay = TunnelReplayRequest {
+            request_id: "req-1".to_string(),
+            method: "GET".to_string(),
+            path: "health".to_string(),
+            query_string: "check=true".to_string(),
+            headers: HashMap::new(),
+            body: None,
+            local_host: "localhost".to_string(),
+            local_port: 3000,
+        };
+
+        assert_eq!(
+            replay.target_url(),
+            "http://localhost:3000/health?check=true"
+        );
+    }
+
+    #[test]
+    fn test_d_from_tunneling_opens_detail() {
         let mut app = make_app_with_state(AppState::Tunneling);
         app.tunnel_requests.push_back(TunnelRequest {
             request_id: "req-1".to_string(),
@@ -1027,9 +2152,10 @@ mod tests {
                 "application/json".to_string(),
             )])),
             response_body: Some("{\"ok\":true}".to_string()),
+            pinned: false,
         });
         app.tunnel_selected_index = 0;
-        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+        app.handle_key_event(key_event(KeyCode::Char('d'))).unwrap();
         assert!(matches!(app.state, AppState::ShowRequestDetail));
         assert_eq!(app.detail_return_state, Some(DetailReturnTarget::Tunneling));
         assert!(app.selected_request.is_some());
@@ -1040,7 +2166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enter_from_tunneling_decodes_query_params() {
+    fn test_d_from_tunneling_decodes_query_params() {
         let mut app = make_app_with_state(AppState::Tunneling);
         app.tunnel_requests.push_back(TunnelRequest {
             request_id: "req-2".to_string(),
@@ -1055,13 +2181,15 @@ mod tests {
             query_string: "q=hello%20world&plus=a+b".to_string(),
             response_headers: Some(HashMap::new()),
             response_body: None,
+            pinned: false,
         });
         app.tunnel_selected_index = 0;
-        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+        app.handle_key_event(key_event(KeyCode::Char('d'))).unwrap();
 
         let selected = app
             .selected_request
             .expect("selected request should be set");
+        assert_eq!(selected.url, "/search?q=hello%20world&plus=a+b");
         assert_eq!(
             selected.query_params.get("q"),
             Some(&"hello world".to_string())
@@ -1124,6 +2252,36 @@ mod tests {
         app.handle_key_event(key_event(KeyCode::Down)).unwrap();
         assert_eq!(app.response_headers_scroll_offset, headers_max);
         assert_eq!(app.response_scroll_offset, 1);
+    }
+
+    #[test]
+    fn test_body_scroll_advances_for_compact_json() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        let mut request = make_request("POST", "/webhook");
+        let items = (0..50).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        request.body = Some(format!(r#"{{"items":[{}]}}"#, items));
+        app.selected_request = Some(request);
+        app.current_tab = 2;
+
+        app.handle_key_event(key_event(KeyCode::Down)).unwrap();
+
+        assert_eq!(app.body_scroll_offset, 1);
+    }
+
+    #[test]
+    fn test_header_scroll_advances_for_long_wrapped_value() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        let large_value = "a".repeat(2_500);
+        app.selected_request = Some(make_request_with_headers(
+            "POST",
+            "/webhook",
+            vec![("x-large-header", large_value.as_str())],
+        ));
+        app.current_tab = 1;
+
+        app.handle_key_event(key_event(KeyCode::Down)).unwrap();
+
+        assert_eq!(app.headers_scroll_offset, 1);
     }
 
     #[test]
