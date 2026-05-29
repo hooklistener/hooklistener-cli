@@ -1,0 +1,27 @@
+---
+source: src/ui.rs
+expression: snapshot
+---
+
+ ┌ HTTP Tunnel ───────────────────────────────────────────────────────────────────────────────────┐
+ │ hooklistener  ● connected  static  uptime 2m 5s                                                │
+ │ https://plant-07.hook.events  →  localhost:8080                                                │
+ └────────────────────────────────────────────────────────────────────────────────────────────────┘
+  Statistics ──────────────────────────────────────────────────────────────────────────────────────
+  Requests 5  2xx 2  4xx 1  5xx 1  Err 0  Avg 467ms  Last 200  View All  Follow Paused
+
+ ┌ Filter ────────────────────────────────────────────────────────────────────────────────────────┐
+ │/billing▎                                                                                       │
+ └────────────────────────────────────────────────────────────────────────────────────────────────┘
+  Live Requests (1) filtered from 5 | Enter expand | D details ────────────────────────────────────
+ ID       Age    Method   Path                         Status   Duration   Size     From
+
+ req-50   now    POST     /webhooks/billing/invoice    502      1420ms     68b      203.0.113.91
+
+
+
+
+
+
+
+ Tunnel (5)  ↑↓ Select | Enter Expand | Tab Pins | P Pin | A Actions | Home Top | E  API connected

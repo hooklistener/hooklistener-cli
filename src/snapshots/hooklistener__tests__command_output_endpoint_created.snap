@@ -1,0 +1,12 @@
+---
+source: src/main.rs
+assertion_line: 3010
+expression: output
+---
+[OK] ENDPOINT CREATED
+
+ID             ep_123
+SLUG           github-webhooks
+WEBHOOK URL    https://example.hooklistener.dev/github-webhooks
+ORGANIZATION   org_123
+ACTION         Run `hooklistener listen github-webhooks`

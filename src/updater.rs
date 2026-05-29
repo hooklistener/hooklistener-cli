@@ -160,15 +160,26 @@ pub fn persist_check_result(latest_version: Option<&str>) {
 /// Print an update notification to stderr (won't interfere with --json stdout).
 pub fn print_update_notification(new_version: &str) {
     let method = InstallMethod::detect();
-    eprintln!();
-    eprintln!(
-        "{} A new version of hooklistener is available: {} -> {}",
-        "Update available!".yellow().bold(),
-        CURRENT_VERSION.dim(),
-        new_version.green().bold()
+    let notification = render_update_notification(CURRENT_VERSION, new_version, &method);
+    eprint!("{notification}");
+}
+
+fn render_update_notification(
+    current_version: &str,
+    new_version: &str,
+    method: &InstallMethod,
+) -> String {
+    let status = crate::format_status_line(crate::OutputStatus::Info, "UPDATE AVAILABLE")
+        .yellow()
+        .bold();
+    let current = crate::format_field_line("CURRENT", current_version.dim());
+    let latest = crate::format_field_line("LATEST", new_version.green().bold());
+    let action = crate::format_field_line(
+        "ACTION",
+        format!("Run {} to update.", method.upgrade_command().bold()),
     );
-    eprintln!("  Run {} to update.", method.upgrade_command().bold());
-    eprintln!();
+
+    format!("\n{}\n\n{}\n{}\n{}\n\n", status, current, latest, action)
 }
 
 /// Run the self-update command.
@@ -187,9 +198,19 @@ pub async fn run_self_update(json: bool) -> Result<()> {
                 }))?;
             } else {
                 println!(
-                    "Installed via {}. Update with:\n\n  {}\n",
-                    method.to_string().bold(),
-                    cmd.green().bold()
+                    "{}",
+                    crate::format_status_line(crate::OutputStatus::Info, "MANUAL UPDATE REQUIRED")
+                        .yellow()
+                        .bold()
+                );
+                println!();
+                println!(
+                    "{}",
+                    crate::format_field_line("METHOD", method.to_string().bold())
+                );
+                println!(
+                    "{}",
+                    crate::format_field_line("COMMAND", cmd.green().bold())
                 );
             }
             Ok(())
@@ -200,7 +221,10 @@ pub async fn run_self_update(json: bool) -> Result<()> {
 
 async fn run_binary_self_update(json: bool) -> Result<()> {
     if !json {
-        println!("{} Checking for updates...", "Updating:".bold());
+        println!(
+            "{}",
+            crate::format_status_line(crate::OutputStatus::Info, "CHECKING FOR UPDATES").bold()
+        );
     }
 
     let status = tokio::task::spawn_blocking(move || {
@@ -231,16 +255,25 @@ async fn run_binary_self_update(json: bool) -> Result<()> {
         }))?;
     } else if status.updated() {
         println!(
-            "\n{} Updated to version {}",
-            "Success!".green().bold(),
-            new_version.bold()
+            "\n{}",
+            crate::format_status_line(crate::OutputStatus::Ok, "UPDATED")
+                .green()
+                .bold(),
+        );
+        println!();
+        println!(
+            "{}",
+            crate::format_field_line("VERSION", new_version.bold())
         );
     } else {
         println!(
-            "\n{} Already on the latest version ({})",
-            "Up to date.".green().bold(),
-            CURRENT_VERSION
+            "\n{}",
+            crate::format_status_line(crate::OutputStatus::Ok, "UP TO DATE")
+                .green()
+                .bold(),
         );
+        println!();
+        println!("{}", crate::format_field_line("VERSION", CURRENT_VERSION));
     }
 
     Ok(())
@@ -291,5 +324,14 @@ mod tests {
             InstallMethod::DirectBinary.upgrade_command(),
             "hooklistener update"
         );
+    }
+
+    #[test]
+    fn update_notification_snapshot() {
+        let output = render_update_notification("1.2.3", "1.4.0", &InstallMethod::Cargo);
+
+        assert!(output.starts_with('\n'));
+        assert!(output.ends_with("\n\n"));
+        insta::assert_snapshot!(output);
     }
 }

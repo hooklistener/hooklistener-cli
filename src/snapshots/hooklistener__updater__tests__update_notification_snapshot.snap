@@ -1,0 +1,10 @@
+---
+source: src/updater.rs
+expression: output
+---
+
+[m[1m[INFO] UPDATE AVAILABLE[0m
+
+CURRENT        [2m1.2.3[0m
+LATEST         [m[1m1.4.0[0m
+ACTION         Run [1mcargo install hooklistener-cli[0m to update.

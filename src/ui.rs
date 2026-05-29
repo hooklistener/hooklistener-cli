@@ -8,21 +8,21 @@ use ratatui::{
     },
 };
 
-// Pastel color palette — soft, pleasant, modern
+// Industrial terminal palette. Keep semantic roles readable without color.
 mod colors {
     use ratatui::style::Color;
 
-    pub const PRIMARY: Color = Color::Rgb(137, 180, 250); // Soft blue — borders, main accent
-    pub const SECONDARY: Color = Color::Rgb(250, 179, 135); // Warm peach — highlights, selected
-    pub const SUCCESS: Color = Color::Rgb(166, 227, 161); // Soft mint — success, POST
-    pub const ERROR: Color = Color::Rgb(243, 139, 168); // Soft rose — errors, DELETE
-    pub const WARNING: Color = Color::Rgb(249, 226, 175); // Pastel amber — warnings, PUT
-    pub const INFO: Color = Color::Rgb(116, 199, 236); // Sky blue — info, GET
-    pub const MUTED: Color = Color::Rgb(127, 132, 156); // Muted lavender — secondary text
-    pub const TEXT: Color = Color::Rgb(205, 214, 244); // Soft white — primary text
-    pub const ACCENT: Color = Color::Rgb(203, 166, 247); // Soft mauve — PATCH, specials
-    pub const BACKGROUND: Color = Color::Rgb(49, 50, 68); // Dark surface — status bar
-    pub const SURFACE: Color = Color::Rgb(69, 71, 90); // Raised surface — row highlights
+    pub const PRIMARY: Color = Color::Rgb(212, 177, 95); // Signal amber
+    pub const SECONDARY: Color = Color::Rgb(127, 167, 200); // Instrument blue
+    pub const SUCCESS: Color = Color::Rgb(143, 174, 121); // Field green
+    pub const ERROR: Color = Color::Rgb(199, 111, 100); // Fault red
+    pub const WARNING: Color = Color::Rgb(212, 177, 95); // Signal amber
+    pub const INFO: Color = Color::Rgb(127, 167, 200); // Instrument blue
+    pub const MUTED: Color = Color::Rgb(143, 147, 138); // Muted ink
+    pub const TEXT: Color = Color::Rgb(216, 216, 210); // Industrial ink
+    pub const ACCENT: Color = Color::Rgb(212, 177, 95); // Primary accent
+    pub const BACKGROUND: Color = Color::Rgb(23, 25, 22); // Panel surface
+    pub const SURFACE: Color = Color::Rgb(42, 48, 41); // Selection row
 
     /// Map an HTTP status code to an appropriate color.
     pub fn for_http_status(status: u16) -> Color {
@@ -107,7 +107,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
         vec![
             Line::from(vec![
                 Span::styled(
-                    "Endpoint: ",
+                    "ENDPOINT  ",
                     Style::default()
                         .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -116,7 +116,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled(
-                    "Target:   ",
+                    "TARGET    ",
                     Style::default()
                         .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -125,7 +125,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled(
-                    "Status:   ",
+                    "STATUS    ",
                     Style::default()
                         .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -146,7 +146,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
         };
         vec![Line::from(vec![
             Span::styled(
-                "Status: ",
+                "STATUS    ",
                 Style::default()
                     .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
@@ -162,7 +162,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
         vec![
             Line::from(vec![
                 Span::styled(
-                    "Endpoint: ",
+                    "ENDPOINT  ",
                     Style::default()
                         .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -171,7 +171,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled(
-                    "Target:   ",
+                    "TARGET    ",
                     Style::default()
                         .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -180,7 +180,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled(
-                    "Status:   ",
+                    "STATUS    ",
                     Style::default()
                         .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -206,7 +206,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
 
     let stats_text = vec![
         Line::from(vec![
-            Span::styled("Total:   ", Style::default().fg(colors::TEXT)),
+            Span::styled("TOTAL    ", Style::default().fg(colors::TEXT)),
             Span::styled(
                 app.listening_stats.total_requests.to_string(),
                 Style::default()
@@ -215,7 +215,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Success: ", Style::default().fg(colors::TEXT)),
+            Span::styled("SUCCESS  ", Style::default().fg(colors::TEXT)),
             Span::styled(
                 app.listening_stats.successful_forwards.to_string(),
                 Style::default()
@@ -224,7 +224,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Failed:  ", Style::default().fg(colors::TEXT)),
+            Span::styled("FAILED   ", Style::default().fg(colors::TEXT)),
             Span::styled(
                 app.listening_stats.failed_forwards.to_string(),
                 Style::default()
@@ -294,18 +294,18 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
 
                 let time_display = "Just now";
 
-                let (method_symbol, method_style) = match request.method.as_str() {
-                    "GET" => ("🔽", style.fg(colors::INFO)),
-                    "POST" => ("📝", style.fg(colors::SUCCESS)),
-                    "PUT" => ("📤", style.fg(colors::WARNING)),
-                    "DELETE" => ("🗑️", style.fg(colors::ERROR)),
-                    "PATCH" => ("✏️", style.fg(colors::ACCENT)),
-                    _ => ("❓", style.fg(colors::TEXT)),
+                let method_style = match request.method.as_str() {
+                    "GET" => style.fg(colors::INFO),
+                    "POST" => style.fg(colors::SUCCESS),
+                    "PUT" => style.fg(colors::WARNING),
+                    "DELETE" => style.fg(colors::ERROR),
+                    "PATCH" => style.fg(colors::ACCENT),
+                    _ => style.fg(colors::TEXT),
                 };
 
                 Row::new(vec![
                     Cell::from(time_display).style(style.fg(colors::MUTED)),
-                    Cell::from(format!("{} {}", method_symbol, request.method)).style(method_style),
+                    Cell::from(request.method.clone()).style(method_style),
                     Cell::from(request.path.clone().unwrap_or(request.url.clone())).style(style),
                     Cell::from(format!("{} headers", request.headers.len()))
                         .style(style.fg(colors::MUTED)),
@@ -636,9 +636,9 @@ fn tunnel_row_style(request: &TunnelRequest, expanded: bool) -> Style {
         TunnelRequestTone::Success | TunnelRequestTone::Other if expanded => {
             Some(colors::BACKGROUND)
         }
-        TunnelRequestTone::ClientError => Some(Color::Rgb(62, 58, 46)),
-        TunnelRequestTone::ServerError | TunnelRequestTone::Failed => Some(Color::Rgb(64, 45, 57)),
-        TunnelRequestTone::Pending => Some(Color::Rgb(55, 54, 45)),
+        TunnelRequestTone::ClientError => Some(Color::Rgb(48, 43, 32)),
+        TunnelRequestTone::ServerError | TunnelRequestTone::Failed => Some(Color::Rgb(52, 37, 36)),
+        TunnelRequestTone::Pending => Some(Color::Rgb(43, 43, 34)),
         _ => None,
     };
 
@@ -2019,7 +2019,7 @@ fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
     let mut status_lines = vec![
         Line::from(vec![
             Span::styled(
-                "Status: ",
+                "STATUS    ",
                 Style::default()
                     .fg(colors::PRIMARY)
                     .add_modifier(Modifier::BOLD),
@@ -2052,7 +2052,7 @@ fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(error) = &resp.error {
         status_lines.push(Line::from(vec![
             Span::styled(
-                "Error: ",
+                "ERROR   ",
                 Style::default()
                     .fg(colors::ERROR)
                     .add_modifier(Modifier::BOLD),
@@ -2124,7 +2124,7 @@ fn draw_error(frame: &mut Frame, error_msg: &str, hint: Option<&str>, area: Rect
     if let Some(hint_text) = hint {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("💡 {}", hint_text),
+            format!("HINT    {}", hint_text),
             Style::default().fg(colors::WARNING),
         )));
     }
@@ -2307,7 +2307,7 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
         let status_info = vec![
             Line::from(vec![
                 Span::styled(
-                    "Status: ",
+                    "STATUS    ",
                     Style::default()
                         .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -2322,7 +2322,7 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
             Line::from(vec![
                 Span::styled(
-                    "Target: ",
+                    "TARGET    ",
                     Style::default()
                         .fg(colors::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -2815,6 +2815,133 @@ mod tests {
         }
     }
 
+    fn listening_request_fixture(
+        id: &str,
+        method: &str,
+        path: &str,
+        remote_addr: &str,
+        content_length: i64,
+        headers: &[(&str, &str)],
+    ) -> crate::models::WebhookRequest {
+        crate::models::WebhookRequest {
+            id: id.to_string(),
+            timestamp: 0,
+            remote_addr: remote_addr.to_string(),
+            headers: headers
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            content_length,
+            method: method.to_string(),
+            url: path.to_string(),
+            path: Some(path.to_string()),
+            query_params: HashMap::new(),
+            created_at: "2026-05-28T13:40:26Z".to_string(),
+            body_preview: None,
+            body: None,
+        }
+    }
+
+    fn base_tunnel_app() -> App {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::Tunneling;
+        app.tunnel_subdomain = Some("plant-07.hook.events".to_string());
+        app.tunnel_connected = true;
+        app.tunnel_connected_at = Some(Instant::now() - Duration::from_secs(125));
+        app.tunnel_local_host = "localhost".to_string();
+        app.tunnel_local_port = 8080;
+        app.tunnel_is_static = true;
+        app
+    }
+
+    fn tunnel_request_fixture(
+        request_id: &str,
+        method: &str,
+        path: &str,
+        status: Option<u16>,
+        duration_ms: Option<u64>,
+        source_ip: &str,
+    ) -> TunnelRequest {
+        let mut request = make_tunnel_request(status, None, duration_ms);
+        request.request_id = request_id.to_string();
+        request.method = method.to_string();
+        request.path = path.to_string();
+        request.headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-forwarded-for".to_string(), source_ip.to_string()),
+        ]);
+        request.body = Some(
+            r#"{"event":"deployment.finished","environment":"production","ok":true}"#.to_string(),
+        );
+        if let Some(status) = status {
+            request.response_headers = Some(HashMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]));
+            request.response_body = Some(format!(r#"{{"status":{},"accepted":true}}"#, status));
+        }
+        request
+    }
+
+    fn app_with_tunnel_rows() -> App {
+        let mut app = base_tunnel_app();
+        let fixtures = [
+            (
+                "req-200-orders",
+                "POST",
+                "/webhooks/orders",
+                Some(200),
+                Some(42),
+                "198.51.100.10",
+            ),
+            (
+                "req-202-build",
+                "PUT",
+                "/deployments/prod",
+                Some(202),
+                Some(318),
+                "198.51.100.11",
+            ),
+            (
+                "req-404-user",
+                "GET",
+                "/webhooks/users/missing",
+                Some(404),
+                Some(88),
+                "203.0.113.24",
+            ),
+            (
+                "req-502-billing",
+                "POST",
+                "/webhooks/billing/invoice",
+                Some(502),
+                Some(1_420),
+                "203.0.113.91",
+            ),
+            (
+                "req-pending-replay",
+                "PATCH",
+                "/replay/pending",
+                Some(200),
+                None,
+                "192.0.2.77",
+            ),
+        ];
+
+        for (request_id, method, path, status, duration_ms, source_ip) in fixtures {
+            let request =
+                tunnel_request_fixture(request_id, method, path, status, duration_ms, source_ip);
+            if let (Some(status), Some(duration_ms)) = (status, duration_ms) {
+                app.tunnel_stats.record_response(status, duration_ms);
+            }
+            app.push_tunnel_request(request);
+            app.tunnel_stats.total += 1;
+        }
+
+        app.tunnel_selected_index = 3;
+        app
+    }
+
     #[test]
     fn tunnel_actions_menu_snapshot() {
         let mut app = App::with_config(valid_test_config());
@@ -2838,6 +2965,26 @@ mod tests {
         app.push_tunnel_request(request);
 
         let snapshot = render_app_to_text(&app, 120, 28);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn tunneling_live_requests_80x24_snapshot() {
+        let app = app_with_tunnel_rows();
+
+        let snapshot = render_app_to_text(&app, 80, 24);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn tunneling_search_active_snapshot() {
+        let mut app = app_with_tunnel_rows();
+        app.search_active = true;
+        app.search_query = "billing".to_string();
+
+        let snapshot = render_app_to_text(&app, 100, 24);
 
         insta::assert_snapshot!(snapshot);
     }
@@ -2867,6 +3014,35 @@ mod tests {
     }
 
     #[test]
+    fn request_detail_response_tab_snapshot() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.current_tab = 3;
+        app.selected_request = Some(make_detail_request());
+        app.selected_tunnel_response = Some(crate::app::TunnelResponseData {
+            status: Some(202),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "x-request-id".to_string(),
+                    "fwd_01hy8gm9vk4r8mwrq27z".to_string(),
+                ),
+                ("server".to_string(), "local-test-rig".to_string()),
+            ]),
+            body: Some(
+                r#"{"accepted":true,"queue":"webhook-forwarder","attempt":1,"duration_ms":64}"#
+                    .to_string(),
+            ),
+            duration_ms: Some(64),
+            error: None,
+        });
+
+        let snapshot = render_app_to_text(&app, 110, 28);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
     fn listening_empty_state_logo_snapshot() {
         let mut app = App::with_config(valid_test_config());
         app.state = AppState::Listening;
@@ -2886,6 +3062,88 @@ mod tests {
         );
 
         let snapshot = render_app_to_text(&app, 120, 18);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn listening_live_requests_80x24_snapshot() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::Listening;
+        app.listening_connected = true;
+        app.listening_endpoint = "orders-prod-v7zd".to_string();
+        app.listening_target = "http://localhost:8080/webhook".to_string();
+        app.listening_stats.total_requests = 3;
+        app.listening_stats.successful_forwards = 2;
+        app.listening_stats.failed_forwards = 1;
+        app.selected_request_index = 1;
+        app.listening_requests = vec![
+            listening_request_fixture(
+                "req-listen-001",
+                "POST",
+                "/webhooks/orders",
+                "198.51.100.20",
+                128,
+                &[("content-type", "application/json")],
+            ),
+            listening_request_fixture(
+                "req-listen-002",
+                "PATCH",
+                "/webhooks/billing/invoice",
+                "203.0.113.42",
+                512,
+                &[
+                    ("content-type", "application/json"),
+                    ("x-provider", "stripe"),
+                ],
+            ),
+            listening_request_fixture(
+                "req-listen-003",
+                "GET",
+                "/health",
+                "192.0.2.9",
+                96,
+                &[("user-agent", "GitHub-Hookshot")],
+            ),
+        ];
+
+        let snapshot = render_app_to_text(&app, 80, 24);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn forward_url_input_snapshot() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::InputForwardUrl;
+        app.selected_request = Some(make_detail_request());
+        app.forward_url_input = "http://localhost:8080/github".to_string();
+
+        let snapshot = render_app_to_text(&app, 90, 20);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn forwarding_progress_snapshot() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ForwardingRequest;
+        app.loading_frame = 3;
+
+        let snapshot = render_app_to_text(&app, 90, 16);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn error_state_snapshot() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::Error {
+            message: "Tunnel connection failed: upstream returned 503".to_string(),
+            hint: Some("Check the local service and press q to exit".to_string()),
+        };
+
+        let snapshot = render_app_to_text(&app, 90, 18);
 
         insta::assert_snapshot!(snapshot);
     }

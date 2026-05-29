@@ -616,8 +616,13 @@ async fn main() -> Result<()> {
 
             // Check if authenticated
             if !config.is_token_valid() {
-                eprintln!(
-                    "❌ Not authenticated. Please run 'hooklistener login' to authenticate first."
+                eprint_status_block(
+                    OutputStatus::Err,
+                    "AUTH REQUIRED",
+                    &[output_field(
+                        "ACTION",
+                        "Run 'hooklistener login' to authenticate first.",
+                    )],
                 );
                 std::process::exit(1);
             }
@@ -682,9 +687,10 @@ async fn main() -> Result<()> {
                     "output": output.display().to_string()
                 }))?;
             } else {
-                println!(
-                    "✅ Diagnostic bundle created in: {}",
-                    output.display().to_string().bold()
+                print_status_block(
+                    OutputStatus::Ok,
+                    "DIAGNOSTIC BUNDLE CREATED",
+                    &[output_field("OUTPUT", output.display().to_string().bold())],
                 );
             }
         }
@@ -701,11 +707,14 @@ async fn main() -> Result<()> {
                     "keep": keep
                 }))?;
             } else {
-                println!(
-                    "Removed {} old log file(s) from {} (keeping {} most recent)",
-                    removed.to_string().bold(),
-                    directory.display().to_string().dim(),
-                    keep.to_string().bold()
+                print_status_block(
+                    OutputStatus::Ok,
+                    "LOGS CLEANED",
+                    &[
+                        output_field("REMOVED", removed.to_string().bold()),
+                        output_field("DIRECTORY", directory.display().to_string().dim()),
+                        output_field("KEEP", keep.to_string().bold()),
+                    ],
                 );
             }
         }
@@ -731,7 +740,7 @@ async fn main() -> Result<()> {
                         "organization_id": config.selected_organization_id
                     }))?;
                 } else {
-                    println!("{} {}", "Config file:".dim(), config_path.display());
+                    print_field("CONFIG FILE", config_path.display());
                     println!();
                     match &config.access_token {
                         Some(token) => {
@@ -741,30 +750,16 @@ async fn main() -> Result<()> {
                                 token.clone()
                             };
                             if config.is_token_valid() {
-                                println!(
-                                    "  {} {} {}",
-                                    "Token:".bold(),
-                                    truncated,
-                                    "(valid)".green()
-                                );
+                                print_field("TOKEN", format!("{truncated} {}", "(valid)".green()));
                             } else {
-                                println!(
-                                    "  {} {} {}",
-                                    "Token:".bold(),
-                                    truncated,
-                                    "(expired)".red()
-                                );
+                                print_field("TOKEN", format!("{truncated} {}", "(expired)".red()));
                             }
                         }
-                        None => println!("  {} {}", "Token:".bold(), "(none)".dim()),
+                        None => print_field("TOKEN", "(none)".dim()),
                     }
                     match &config.selected_organization_id {
-                        Some(org_id) => {
-                            println!("  {} {}", "Organization:".bold(), org_id)
-                        }
-                        None => {
-                            println!("  {} {}", "Organization:".bold(), "(none)".dim())
-                        }
+                        Some(org_id) => print_field("ORGANIZATION", org_id),
+                        None => print_field("ORGANIZATION", "(none)".dim()),
                     }
                 }
             }
@@ -781,7 +776,14 @@ async fn main() -> Result<()> {
                                 "value": null
                             }))?;
                         } else {
-                            println!("✅ Cleared {}", "selected_organization_id".bold());
+                            print_status_block(
+                                OutputStatus::Ok,
+                                "CONFIG CLEARED",
+                                &[
+                                    output_field("KEY", "selected_organization_id"),
+                                    output_field("VALUE", "(none)".dim()),
+                                ],
+                            );
                         }
                     } else {
                         config.selected_organization_id = Some(value);
@@ -793,18 +795,28 @@ async fn main() -> Result<()> {
                                 "value": config.selected_organization_id
                             }))?;
                         } else {
-                            println!(
-                                "✅ Set {} to {}",
-                                "selected_organization_id".bold(),
-                                config.selected_organization_id.as_deref().unwrap().bold()
+                            print_status_block(
+                                OutputStatus::Ok,
+                                "CONFIG SET",
+                                &[
+                                    output_field("KEY", "selected_organization_id"),
+                                    output_field(
+                                        "VALUE",
+                                        config.selected_organization_id.as_deref().unwrap().bold(),
+                                    ),
+                                ],
                             );
                         }
                     }
                 }
                 _ => {
-                    eprintln!(
-                        "Unknown config key: {}. Available keys: selected_organization_id",
-                        key
+                    eprint_status_block(
+                        OutputStatus::Err,
+                        "UNKNOWN CONFIG KEY",
+                        &[
+                            output_field("KEY", key),
+                            output_field("AVAILABLE", "selected_organization_id"),
+                        ],
                     );
                     std::process::exit(1);
                 }
@@ -818,7 +830,7 @@ async fn main() -> Result<()> {
                         "status": "already_logged_out"
                     }))?;
                 } else {
-                    println!("{}", "Already logged out.".dim());
+                    print_status(OutputStatus::Info, "ALREADY LOGGED OUT");
                 }
             } else {
                 // Best-effort revoke refresh token server-side
@@ -832,7 +844,7 @@ async fn main() -> Result<()> {
                         "status": "logged_out"
                     }))?;
                 } else {
-                    println!("✅ Logged out successfully.");
+                    print_status(OutputStatus::Ok, "LOGGED OUT");
                 }
             }
         }
@@ -873,10 +885,13 @@ async fn main() -> Result<()> {
                         "organization_name": organization_name
                     }))?;
                 } else {
-                    println!(
-                        "✅ Selected organization: {} ({})",
-                        organization_name.bold(),
-                        id.dim()
+                    print_status_block(
+                        OutputStatus::Ok,
+                        "ORGANIZATION SELECTED",
+                        &[
+                            output_field("NAME", organization_name.bold()),
+                            output_field("ORGANIZATION", id.dim()),
+                        ],
                     );
                 }
             }
@@ -890,7 +905,7 @@ async fn main() -> Result<()> {
                         "selected_organization_id": null
                     }))?;
                 } else {
-                    println!("✅ Cleared selected organization.");
+                    print_status(OutputStatus::Ok, "ORGANIZATION CLEARED");
                 }
             }
         },
@@ -907,9 +922,14 @@ async fn main() -> Result<()> {
                         "endpoint": endpoint
                     }))?;
                 } else {
-                    print_context("Organization:", &organization_id);
-                    println!("✅ Created endpoint:");
-                    print_endpoints(std::slice::from_ref(&endpoint));
+                    print_status(OutputStatus::Ok, "ENDPOINT CREATED");
+                    println!();
+                    print_endpoint_detail(&endpoint);
+                    print_field("ORGANIZATION", &organization_id);
+                    print_field(
+                        "ACTION",
+                        format!("Run `hooklistener listen {}`", endpoint.slug).dim(),
+                    );
                 }
             }
             EndpointAction::List { org } => {
@@ -940,8 +960,8 @@ async fn main() -> Result<()> {
                         "endpoint": endpoint
                     }))?;
                 } else {
-                    print_context("Organization:", &organization_id);
-                    print_endpoints(std::slice::from_ref(&endpoint));
+                    print_endpoint_detail(&endpoint);
+                    print_field("ORGANIZATION", &organization_id);
                 }
             }
             EndpointAction::Delete { endpoint_id, org } => {
@@ -957,10 +977,13 @@ async fn main() -> Result<()> {
                         "endpoint_id": endpoint_id
                     }))?;
                 } else {
-                    println!(
-                        "🗑  Deleted endpoint: {} {}",
-                        endpoint_id.bold(),
-                        format!("(organization {})", organization_id).dim()
+                    print_status_block(
+                        OutputStatus::Ok,
+                        "ENDPOINT DELETED",
+                        &[
+                            output_field("ENDPOINT", endpoint_id.bold()),
+                            output_field("ORGANIZATION", organization_id.dim()),
+                        ],
                     );
                 }
             }
@@ -1033,14 +1056,14 @@ async fn main() -> Result<()> {
                         "request_id": request_id
                     }))?;
                 } else {
-                    println!(
-                        "🗑  Deleted request: {} {}",
-                        request_id.bold(),
-                        format!(
-                            "(endpoint {}, organization {})",
-                            endpoint_id, organization_id
-                        )
-                        .dim()
+                    print_status_block(
+                        OutputStatus::Ok,
+                        "REQUEST DELETED",
+                        &[
+                            output_field("REQUEST", request_id.bold()),
+                            output_field("ENDPOINT", endpoint_id.dim()),
+                            output_field("ORGANIZATION", organization_id.dim()),
+                        ],
                     );
                 }
             }
@@ -1072,14 +1095,17 @@ async fn main() -> Result<()> {
                         "forward": response
                     }))?;
                 } else {
-                    print_context("Organization:", &organization_id);
-                    print_context("Endpoint:", &endpoint_id);
-                    print_context("Request:", &request_id);
-                    println!(
-                        "✅ Forward accepted: {} (status: {}, target: {})",
-                        response.forward_id.bold(),
-                        response.status.bold(),
-                        response.target_url.underlined()
+                    print_status_block(
+                        OutputStatus::Ok,
+                        "FORWARD ACCEPTED",
+                        &[
+                            output_field("FORWARD ID", response.forward_id.bold()),
+                            output_field("STATUS", response.status.bold()),
+                            output_field("TARGET URL", response.target_url.underlined()),
+                            output_field("REQUEST", request_id.dim()),
+                            output_field("ENDPOINT", endpoint_id.dim()),
+                            output_field("ORGANIZATION", organization_id.dim()),
+                        ],
                     );
                 }
             }
@@ -1159,13 +1185,16 @@ async fn main() -> Result<()> {
                         "result": created
                     }))?;
                 } else {
-                    println!(
-                        "✅ Created static tunnel: {} {}",
-                        created.static_tunnel.slug.bold(),
-                        format!("({})", created.static_tunnel.id).dim()
-                    );
+                    print_status(OutputStatus::Ok, "STATIC TUNNEL CREATED");
+                    println!();
+                    print_field("ID", &created.static_tunnel.id);
+                    print_field("SLUG", created.static_tunnel.slug.as_str().bold());
+                    if let Some(name) = created.static_tunnel.name.as_deref() {
+                        print_field("NAME", name);
+                    }
+                    print_field("ORGANIZATION", organization_id.dim());
                     if let Some(message) = created.message {
-                        println!("   {}", message.dim());
+                        print_field("MESSAGE", message.dim());
                     }
                 }
             }
@@ -1185,12 +1214,13 @@ async fn main() -> Result<()> {
                         "message": response.message
                     }))?;
                 } else {
-                    println!(
-                        "🗑  {}",
-                        response
-                            .message
-                            .unwrap_or_else(|| "Static tunnel deleted.".to_string())
-                    );
+                    print_status(OutputStatus::Ok, "STATIC TUNNEL DELETED");
+                    println!();
+                    print_field("SLUG/ID", slug_id);
+                    print_field("ORGANIZATION", organization_id.dim());
+                    if let Some(message) = response.message {
+                        print_field("MESSAGE", message.dim());
+                    }
                 }
             }
         },
@@ -1201,23 +1231,16 @@ async fn main() -> Result<()> {
                 if json {
                     print_json(&endpoint)?;
                 } else {
-                    println!("✅ Created anonymous endpoint:");
-                    println!("  {} {}", "ID:".bold(), endpoint.id);
-                    println!(
-                        "  {} {}",
-                        "Webhook URL:".bold(),
-                        endpoint.webhook_url.as_str().underlined()
-                    );
-                    println!("  {} {}", "Expires At:".bold(), endpoint.expires_at.dim());
+                    print_status(OutputStatus::Ok, "ANONYMOUS ENDPOINT CREATED");
                     println!();
-                    println!(
-                        "  {} {}",
-                        "Viewer Token:".bold(),
-                        endpoint.viewer_token.as_str().yellow()
-                    );
-                    println!(
-                        "  {}",
-                        "Save this token! You need it to list captured events.".dim()
+                    print_field("ID", endpoint.id);
+                    print_field("WEBHOOK URL", endpoint.webhook_url.as_str().underlined());
+                    print_field("EXPIRES AT", endpoint.expires_at.dim());
+                    println!();
+                    print_field("VIEWER TOKEN", endpoint.viewer_token.as_str().yellow());
+                    print_field(
+                        "ACTION",
+                        "Save this token. It is required to list captured events.".dim(),
                     );
                 }
             }
@@ -1227,21 +1250,23 @@ async fn main() -> Result<()> {
                 if json {
                     print_json(&status)?;
                 } else {
-                    println!("  {} {}", "ID:".bold(), status.id);
+                    print_status(OutputStatus::Info, "ANONYMOUS ENDPOINT");
+                    println!();
+                    print_field("ID", status.id);
                     let active_str = if status.active {
                         "active".green().to_string()
                     } else {
                         "expired".red().to_string()
                     };
-                    println!("  {} {}", "Status:".bold(), active_str);
+                    print_field("STATUS", active_str);
                     if let Some(expires) = status.expires_at.as_deref() {
-                        println!("  {} {}", "Expires At:".bold(), expires.dim());
+                        print_field("EXPIRES AT", expires.dim());
                     }
                     if let Some(url) = status.webhook_url.as_deref() {
-                        println!("  {} {}", "Webhook URL:".bold(), url.underlined());
+                        print_field("WEBHOOK URL", url.underlined());
                     }
                     if let Some(error) = status.error.as_deref() {
-                        println!("  {} {}", "Error:".red().bold(), error);
+                        print_field("ERROR", error);
                     }
                 }
             }
@@ -1309,24 +1334,21 @@ async fn main() -> Result<()> {
                         "shared_request": shared
                     }))?;
                 } else {
-                    print_context("Organization:", &organization_id);
-                    println!("✅ Created shared link:");
-                    println!("  {} {}", "Share Token:".bold(), shared.share_token);
+                    print_status(OutputStatus::Ok, "SHARE LINK CREATED");
+                    println!();
+                    print_field("SHARE TOKEN", shared.share_token);
                     if let Some(url) = shared.share_url.as_deref() {
-                        println!("  {} {}", "Share URL:".bold(), url.underlined());
+                        print_field("SHARE URL", url.underlined());
                     }
-                    println!("  {} {}", "Request ID:".bold(), shared.debug_request_id);
+                    print_field("REQUEST ID", shared.debug_request_id);
+                    print_field("ORGANIZATION", &organization_id);
                     if shared.password_protected {
-                        println!("  {} {}", "Password:".bold(), "protected".yellow());
+                        print_field("PASSWORD", "protected".yellow());
                     }
                     if let Some(expires) = shared.expires_at.as_deref() {
-                        println!("  {} {}", "Expires At:".bold(), expires.dim());
+                        print_field("EXPIRES AT", expires.dim());
                     }
-                    println!(
-                        "  {} {}",
-                        "Include Forwards:".bold(),
-                        shared.include_forwards
-                    );
+                    print_field("INCLUDE FWDS", shared.include_forwards);
                 }
             }
             ShareAction::List {
@@ -1358,13 +1380,14 @@ async fn main() -> Result<()> {
                 } else {
                     // Check if it's a protected share
                     if data.get("protected").and_then(|v| v.as_bool()) == Some(true) {
-                        println!("{} This share is password-protected.", "🔒".bold());
+                        print_status(OutputStatus::Info, "PROTECTED SHARE");
+                        println!();
                         if let Some(expires) = data.get("expires_at").and_then(|v| v.as_str()) {
-                            println!("  {} {}", "Expires At:".bold(), expires.dim());
+                            print_field("EXPIRES AT", expires.dim());
                         }
-                        println!(
-                            "\n  {}",
-                            "Use the web UI or API to authenticate with the password.".dim()
+                        print_field(
+                            "ACTION",
+                            "Use the web UI or API to authenticate with the password.".dim(),
                         );
                     } else {
                         print_shared_request_full(&data);
@@ -1385,10 +1408,13 @@ async fn main() -> Result<()> {
                         "share_token": token
                     }))?;
                 } else {
-                    println!(
-                        "🗑  Revoked share: {} {}",
-                        token.bold(),
-                        format!("(organization {})", organization_id).dim()
+                    print_status_block(
+                        OutputStatus::Ok,
+                        "SHARE REVOKED",
+                        &[
+                            output_field("SHARE TOKEN", token.bold()),
+                            output_field("ORGANIZATION", organization_id.dim()),
+                        ],
                     );
                 }
             }
@@ -1434,9 +1460,10 @@ async fn main() -> Result<()> {
                         "monitor": monitor
                     }))?;
                 } else {
-                    print_context("Organization:", &organization_id);
-                    println!("✅ Created uptime monitor:");
+                    print_status(OutputStatus::Ok, "UPTIME MONITOR CREATED");
+                    println!();
                     print_monitor_detail(&monitor);
+                    print_field("ORGANIZATION", &organization_id);
                 }
             }
             MonitorAction::List { org } => {
@@ -1525,9 +1552,10 @@ async fn main() -> Result<()> {
                         "monitor": monitor
                     }))?;
                 } else {
-                    print_context("Organization:", &organization_id);
-                    println!("✅ Updated monitor:");
+                    print_status(OutputStatus::Ok, "MONITOR UPDATED");
+                    println!();
                     print_monitor_detail(&monitor);
+                    print_field("ORGANIZATION", &organization_id);
                 }
             }
             MonitorAction::Delete { id, org } => {
@@ -1543,10 +1571,13 @@ async fn main() -> Result<()> {
                         "monitor_id": id
                     }))?;
                 } else {
-                    println!(
-                        "🗑  Deleted monitor: {} {}",
-                        id.bold(),
-                        format!("(organization {})", organization_id).dim()
+                    print_status_block(
+                        OutputStatus::Ok,
+                        "MONITOR DELETED",
+                        &[
+                            output_field("MONITOR", id.bold()),
+                            output_field("ORGANIZATION", organization_id.dim()),
+                        ],
                     );
                 }
             }
@@ -1617,8 +1648,13 @@ async fn main() -> Result<()> {
 
             // Check if authenticated
             if !config.is_token_valid() {
-                eprintln!(
-                    "❌ Not authenticated. Please run 'hooklistener login' to authenticate first."
+                eprint_status_block(
+                    OutputStatus::Err,
+                    "AUTH REQUIRED",
+                    &[output_field(
+                        "ACTION",
+                        "Run 'hooklistener login' to authenticate first.",
+                    )],
                 );
                 std::process::exit(1);
             }
@@ -1689,15 +1725,24 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
     let mut config = config::Config::load()?;
 
     if config.is_token_valid() && !force_reauth {
-        println!("\n  ✅ You're already authenticated.\n");
-        println!(
-            "  Run {} to start forwarding webhooks.",
-            "hooklistener listen <endpoint>".bold()
+        println!();
+        print_status(OutputStatus::Ok, "AUTHENTICATED");
+        println!();
+        print_field(
+            "ACTION",
+            format!(
+                "Run {} to start forwarding webhooks.",
+                "hooklistener listen <endpoint>".bold()
+            ),
         );
-        println!(
-            "  Use {} if you need to re-authenticate.\n",
-            "hooklistener login --force".bold()
+        print_field(
+            "ACTION",
+            format!(
+                "Use {} to re-authenticate.",
+                "hooklistener login --force".bold()
+            ),
         );
+        println!();
         return Ok(());
     }
 
@@ -1718,11 +1763,11 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
         .and_then(|mut cb| cb.set_text(&display_code))
         .is_ok();
 
-    println!("\n  🔐 {}\n", "Hooklistener Login".bold());
-    println!("  Open:  {}", portal_url.as_str().underlined());
-    print!("  Code:  {}", display_code.bold());
+    println!("\n{}\n", "HOOKLISTENER LOGIN".bold());
+    print_field("OPEN", portal_url.as_str().underlined());
+    print!("{} {}", output_label("CODE").bold(), display_code.bold());
     if clipboard_ok {
-        print!("  {}", "(copied to clipboard)".dim());
+        print!(" {}", "(copied to clipboard)".dim());
     }
     println!("\n");
 
@@ -1752,11 +1797,16 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
                     refresh_expires_at,
                 );
                 config.save()?;
-                println!("  ✅ Authentication successful!\n");
-                println!(
-                    "  Run {} to forward webhooks.\n",
-                    "hooklistener listen <endpoint>".bold()
+                print_status(OutputStatus::Ok, "AUTHENTICATION COMPLETE");
+                println!();
+                print_field(
+                    "ACTION",
+                    format!(
+                        "Run {} to forward webhooks.",
+                        "hooklistener listen <endpoint>".bold()
+                    ),
                 );
+                println!();
                 return Ok(());
             }
             Ok(None) => {
@@ -1853,21 +1903,147 @@ fn require_organization(cli_org: Option<String>, config: &config::Config) -> Res
     })
 }
 
-/// Print a dim context line like "Organization: abc123".
+const FIELD_LABEL_WIDTH: usize = 14;
+
+#[derive(Clone, Copy)]
+pub(crate) enum OutputStatus {
+    Ok,
+    Err,
+    Info,
+}
+
+impl OutputStatus {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Ok => "[OK]",
+            Self::Err => "[ERR]",
+            Self::Info => "[INFO]",
+        }
+    }
+}
+
+pub(crate) struct OutputField {
+    label: &'static str,
+    value: String,
+}
+
+pub(crate) fn output_field(label: &'static str, value: impl std::fmt::Display) -> OutputField {
+    OutputField {
+        label,
+        value: value.to_string(),
+    }
+}
+
+fn output_label(label: &str) -> String {
+    let normalized = label.trim().trim_end_matches(':').to_ascii_uppercase();
+    format!("{normalized:<width$}", width = FIELD_LABEL_WIDTH)
+}
+
+fn output_title(title: &str) -> String {
+    title.trim().trim_end_matches(':').to_ascii_uppercase()
+}
+
+pub(crate) fn format_status_line(status: OutputStatus, title: &str) -> String {
+    format!("{} {}", status.token(), output_title(title))
+}
+
+pub(crate) fn format_field_line(label: &str, value: impl std::fmt::Display) -> String {
+    format!("{} {}", output_label(label), value)
+}
+
+fn styled_status_line(status: OutputStatus, title: &str) -> String {
+    let line = format_status_line(status, title);
+    match status {
+        OutputStatus::Ok => line.green().bold().to_string(),
+        OutputStatus::Err => line.red().bold().to_string(),
+        OutputStatus::Info => line.blue().bold().to_string(),
+    }
+}
+
+fn format_pagination_line(p: &api::Pagination) -> String {
+    format!(
+        "PAGE {}/{}  PAGE SIZE {}  TOTAL {}",
+        p.page, p.total_pages, p.page_size, p.total_count
+    )
+}
+
+fn value_or_dash(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+#[cfg(test)]
+pub(crate) fn render_status_block(
+    status: OutputStatus,
+    title: &str,
+    fields: &[OutputField],
+) -> String {
+    let mut output = format_status_line(status, title);
+    if !fields.is_empty() {
+        output.push('\n');
+        output.push('\n');
+    }
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        output.push_str(&format_field_line(field.label, &field.value));
+    }
+    output.push('\n');
+    output
+}
+
+fn print_status(status: OutputStatus, title: &str) {
+    println!("{}", styled_status_line(status, title));
+}
+
+fn print_status_block(status: OutputStatus, title: &str, fields: &[OutputField]) {
+    print_status(status, title);
+    if !fields.is_empty() {
+        println!();
+    }
+    for field in fields {
+        print_field(field.label, &field.value);
+    }
+}
+
+fn eprint_field(label: &str, value: impl std::fmt::Display) {
+    eprintln!("{} {}", output_label(label).bold(), value);
+}
+
+fn eprint_status(status: OutputStatus, title: &str) {
+    eprintln!("{}", styled_status_line(status, title));
+}
+
+fn eprint_status_block(status: OutputStatus, title: &str, fields: &[OutputField]) {
+    eprint_status(status, title);
+    if !fields.is_empty() {
+        eprintln!();
+    }
+    for field in fields {
+        eprint_field(field.label, &field.value);
+    }
+}
+
+fn print_field(label: &str, value: impl std::fmt::Display) {
+    println!("{} {}", output_label(label).bold(), value);
+}
+
+fn print_section(label: &str) {
+    println!("{}", output_title(label).bold());
+}
+
+/// Print a dim context line like "ORGANIZATION abc123".
 fn print_context(label: &str, value: &str) {
-    println!("{} {}", label.dim(), value.dim());
+    println!("{} {}", output_label(label).dim(), value.dim());
 }
 
 /// Print a pagination footer.
 fn print_pagination(p: &api::Pagination) {
-    println!(
-        "{}",
-        format!(
-            "Page {}/{} (page_size={}, total={})",
-            p.page, p.total_pages, p.page_size, p.total_count
-        )
-        .dim()
-    );
+    println!("{}", format_pagination_line(p).dim());
 }
 
 /// Print a key-value map (headers, query params) with a bold section label.
@@ -1877,9 +2053,9 @@ fn print_key_value_map(
     separator: &str,
 ) {
     if map.is_empty() {
-        println!("{} {}", label.bold(), "(none)".dim());
+        print_field(label, "(none)".dim());
     } else {
-        println!("{}", label.bold());
+        print_section(label);
         for (key, value) in map {
             println!("  {}{}{}", key.as_str().dim(), separator, value);
         }
@@ -1890,26 +2066,30 @@ fn print_key_value_map(
 fn print_body_section(label: &str, body: Option<&str>) {
     match body {
         Some(body) if !body.is_empty() => {
-            println!("{}", label.bold());
+            print_section(label);
             println!("{}", body);
         }
-        _ => println!("{} {}", label.bold(), "(empty)".dim()),
+        _ => print_field(label, "(empty)".dim()),
     }
 }
 
 /// Create a pre-configured table with the standard preset and dynamic content arrangement.
 fn new_table(headers: &[&str]) -> Table {
+    let headers = headers
+        .iter()
+        .map(|header| output_title(header))
+        .collect::<Vec<_>>();
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL_CONDENSED)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(headers.to_vec());
+        .set_header(headers);
     table
 }
 
 fn print_organizations(organizations: &[api::Organization], selected_org: Option<&str>) {
     if organizations.is_empty() {
-        println!("{}", "No organizations found.".dim());
+        print_status(OutputStatus::Info, "NO ORGANIZATIONS FOUND");
         return;
     }
 
@@ -1927,7 +2107,7 @@ fn print_organizations(organizations: &[api::Organization], selected_org: Option
 
 fn print_endpoints(endpoints: &[api::DebugEndpointSummary]) {
     if endpoints.is_empty() {
-        println!("{}", "No debug endpoints found.".dim());
+        print_status(OutputStatus::Info, "NO DEBUG ENDPOINTS FOUND");
         return;
     }
 
@@ -1944,9 +2124,20 @@ fn print_endpoints(endpoints: &[api::DebugEndpointSummary]) {
     println!("{table}");
 }
 
+fn print_endpoint_detail(endpoint: &api::DebugEndpointSummary) {
+    print_field("ID", &endpoint.id);
+    print_field("SLUG", &endpoint.slug);
+    print_field("STATUS", &endpoint.status);
+    print_field("WEBHOOK URL", endpoint.webhook_url.as_str().underlined());
+    print_field("NAME", &endpoint.name);
+    if let Some(created_at) = endpoint.created_at.as_deref() {
+        print_field("CREATED AT", created_at.dim());
+    }
+}
+
 fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
     if response.data.is_empty() {
-        println!("{}", "No requests found.".dim());
+        print_status(OutputStatus::Info, "NO REQUESTS FOUND");
         return;
     }
 
@@ -1964,21 +2155,21 @@ fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
 }
 
 fn print_endpoint_request_detail(request: &api::DebugRequestDetail) {
-    println!("{} {}", "Request ID:".bold(), request.id);
-    println!("{} {}", "Method:".bold(), request.method.as_str().bold());
+    print_field("REQUEST ID", &request.id);
+    print_field("METHOD", request.method.as_str().bold());
     if let Some(path) = request.path.as_deref() {
-        println!("{} {}", "Path:".bold(), path);
+        print_field("PATH", path);
     }
-    println!("{} {}", "URL:".bold(), request.url);
+    print_field("URL", &request.url);
 
     if let Some(status_remote) = request.remote_addr.as_deref() {
-        println!("{} {}", "Remote Address:".bold(), status_remote);
+        print_field("REMOTE", status_remote);
     }
     if let Some(content_length) = request.content_length {
-        println!("{} {}", "Content Length:".bold(), content_length);
+        print_field("CONTENT LEN", content_length);
     }
     if let Some(created_at) = request.created_at.as_deref() {
-        println!("{} {}", "Created At:".bold(), created_at.dim());
+        print_field("CREATED AT", created_at.dim());
     }
 
     println!();
@@ -1996,7 +2187,7 @@ fn print_endpoint_request_detail(request: &api::DebugRequestDetail) {
 
 fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsResponse) {
     if response.data.is_empty() {
-        println!("{}", "No forwards found.".dim());
+        print_status(OutputStatus::Info, "NO FORWARDS FOUND");
         return;
     }
 
@@ -2011,7 +2202,7 @@ fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsRespon
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "-".into());
         let target = match forward.error_message.as_deref() {
-            Some(err) => format!("{}\n  error: {err}", forward.target_url),
+            Some(err) => format!("{}\n  [ERR] {err}", forward.target_url),
             None => forward.target_url.clone(),
         };
         table.add_row(vec![
@@ -2027,23 +2218,23 @@ fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsRespon
 }
 
 fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
-    println!("{} {}", "Forward ID:".bold(), forward.id);
-    println!("{} {}", "Request ID:".bold(), forward.debug_request_id);
-    println!("{} {}", "Target URL:".bold(), forward.target_url);
-    println!("{} {}", "Method:".bold(), forward.method.as_str().bold());
+    print_field("FORWARD ID", &forward.id);
+    print_field("REQUEST ID", &forward.debug_request_id);
+    print_field("TARGET URL", &forward.target_url);
+    print_field("METHOD", forward.method.as_str().bold());
     if let Some(status_code) = forward.status_code {
-        println!("{} {}", "Status:".bold(), style_status_code(status_code));
+        print_field("STATUS", style_status_code(status_code));
     } else {
-        println!("{} {}", "Status:".bold(), "(pending)".yellow());
+        print_field("STATUS", "(pending)".yellow());
     }
     if let Some(duration_ms) = forward.duration_ms {
-        println!("{} {}ms", "Duration:".bold(), duration_ms);
+        print_field("DURATION", format!("{duration_ms}ms"));
     }
     if let Some(attempted_at) = forward.attempted_at.as_deref() {
-        println!("{} {}", "Attempted At:".bold(), attempted_at.dim());
+        print_field("ATTEMPTED AT", attempted_at.dim());
     }
     if let Some(error_message) = forward.error_message.as_deref() {
-        println!("{} {}", "Error:".red().bold(), error_message);
+        print_field("ERROR", error_message);
     }
 
     println!();
@@ -2072,7 +2263,9 @@ fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
 }
 
 fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
-    if !response.static_tunnels.is_empty() {
+    if response.static_tunnels.is_empty() {
+        print_status(OutputStatus::Info, "NO STATIC TUNNELS FOUND");
+    } else {
         let mut table = new_table(&["ID", "Slug", "Name"]);
         for tunnel in &response.static_tunnels {
             let name = tunnel.name.as_deref().unwrap_or("");
@@ -2081,41 +2274,38 @@ fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
         println!("{table}");
     }
 
-    println!(
-        "{}",
-        format!("Used {}/{} static tunnels", response.used, response.limit).dim()
+    print_field(
+        "USED",
+        format!("{}/{}", response.used, response.limit).dim(),
     );
 }
 
 fn print_anon_events(response: &api::AnonEventsResponse) {
     if response.data.is_empty() {
-        println!("{}", "No events captured yet.".dim());
+        print_status(OutputStatus::Info, "NO EVENTS CAPTURED");
     } else {
-        println!(
-            "{}",
-            format!("{:<36}  {:<7}  Received At", "ID", "Method").dim()
-        );
+        let mut table = new_table(&["ID", "Method", "Received At"]);
         for event in &response.data {
-            println!(
-                "{:<36}  {:<7}  {}",
-                event.id,
-                event.method.as_str().bold(),
-                event.inserted_at.as_deref().unwrap_or("-").dim()
-            );
+            table.add_row(vec![
+                event.id.as_str(),
+                event.method.as_str(),
+                value_or_dash(event.inserted_at.as_deref()),
+            ]);
         }
+        println!("{table}");
     }
     print_pagination(&response.pagination);
 }
 
 fn print_anon_event_detail(event: &api::AnonEvent) {
-    println!("{} {}", "Event ID:".bold(), event.id);
-    println!("{} {}", "Endpoint ID:".bold(), event.endpoint_id);
-    println!("{} {}", "Method:".bold(), event.method.as_str().bold());
+    print_field("EVENT ID", &event.id);
+    print_field("ENDPOINT ID", &event.endpoint_id);
+    print_field("METHOD", event.method.as_str().bold());
     if let Some(status) = event.status.as_deref() {
-        println!("{} {}", "Status:".bold(), status);
+        print_field("STATUS", status);
     }
     if let Some(inserted_at) = event.inserted_at.as_deref() {
-        println!("{} {}", "Received At:".bold(), inserted_at.dim());
+        print_field("RECEIVED AT", inserted_at.dim());
     }
 
     println!();
@@ -2127,79 +2317,64 @@ fn print_anon_event_detail(event: &api::AnonEvent) {
 
 fn print_shared_requests(shares: &[api::SharedRequestSummary]) {
     if shares.is_empty() {
-        println!("{}", "No shares found.".dim());
+        print_status(OutputStatus::Info, "NO SHARES FOUND");
         return;
     }
 
-    println!(
-        "{}",
-        format!(
-            "{:<36}  {:<32}  {:<5}  {:<6}  {:<10}  Expires At",
-            "ID", "Token", "Fwds", "Views", "Protected"
-        )
-        .dim()
-    );
+    let mut table = new_table(&["ID", "Token", "Fwds", "Views", "Protected", "Expires At"]);
     for share in shares {
-        let protected = if share.password_protected {
-            "yes".yellow().to_string()
-        } else {
-            "no".to_string()
-        };
-        let expires = share.expires_at.as_deref().unwrap_or("-");
-        println!(
-            "{:<36}  {:<32}  {:<5}  {:<6}  {:<10}  {}",
-            share.id,
-            share.share_token.as_str().bold(),
-            if share.include_forwards { "yes" } else { "no" },
-            share.view_count,
-            protected,
-            expires.dim()
-        );
+        table.add_row(vec![
+            share.id.as_str().to_string(),
+            share.share_token.clone(),
+            yes_no(share.include_forwards).to_string(),
+            share.view_count.to_string(),
+            yes_no(share.password_protected).to_string(),
+            value_or_dash(share.expires_at.as_deref()).to_string(),
+        ]);
     }
+    println!("{table}");
 }
 
 fn print_shared_request_full(data: &serde_json::Value) {
     if let Some(token) = data.get("share_token").and_then(|v| v.as_str()) {
-        println!("{} {}", "Share Token:".bold(), token);
+        print_field("SHARE TOKEN", token);
     }
     if let Some(expires) = data.get("expires_at").and_then(|v| v.as_str()) {
-        println!("{} {}", "Expires At:".bold(), expires.dim());
+        print_field("EXPIRES AT", expires.dim());
     }
     if let Some(views) = data.get("view_count").and_then(|v| v.as_u64()) {
-        println!("{} {}", "Views:".bold(), views);
+        print_field("VIEWS", views);
     }
 
     if let Some(request) = data.get("debug_request") {
         println!();
-        println!("{}", "── Debug Request ──".bold());
+        print_section("DEBUG REQUEST");
         if let Some(id) = request.get("id").and_then(|v| v.as_str()) {
-            println!("  {} {}", "ID:".bold(), id);
+            print_field("ID", id);
         }
         if let Some(method) = request.get("method").and_then(|v| v.as_str()) {
-            println!("  {} {}", "Method:".bold(), method.bold());
+            print_field("METHOD", method.bold());
         }
         if let Some(url) = request.get("url").and_then(|v| v.as_str()) {
-            println!("  {} {}", "URL:".bold(), url);
+            print_field("URL", url);
         }
         if let Some(remote) = request.get("remote_addr").and_then(|v| v.as_str()) {
-            println!("  {} {}", "Remote:".bold(), remote.dim());
+            print_field("REMOTE", remote.dim());
         }
         if let Some(created) = request.get("created_at").and_then(|v| v.as_str()) {
-            println!("  {} {}", "Created At:".bold(), created.dim());
+            print_field("CREATED AT", created.dim());
         }
 
-        // Headers
         if let Some(headers) = request.get("headers").and_then(|v| v.as_object())
             && !headers.is_empty()
         {
             println!();
-            println!("  {}", "Headers:".bold());
+            print_section("HEADERS");
             for (key, value) in headers {
-                println!("    {}: {}", key.as_str().dim(), value);
+                println!("  {}: {}", key.as_str().dim(), value);
             }
         }
 
-        // Body
         let body = request
             .get("body")
             .and_then(|v| v.as_str())
@@ -2208,8 +2383,8 @@ fn print_shared_request_full(data: &serde_json::Value) {
             && !body.is_empty()
         {
             println!();
-            println!("  {}", "Body:".bold());
-            println!("  {}", body);
+            print_section("BODY");
+            println!("{}", body);
         }
     }
 
@@ -2217,7 +2392,7 @@ fn print_shared_request_full(data: &serde_json::Value) {
         && !forwards.is_empty()
     {
         println!();
-        println!("{}", "── Forwards ──".bold());
+        print_section("FORWARDS");
         for fwd in forwards {
             let target = fwd
                 .get("target_url")
@@ -2239,60 +2414,58 @@ fn print_shared_request_full(data: &serde_json::Value) {
     }
 }
 
+fn monitor_status_label(status: Option<&str>) -> &str {
+    status.unwrap_or("pending")
+}
+
 fn style_monitor_status(status: Option<&str>) -> String {
-    match status {
-        Some("up") => "up".green().to_string(),
-        Some("down") => "down".red().to_string(),
-        Some(s) => s.yellow().to_string(),
-        None => "pending".yellow().to_string(),
+    match monitor_status_label(status) {
+        "up" => "up".green().to_string(),
+        "down" => "down".red().to_string(),
+        s => s.yellow().to_string(),
     }
 }
 
 fn print_monitors(monitors: &[api::UptimeMonitor]) {
     if monitors.is_empty() {
-        println!("{}", "No uptime monitors found.".dim());
+        print_status(OutputStatus::Info, "NO UPTIME MONITORS FOUND");
         return;
     }
 
-    println!(
-        "{}",
-        format!(
-            "{:<36}  {:<8}  {:<7}  {:<5}  {:<24}  Name",
-            "ID", "Status", "Method", "Int", "URL"
-        )
-        .dim()
-    );
+    let mut table = new_table(&["ID", "Status", "Method", "Int", "URL", "Name"]);
     for m in monitors {
-        let status = style_monitor_status(m.current_status.as_deref());
-        let enabled_marker = if m.enabled { "" } else { " (disabled)" };
+        let status = monitor_status_label(m.current_status.as_deref());
         let interval = m
             .check_interval
             .map(|i| format!("{}m", i))
             .unwrap_or_default();
-        // Truncate URL for table display
         let url_display = if m.url.len() > 24 {
             format!("{}…", &m.url[..23])
         } else {
             m.url.clone()
         };
-        println!(
-            "{:<36}  {:<8}  {:<7}  {:<5}  {:<24}  {}{}",
-            m.id,
-            status,
-            m.method.to_uppercase().bold(),
+        let name = if m.enabled {
+            m.name.clone()
+        } else {
+            format!("{} (disabled)", m.name)
+        };
+        table.add_row(vec![
+            m.id.clone(),
+            status.to_string(),
+            m.method.to_uppercase(),
             interval,
             url_display,
-            m.name,
-            enabled_marker.dim()
-        );
+            name,
+        ]);
     }
+    println!("{table}");
 }
 
 fn print_monitor_detail(m: &api::UptimeMonitor) {
-    println!("{} {}", "ID:".bold(), m.id);
-    println!("{} {}", "Name:".bold(), m.name);
-    println!("{} {}", "URL:".bold(), m.url.as_str().underlined());
-    println!("{} {}", "Method:".bold(), m.method.to_uppercase().bold());
+    print_field("ID", &m.id);
+    print_field("NAME", &m.name);
+    print_field("URL", m.url.as_str().underlined());
+    print_field("METHOD", m.method.to_uppercase().bold());
 
     let status = style_monitor_status(m.current_status.as_deref());
     let enabled = if m.enabled {
@@ -2300,49 +2473,46 @@ fn print_monitor_detail(m: &api::UptimeMonitor) {
     } else {
         "no (paused)".yellow().to_string()
     };
-    println!("{} {}", "Status:".bold(), status);
-    println!("{} {}", "Enabled:".bold(), enabled);
+    print_field("STATUS", status);
+    print_field("ENABLED", enabled);
 
     if let Some(code) = m.expected_status_code {
-        println!("{} {}", "Expected Status:".bold(), code);
+        print_field("EXPECTED", code);
     }
     if let Some(ref bc) = m.body_contains {
-        println!("{} {}", "Body Contains:".bold(), bc);
+        print_field("BODY MATCH", bc);
     }
     if let Some(interval) = m.check_interval {
-        println!("{} {}m", "Check Interval:".bold(), interval);
+        print_field("INTERVAL", format!("{interval}m"));
     }
     if let Some(threshold) = m.failure_threshold {
-        println!("{} {}", "Failure Threshold:".bold(), threshold);
+        print_field("THRESHOLD", threshold);
     }
     if let Some(failures) = m.consecutive_failures {
-        println!("{} {}", "Consecutive Failures:".bold(), failures);
+        print_field("FAILURES", failures);
     }
 
-    println!(
-        "{} email={}, slack={}",
-        "Notifications:".bold(),
-        if m.email_enabled { "on" } else { "off" },
-        if m.slack_enabled { "on" } else { "off" }
+    print_field(
+        "NOTIFY",
+        format!(
+            "email={}, slack={}",
+            if m.email_enabled { "on" } else { "off" },
+            if m.slack_enabled { "on" } else { "off" }
+        ),
     );
 
     if let Some(ref checked) = m.last_checked_at {
-        println!("{} {}", "Last Checked:".bold(), checked.as_str().dim());
+        print_field("LAST CHECK", checked.as_str().dim());
     }
     if let Some(ref changed) = m.last_status_change_at {
-        println!(
-            "{} {}",
-            "Last Status Change:".bold(),
-            changed.as_str().dim()
-        );
+        print_field("STATUS CHANGE", changed.as_str().dim());
     }
     if let Some(ref created) = m.created_at {
-        println!("{} {}", "Created At:".bold(), created.as_str().dim());
+        print_field("CREATED AT", created.as_str().dim());
     }
 }
 
 fn print_uptime_checks(response: &api::UptimeChecksResponse) {
-    // Stats summary
     if let Some(ref stats) = response.stats {
         let uptime = stats
             .uptime_percentage
@@ -2363,53 +2533,40 @@ fn print_uptime_checks(response: &api::UptimeChecksResponse) {
             .unwrap_or_else(|| "-".to_string());
         println!(
             "{} {}  {} {}",
-            "Uptime:".bold(),
+            "UPTIME".bold(),
             uptime,
-            "Avg Response:".bold(),
+            "AVG RESPONSE".bold(),
             avg_rt
         );
         println!();
     }
 
     if response.data.is_empty() {
-        println!("{}", "No checks recorded yet.".dim());
+        print_status(OutputStatus::Info, "NO CHECKS RECORDED");
     } else {
-        println!(
-            "{}",
-            format!(
-                "{:<36}  {:<6}  {:<8}  {:<10}  Checked At",
-                "ID", "Status", "Code", "Response"
-            )
-            .dim()
-        );
+        let mut table = new_table(&["ID", "Status", "Code", "Response", "Checked At", "Error"]);
         for check in &response.data {
-            let status = match check.status.as_str() {
-                "up" => "up".green().to_string(),
-                "down" => "down".red().to_string(),
-                s => s.to_string(),
-            };
             let code = check
                 .status_code
-                .map(style_status_code)
+                .map(status_code_label)
                 .unwrap_or_else(|| "-".to_string());
             let rt = check
                 .response_time_ms
                 .map(|ms| format!("{}ms", ms))
                 .unwrap_or_else(|| "-".to_string());
-            let checked = check.checked_at.as_deref().unwrap_or("-");
+            let checked = value_or_dash(check.checked_at.as_deref());
+            let error = value_or_dash(check.error_message.as_deref());
 
-            println!(
-                "{:<36}  {:<6}  {:<8}  {:<10}  {}",
-                check.id,
-                status,
+            table.add_row(vec![
+                check.id.clone(),
+                check.status.clone(),
                 code,
                 rt,
-                checked.dim()
-            );
-            if let Some(ref err) = check.error_message {
-                println!("  {} {}", "error:".red(), err);
-            }
+                checked.to_string(),
+                error.to_string(),
+            ]);
         }
+        println!("{table}");
     }
 
     print_pagination(&response.pagination);
@@ -2711,8 +2868,12 @@ where
     Ok(())
 }
 
+fn status_code_label(code: u16) -> String {
+    code.to_string()
+}
+
 fn style_status_code(code: u16) -> String {
-    let s = code.to_string();
+    let s = status_code_label(code);
     match code {
         200..=299 => s.green().to_string(),
         300..=399 => s.yellow().to_string(),
@@ -2738,12 +2899,14 @@ fn error_hint(err: &anyhow::Error) -> Option<&str> {
 }
 
 fn display_error(err: &anyhow::Error) {
-    eprintln!("{} {}", "Error:".red().bold(), err);
+    eprint_status(OutputStatus::Err, "COMMAND FAILED");
+    eprintln!();
+    eprint_field("MESSAGE", err);
     if let Some(hint) = error_hint(err) {
-        eprintln!("{} {}", "Hint:".yellow().bold(), hint);
+        eprint_field("HINT", hint);
     }
     for cause in err.chain().skip(1) {
-        eprintln!("{} {}", "Caused by:".dim(), cause);
+        eprint_field("CAUSE", cause);
     }
 }
 
@@ -2778,11 +2941,376 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 mod tests {
     use super::*;
 
+    fn assert_no_emoji(output: &str) {
+        assert!(
+            !output.chars().any(|ch| {
+                let code = ch as u32;
+                (0x1F300..=0x1FAFF).contains(&code) || (0x2600..=0x27BF).contains(&code)
+            }),
+            "output contains emoji-like glyphs: {output}"
+        );
+    }
+
+    fn assert_no_ansi_escape(output: &str) {
+        assert!(
+            !output.contains("\u{1b}["),
+            "output contains ANSI escape sequences: {output:?}"
+        );
+    }
+
+    fn render_table<'a, const C: usize>(
+        headers: &[&str],
+        rows: impl IntoIterator<Item = [&'a str; C]>,
+    ) -> String {
+        let mut table = new_table(headers);
+        for row in rows {
+            table.add_row(row);
+        }
+        table.to_string()
+    }
+
+    fn render_field_block(fields: &[OutputField]) -> String {
+        let mut output = String::new();
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                output.push('\n');
+            }
+            output.push_str(&format_field_line(field.label, &field.value));
+        }
+        output.push('\n');
+        output
+    }
+
+    fn render_snapshot_sections(sections: Vec<(&str, String)>) -> String {
+        let mut output = String::new();
+        for (index, (title, body)) in sections.into_iter().enumerate() {
+            if index > 0 {
+                output.push('\n');
+                output.push('\n');
+            }
+            output.push_str(&output_title(title));
+            output.push('\n');
+            output.push_str(body.trim_end());
+            output.push('\n');
+        }
+        output
+    }
+
+    fn render_empty_status(title: &str) -> String {
+        format!("{}\n", format_status_line(OutputStatus::Info, title))
+    }
+
     fn make_config(selected_org: Option<&str>) -> config::Config {
         config::Config {
             selected_organization_id: selected_org.map(String::from),
             ..config::Config::default()
         }
+    }
+
+    #[test]
+    fn command_output_endpoint_created_snapshot() {
+        let output = render_status_block(
+            OutputStatus::Ok,
+            "endpoint created",
+            &[
+                output_field("ID", "ep_123"),
+                output_field("SLUG", "github-webhooks"),
+                output_field(
+                    "WEBHOOK URL",
+                    "https://example.hooklistener.dev/github-webhooks",
+                ),
+                output_field("ORGANIZATION", "org_123"),
+                output_field("ACTION", "Run `hooklistener listen github-webhooks`"),
+            ],
+        );
+
+        assert_no_emoji(&output);
+        assert!(!output.contains("ID:"));
+        insta::assert_snapshot!("command_output_endpoint_created", output);
+    }
+
+    #[test]
+    fn command_output_request_deleted_snapshot() {
+        let output = render_status_block(
+            OutputStatus::Ok,
+            "request deleted",
+            &[
+                output_field("REQUEST", "req_123"),
+                output_field("ENDPOINT", "ep_123"),
+                output_field("ORGANIZATION", "org_123"),
+            ],
+        );
+
+        assert_no_emoji(&output);
+        assert!(output.starts_with("[OK] REQUEST DELETED\n\n"));
+        insta::assert_snapshot!("command_output_request_deleted", output);
+    }
+
+    #[test]
+    fn command_output_error_block_snapshot() {
+        let output = render_status_block(
+            OutputStatus::Err,
+            "command failed",
+            &[
+                output_field("MESSAGE", "Not authenticated"),
+                output_field("ACTION", "Run `hooklistener login`"),
+            ],
+        );
+
+        assert_no_emoji(&output);
+        assert!(output.starts_with("[ERR] COMMAND FAILED\n\n"));
+        insta::assert_snapshot!("command_output_error_block", output);
+    }
+
+    #[test]
+    fn command_output_table_headers_snapshot() {
+        let output = render_table(
+            &["ID", "Method", "Status", "Checked At"],
+            [["req_123", "POST", "200", "2026-05-29T12:00:00Z"]],
+        );
+
+        assert!(output.contains("METHOD"));
+        assert!(output.contains("CHECKED AT"));
+        assert!(!output.contains("Method"));
+        assert_no_ansi_escape(&output);
+        insta::assert_snapshot!("command_output_table_headers", output);
+    }
+
+    #[test]
+    fn command_output_monitor_table_snapshot() {
+        let output = render_table(
+            &["ID", "Status", "Method", "Int", "URL", "Name"],
+            [[
+                "mon_123",
+                monitor_status_label(Some("up")),
+                "GET",
+                "5m",
+                "https://serpgoblin.com",
+                "SerpGoblin",
+            ]],
+        );
+
+        assert_no_emoji(&output);
+        assert_no_ansi_escape(&output);
+        insta::assert_snapshot!("command_output_monitor_table", output);
+    }
+
+    #[test]
+    fn command_output_table_family_snapshot() {
+        let output = render_snapshot_sections(vec![
+            (
+                "org list",
+                render_table(
+                    &["", "ID", "Name"],
+                    [
+                        ["*", "org_123", "Hooklistener Labs"],
+                        ["", "org_456", "Platform Team"],
+                    ],
+                ),
+            ),
+            (
+                "endpoint list",
+                render_table(
+                    &["ID", "Slug", "Status", "Webhook URL", "Name"],
+                    [[
+                        "ep_123",
+                        "github-webhooks",
+                        "active",
+                        "https://hooks.example.dev/github-webhooks",
+                        "GitHub",
+                    ]],
+                ),
+            ),
+            (
+                "endpoint request list",
+                render_table(
+                    &["ID", "Method", "URL", "Remote"],
+                    [[
+                        "req_123",
+                        "POST",
+                        "/webhooks/github/push?delivery=1c07ce58",
+                        "172.71.190.83",
+                    ]],
+                ),
+            ),
+            (
+                "request forwards",
+                render_table(
+                    &["ID", "Method", "Status", "Duration", "Target"],
+                    [
+                        [
+                            "fwd_123",
+                            "POST",
+                            "200",
+                            "42ms",
+                            "http://localhost:3000/webhooks",
+                        ],
+                        [
+                            "fwd_456",
+                            "POST",
+                            "-",
+                            "-",
+                            "http://localhost:3001/webhooks\n  [ERR] connection refused",
+                        ],
+                    ],
+                ),
+            ),
+            (
+                "static tunnel list",
+                render_table(
+                    &["ID", "Slug", "Name"],
+                    [["tun_123", "acme-dev", "Development tunnel"]],
+                ),
+            ),
+            (
+                "anon events",
+                render_table(
+                    &["ID", "Method", "Received At"],
+                    [["evt_123", "POST", "2026-05-29T12:00:00Z"]],
+                ),
+            ),
+            (
+                "share list",
+                render_table(
+                    &["ID", "Token", "Fwds", "Views", "Protected", "Expires At"],
+                    [[
+                        "shr_123",
+                        "share_abcdef123456",
+                        "yes",
+                        "14",
+                        "no",
+                        "2026-06-05T12:00:00Z",
+                    ]],
+                ),
+            ),
+            (
+                "monitor checks",
+                render_table(
+                    &["ID", "Status", "Code", "Response", "Checked At", "Error"],
+                    [
+                        ["chk_123", "up", "200", "184ms", "2026-05-29T12:00:00Z", "-"],
+                        [
+                            "chk_456",
+                            "down",
+                            "500",
+                            "901ms",
+                            "2026-05-29T12:05:00Z",
+                            "timeout",
+                        ],
+                    ],
+                ),
+            ),
+        ]);
+
+        insta::assert_snapshot!("command_output_table_family", output);
+    }
+
+    #[test]
+    fn command_output_detail_blocks_snapshot() {
+        let output = render_snapshot_sections(vec![
+            (
+                "endpoint show",
+                render_field_block(&[
+                    output_field("ID", "ep_123"),
+                    output_field("SLUG", "github-webhooks"),
+                    output_field("STATUS", "active"),
+                    output_field("WEBHOOK URL", "https://hooks.example.dev/github-webhooks"),
+                    output_field("NAME", "GitHub"),
+                    output_field("CREATED AT", "2026-05-29T12:00:00Z"),
+                ]),
+            ),
+            (
+                "request show",
+                format!(
+                    "{}\nHEADERS\n  content-type: \"application/json\"\n  x-github-delivery: \"1c07ce58\"\n\nQUERY PARAMS\n  delivery=\"1c07ce58\"\n\nBODY\n{}",
+                    render_field_block(&[
+                        output_field("REQUEST ID", "req_123"),
+                        output_field("METHOD", "POST"),
+                        output_field("PATH", "/webhooks/github/push"),
+                        output_field("URL", "/webhooks/github/push?delivery=1c07ce58"),
+                        output_field("REMOTE", "172.71.190.83"),
+                        output_field("CONTENT LEN", "10354"),
+                        output_field("CREATED AT", "2026-05-29T12:00:00Z"),
+                    ])
+                    .trim_end(),
+                    r#"{"ref":"refs/heads/main","repository":"hooklistener"}"#
+                ),
+            ),
+            (
+                "forward show",
+                format!(
+                    "{}\nREQUEST HEADERS\n  content-type: \"application/json\"\n\nRESPONSE HEADERS\n  server: \"local-dev\"\n\nRESPONSE BODY\n{}",
+                    render_field_block(&[
+                        output_field("FORWARD ID", "fwd_123"),
+                        output_field("REQUEST ID", "req_123"),
+                        output_field("TARGET URL", "http://localhost:3000/webhooks"),
+                        output_field("METHOD", "POST"),
+                        output_field("STATUS", "200"),
+                        output_field("DURATION", "42ms"),
+                        output_field("ATTEMPTED AT", "2026-05-29T12:00:01Z"),
+                    ])
+                    .trim_end(),
+                    r#"{"ok":true}"#
+                ),
+            ),
+            (
+                "monitor show",
+                render_field_block(&[
+                    output_field("ID", "mon_123"),
+                    output_field("NAME", "SerpGoblin"),
+                    output_field("URL", "https://serpgoblin.com"),
+                    output_field("METHOD", "GET"),
+                    output_field("STATUS", "up"),
+                    output_field("ENABLED", "yes"),
+                    output_field("EXPECTED", "200"),
+                    output_field("INTERVAL", "5m"),
+                    output_field("THRESHOLD", "3"),
+                    output_field("FAILURES", "0"),
+                    output_field("NOTIFY", "email=on, slack=off"),
+                    output_field("LAST CHECK", "2026-05-29T12:00:00Z"),
+                ]),
+            ),
+        ]);
+
+        insta::assert_snapshot!("command_output_detail_blocks", output);
+    }
+
+    #[test]
+    fn command_output_empty_states_snapshot() {
+        let output = render_snapshot_sections(vec![
+            (
+                "endpoint list",
+                render_empty_status("NO DEBUG ENDPOINTS FOUND"),
+            ),
+            ("request list", render_empty_status("NO REQUESTS FOUND")),
+            ("forward list", render_empty_status("NO FORWARDS FOUND")),
+            ("share list", render_empty_status("NO SHARES FOUND")),
+            (
+                "monitor list",
+                render_empty_status("NO UPTIME MONITORS FOUND"),
+            ),
+            ("monitor checks", render_empty_status("NO CHECKS RECORDED")),
+            (
+                "static tunnel list",
+                render_empty_status("NO STATIC TUNNELS FOUND"),
+            ),
+            ("anon events", render_empty_status("NO EVENTS CAPTURED")),
+        ]);
+
+        insta::assert_snapshot!("command_output_empty_states", output);
+    }
+
+    #[test]
+    fn command_output_pagination_snapshot() {
+        let output = format_pagination_line(&api::Pagination {
+            page: 2,
+            page_size: 25,
+            total_count: 120,
+            total_pages: 5,
+        });
+
+        assert_eq!(output, "PAGE 2/5  PAGE SIZE 25  TOTAL 120");
+        insta::assert_snapshot!("command_output_pagination", output);
     }
 
     #[test]
