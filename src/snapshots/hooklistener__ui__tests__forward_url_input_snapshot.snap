@@ -1,0 +1,23 @@
+---
+source: src/ui.rs
+expression: snapshot
+---
+
+ ┌ Request to Forward ──────────────────────────────────────────────────────────────────┐
+ │Forwarding Request: POST from Tunnel                                                  │
+ │                                                                                      │
+ │                                                                                      │
+ └──────────────────────────────────────────────────────────────────────────────────────┘
+ ┌ Enter Target URL ────────────────────────────────────────────────────────────────────┐
+ │http://localhost:8080/github                                                          │
+ └──────────────────────────────────────────────────────────────────────────────────────┘
+
+                               Enter: Forward | Esc: Cancel
+
+                         Example: https://your-server.com/webhook
+
+
+
+
+
+ Forward  Enter Send | Esc Cancel                                          API connected

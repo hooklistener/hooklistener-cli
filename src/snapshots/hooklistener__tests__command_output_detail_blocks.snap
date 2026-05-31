@@ -1,0 +1,63 @@
+---
+source: src/main.rs
+expression: output
+---
+ENDPOINT SHOW
+ID             ep_123
+SLUG           github-webhooks
+STATUS         active
+WEBHOOK URL    https://hooks.example.dev/github-webhooks
+NAME           GitHub
+CREATED AT     2026-05-29T12:00:00Z
+
+
+REQUEST SHOW
+REQUEST ID     req_123
+METHOD         POST
+PATH           /webhooks/github/push
+URL            /webhooks/github/push?delivery=1c07ce58
+REMOTE         172.71.190.83
+CONTENT LEN    10354
+CREATED AT     2026-05-29T12:00:00Z
+HEADERS
+  content-type: "application/json"
+  x-github-delivery: "1c07ce58"
+
+QUERY PARAMS
+  delivery="1c07ce58"
+
+BODY
+{"ref":"refs/heads/main","repository":"hooklistener"}
+
+
+FORWARD SHOW
+FORWARD ID     fwd_123
+REQUEST ID     req_123
+TARGET URL     http://localhost:3000/webhooks
+METHOD         POST
+STATUS         200
+DURATION       42ms
+ATTEMPTED AT   2026-05-29T12:00:01Z
+REQUEST HEADERS
+  content-type: "application/json"
+
+RESPONSE HEADERS
+  server: "local-dev"
+
+RESPONSE BODY
+{"ok":true}
+
+
+MONITOR SHOW
+ID             mon_123
+NAME           SerpGoblin
+URL            https://serpgoblin.com
+METHOD         GET
+STATUS         up
+ENABLED        yes
+EXPECTED       200
+INTERVAL       5m
+THRESHOLD      3
+FAILURES       0
+NOTIFY         email=on, slack=off
+LAST CHECK     2026-05-29T12:00:00Z

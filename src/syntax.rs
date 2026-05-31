@@ -5,17 +5,17 @@ use ratatui::{
     text::{Line, Span},
 };
 
-// Pastel colors matching the UI palette
+// Syntax roles mapped to the terminal design palette.
 mod colors {
     use ratatui::style::Color;
 
-    pub const STRUCTURE: Color = Color::Rgb(250, 179, 135); // Peach — braces, brackets
-    pub const KEY: Color = Color::Rgb(137, 180, 250); // Soft blue — JSON keys
-    pub const STRING: Color = Color::Rgb(166, 227, 161); // Soft mint — string values
-    pub const NUMBER: Color = Color::Rgb(203, 166, 247); // Soft mauve — numbers
-    pub const KEYWORD: Color = Color::Rgb(148, 226, 213); // Teal — true/false/null
-    pub const PUNCTUATION: Color = Color::Rgb(127, 132, 156); // Muted — commas
-    pub const TEXT: Color = Color::Rgb(205, 214, 244); // Soft white — colons, whitespace
+    pub const STRUCTURE: Color = Color::Rgb(212, 177, 95); // Braces, brackets
+    pub const KEY: Color = Color::Rgb(127, 167, 200); // JSON keys
+    pub const STRING: Color = Color::Rgb(143, 174, 121); // String values
+    pub const NUMBER: Color = Color::Rgb(212, 177, 95); // Numbers
+    pub const KEYWORD: Color = Color::Rgb(127, 167, 200); // true, false, null
+    pub const PUNCTUATION: Color = Color::Rgb(143, 147, 138); // Commas
+    pub const TEXT: Color = Color::Rgb(216, 216, 210); // Colons, whitespace
 }
 
 pub struct JsonHighlighter;

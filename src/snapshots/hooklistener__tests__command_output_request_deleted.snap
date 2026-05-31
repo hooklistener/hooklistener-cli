@@ -1,0 +1,10 @@
+---
+source: src/main.rs
+assertion_line: 3027
+expression: output
+---
+[OK] REQUEST DELETED
+
+REQUEST        req_123
+ENDPOINT       ep_123
+ORGANIZATION   org_123

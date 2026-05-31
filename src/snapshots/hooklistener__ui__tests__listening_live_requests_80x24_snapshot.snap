@@ -1,0 +1,27 @@
+---
+source: src/ui.rs
+expression: snapshot
+---
+
+ ┌ Tunnel Connection ──────────────────────────┐┌ Statistics ─────────────────┐
+ │ENDPOINT  orders-prod-v7zd                   ││TOTAL    3                   │
+ │TARGET    http://localhost:8080/webhook      ││SUCCESS  2                   │
+ │STATUS    ● Connected                        ││FAILED   1                   │
+ └─────────────────────────────────────────────┘└─────────────────────────────┘
+ ┌ Live Requests ─────────────────────────────────────────────────────────────┐
+ │  Time        Method      Path                               Details        │
+ │                                                                            │
+ │  Just now    POST        /webhooks/orders                   1 headers      │
+ │> Just now    PATCH       /webhooks/billing/invoice          2 headers      │
+ │  Just now    GET         /health                            1 headers      │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ └────────────────────────────────────────────────────────────────────────────┘
+ Listen (3)  ↑↓ Select | Enter Details | / Search | Q Quit       API connected

@@ -4,9 +4,9 @@ expression: snapshot
 ---
 
  ┌ Tunnel Connection ──────────────────────────────────────────────────┐┌ Statistics ─────────────────────────────────┐
- │Endpoint: github-webhooks-v7zd                                       ││Total:   0                                   │
- │Target:   http://localhost:3000                                      ││Success: 0                                   │
- │Status:   ● Connected                                                ││Failed:  0                                   │
+ │ENDPOINT  github-webhooks-v7zd                                       ││TOTAL    0                                   │
+ │TARGET    http://localhost:3000                                      ││SUCCESS  0                                   │
+ │STATUS    ● Connected                                                ││FAILED   0                                   │
  └─────────────────────────────────────────────────────────────────────┘└─────────────────────────────────────────────┘
  ┌ Live Requests ─────────────────────────────────────────────────────────────────────────────────────────────────────┐
  │                                                        **%%%%%%%%%%%%*                                             │

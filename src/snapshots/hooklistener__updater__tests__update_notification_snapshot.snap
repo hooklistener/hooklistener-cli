@@ -1,0 +1,10 @@
+---
+source: src/updater.rs
+expression: output
+---
+
+[INFO] UPDATE AVAILABLE
+
+CURRENT        1.2.3
+LATEST         1.4.0
+ACTION         Run cargo install hooklistener-cli to update.

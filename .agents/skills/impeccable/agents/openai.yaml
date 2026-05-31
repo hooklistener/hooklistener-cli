@@ -1,0 +1,4 @@
+interface:
+  display_name: Impeccable
+  short_description: Polish frontend and terminal UI.
+  default_prompt: Use Impeccable to redesign, critique, audit, or polish this interface, including terminal/TUI surfaces when relevant.

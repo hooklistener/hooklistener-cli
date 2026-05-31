@@ -1,0 +1,27 @@
+---
+source: src/ui.rs
+expression: snapshot
+---
+
+ ┌ HTTP Tunnel ───────────────────────────────────────────────────────────────┐
+ │ hooklistener  ● connected  static  uptime 2m 5s                            │
+ │ https://plant-07.hook.events  →  localhost:8080                            │
+ └────────────────────────────────────────────────────────────────────────────┘
+  Statistics ──────────────────────────────────────────────────────────────────
+  Requests 2xx 2  4xx 1  5xx 1  Err 0  Avg 467ms Last 200  View All  Follow Pau
+
+  Live Requests (5) | Enter expand | D details ────────────────────────────────
+   ID     Age    Method Path                 Status   Duration Size    From
+
+   req-pe now    PATCH  /replay/pending      200      --       68b     192.0.2.
+   req-50 now    POST   /webhooks/billing/in 502      1420ms   68b     203.0.11
+   req-40 now    GET    /webhooks/users/miss 404      88ms     68b     203.0.11
+ ▸ req-20 now    PUT    /deployments/prod    202      318ms    68b     198.51.1
+   req-20 now    POST   /webhooks/orders     200      42ms     68b     198.51.1
+
+
+
+
+
+
+ Tunnel (5)  ↑↓ Select | Enter Expand | Tab Pins | P Pin | A Ac  API connected

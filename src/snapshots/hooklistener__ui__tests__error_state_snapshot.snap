@@ -1,0 +1,21 @@
+---
+source: src/ui.rs
+expression: snapshot
+---
+
+ ┌ Error ───────────────────────────────────────────────────────────────────────────────┐
+ │                    Tunnel connection failed: upstream returned 503                   │
+ │                                                                                      │
+ │                  HINT    Check the local service and press q to exit                 │
+ │                                                                                      │
+ │                                                                                      │
+ │                                                                                      │
+ │                                                                                      │
+ │                                                                                      │
+ │                                                                                      │
+ │                                                                                      │
+ └──────────────────────────────────────────────────────────────────────────────────────┘
+ ────────────────────────────────────────────────────────────────────────────────────────
+                                        q/Esc: Quit
+
+ Error  Q/Esc Quit                                                         API connected
