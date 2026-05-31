@@ -332,6 +332,26 @@ mod tests {
 
         assert!(output.starts_with('\n'));
         assert!(output.ends_with("\n\n"));
-        insta::assert_snapshot!(output);
+        insta::assert_snapshot!(strip_ansi_sequences(&output));
+    }
+
+    fn strip_ansi_sequences(input: &str) -> String {
+        let mut stripped = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                stripped.push(ch);
+            }
+        }
+
+        stripped
     }
 }
