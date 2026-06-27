@@ -124,6 +124,125 @@ pub struct EndpointRequestForwardResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseRunParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseRunFailure {
+    pub case_id: String,
+    pub reason: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseRunTarget {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseRunForward {
+    pub id: String,
+    pub debug_request_id: String,
+    #[serde(default)]
+    pub debug_request_case_id: Option<String>,
+    #[serde(default)]
+    pub case_suite_run_id: Option<String>,
+    #[serde(default)]
+    pub target_url: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub error_message: Option<Value>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub attempted_at: Option<String>,
+    #[serde(default)]
+    pub assertion_status: Option<String>,
+    #[serde(default)]
+    pub assertion_details: Option<Value>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub poll_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseRunResult {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub case_suite_run_id: Option<String>,
+    #[serde(default)]
+    pub case_suite_run_url: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    pub status: String,
+    pub result_status: String,
+    #[serde(rename = "async")]
+    pub async_run: bool,
+    #[serde(default)]
+    pub waited: Option<bool>,
+    #[serde(default)]
+    pub timed_out: Option<bool>,
+    pub endpoint_id: String,
+    pub target: CaseRunTarget,
+    #[serde(default)]
+    pub total_count: u64,
+    #[serde(default)]
+    pub queued_count: u64,
+    #[serde(default)]
+    pub failed_count: u64,
+    #[serde(default)]
+    pub completed_count: u64,
+    #[serde(default)]
+    pub waiting_count: u64,
+    #[serde(default)]
+    pub queue_failed_count: u64,
+    #[serde(default)]
+    pub delivery_failed_count: u64,
+    #[serde(default)]
+    pub passed_count: u64,
+    #[serde(default)]
+    pub assertion_failed_count: u64,
+    #[serde(default)]
+    pub assertion_error_count: u64,
+    #[serde(default)]
+    pub not_configured_count: u64,
+    #[serde(default)]
+    pub forwards: Vec<CaseRunForward>,
+    #[serde(default)]
+    pub failures: Vec<CaseRunFailure>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugRequestForwardSummary {
     pub id: String,
     pub debug_request_id: String,
@@ -669,6 +788,18 @@ impl ApiClient {
             .await
     }
 
+    pub async fn run_endpoint_cases(
+        &self,
+        endpoint_id: &str,
+        params: &CaseRunParams,
+    ) -> Result<CaseRunResult> {
+        let path = format!("/api/v1/endpoints/{}/cases/run", endpoint_id);
+        let body = serde_json::to_value(params)?;
+        let response: DataResponse<CaseRunResult> =
+            self.post_json(&path, &body, "run endpoint cases").await?;
+        Ok(response.data)
+    }
+
     pub async fn list_endpoint_request_forwards(
         &self,
         endpoint_id: &str,
@@ -1045,5 +1176,52 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_run_endpoint_cases_posts_params_and_returns_data() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v1/endpoints/ep_123/cases/run")
+            .match_header("authorization", "Bearer test-token")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "target_url": "http://localhost:3000/webhooks",
+                "wait": true,
+                "timeout_ms": 60000
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"run_123","case_suite_run_id":"run_123","case_suite_run_url":"/api/v1/case-runs/run_123","status":"completed","result_status":"passed","async":false,"waited":true,"endpoint_id":"ep_123","target":{"type":"custom","url":"http://localhost:3000/webhooks"},"total_count":1,"queued_count":0,"failed_count":0,"completed_count":1,"passed_count":1,"forwards":[],"failures":[]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+        let result = client
+            .run_endpoint_cases(
+                "ep_123",
+                &CaseRunParams {
+                    target_url: Some("http://localhost:3000/webhooks".to_string()),
+                    target_id: None,
+                    target: None,
+                    target_name: None,
+                    wait: Some(true),
+                    timeout_ms: Some(60_000),
+                    interval_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.result_status, "passed");
+        assert_eq!(result.case_suite_run_id.as_deref(), Some("run_123"));
+        assert_eq!(
+            result.target.url.as_deref(),
+            Some("http://localhost:3000/webhooks")
+        );
+        assert_eq!(result.passed_count, 1);
+        mock.assert_async().await;
     }
 }

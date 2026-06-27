@@ -115,6 +115,11 @@ enum Commands {
         #[command(subcommand)]
         action: EndpointAction,
     },
+    /// Saved endpoint case helpers
+    Cases {
+        #[command(subcommand)]
+        action: CasesAction,
+    },
     /// Static tunnel slug management
     StaticTunnel {
         #[command(subcommand)]
@@ -302,6 +307,42 @@ enum EndpointAction {
     Forward {
         /// Forward ID
         forward_id: String,
+        /// Organization ID override (falls back to configured default)
+        #[arg(long)]
+        org: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CasesAction {
+    /// Run saved cases for an endpoint
+    Run {
+        /// Debug endpoint ID
+        endpoint_id: String,
+        /// Target URL, saved target ID, or "cli"
+        #[arg(long)]
+        target: Option<String>,
+        /// Explicit target URL to replay cases to
+        #[arg(long)]
+        target_url: Option<String>,
+        /// Explicit saved replay target ID
+        #[arg(long)]
+        target_id: Option<String>,
+        /// Optional display name for the target
+        #[arg(long)]
+        target_name: Option<String>,
+        /// Wait for the run to complete before returning
+        #[arg(long)]
+        wait: bool,
+        /// Timeout for --wait, such as 60, 60s, 2m, or 1h
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Timeout for --wait in milliseconds
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+        /// Poll interval for --wait in milliseconds
+        #[arg(long)]
+        interval_ms: Option<u64>,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
         org: Option<String>,
@@ -547,6 +588,162 @@ fn normalize_http_method(method: Option<String>) -> Result<Option<String>> {
     }
 
     Ok(Some(normalized))
+}
+
+fn parse_timeout_ms(timeout: Option<String>, timeout_ms: Option<u64>) -> Result<Option<u64>> {
+    match (timeout, timeout_ms) {
+        (Some(_), Some(_)) => Err(anyhow!("Use either --timeout or --timeout-ms, not both.")),
+        (None, None) => Ok(None),
+        (None, Some(ms)) => Ok(Some(ms)),
+        (Some(raw), None) => parse_duration_to_ms(&raw).map(Some),
+    }
+}
+
+fn parse_duration_to_ms(raw: &str) -> Result<u64> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(anyhow!("Timeout cannot be empty."));
+    }
+
+    let split_at = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split_at);
+    if number.is_empty() {
+        return Err(anyhow!("Timeout must start with a number."));
+    }
+    let amount: u64 = number.parse()?;
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+        "ms" | "millisecond" | "milliseconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+        other => {
+            return Err(anyhow!(
+                "Invalid timeout unit '{}'. Use ms, s, m, or h.",
+                other
+            ));
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("Timeout is too large."))
+}
+
+struct CaseRunInput {
+    target: Option<String>,
+    target_url: Option<String>,
+    target_id: Option<String>,
+    target_name: Option<String>,
+    wait: bool,
+    timeout: Option<String>,
+    timeout_ms: Option<u64>,
+    interval_ms: Option<u64>,
+}
+
+fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
+    let CaseRunInput {
+        target,
+        target_url,
+        target_id,
+        target_name,
+        wait,
+        timeout,
+        timeout_ms,
+        interval_ms,
+    } = input;
+
+    let explicit_targets = target_url.iter().count() + target_id.iter().count();
+    if target.is_some() && explicit_targets > 0 {
+        return Err(anyhow!(
+            "Use --target by itself, or use one of --target-url/--target-id."
+        ));
+    }
+    if explicit_targets > 1 {
+        return Err(anyhow!("Use only one of --target-url or --target-id."));
+    }
+
+    let mut params = api::CaseRunParams {
+        target_url: None,
+        target_id: None,
+        target: None,
+        target_name,
+        wait: wait.then_some(true),
+        timeout_ms: parse_timeout_ms(timeout, timeout_ms)?,
+        interval_ms,
+    };
+
+    if let Some(target_url) = target_url {
+        params.target_url = Some(target_url);
+    } else if let Some(target_id) = target_id {
+        params.target_id = Some(target_id);
+    } else if let Some(target) = target {
+        let normalized = target.trim();
+        if normalized.eq_ignore_ascii_case("cli") {
+            params.target = Some("cli".to_string());
+        } else if normalized.starts_with("http://") || normalized.starts_with("https://") {
+            params.target_url = Some(target);
+        } else {
+            params.target_id = Some(target);
+        }
+    } else {
+        return Err(anyhow!(
+            "Target is required. Use --target, --target-url, or --target-id."
+        ));
+    }
+
+    Ok(params)
+}
+
+fn case_run_failed(result: &api::CaseRunResult) -> bool {
+    matches!(result.result_status.as_str(), "failed" | "timeout")
+}
+
+fn case_run_target_label(target: &api::CaseRunTarget) -> String {
+    if target.r#type.as_deref() == Some("cli") {
+        return "CLI listener".to_string();
+    }
+
+    target
+        .name
+        .as_deref()
+        .or(target.url.as_deref())
+        .or(target.id.as_deref())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn case_run_forward_target(forward: &api::CaseRunForward) -> String {
+    forward.target_url.as_deref().unwrap_or("CLI").to_string()
+}
+
+fn has_case_run_error(error: Option<&serde_json::Value>) -> bool {
+    match error {
+        Some(serde_json::Value::Null) | None => false,
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(serde_json::Value::Object(value)) => !value.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn case_run_value_message(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(message) => message.clone(),
+        serde_json::Value::Object(object) => {
+            if let Some(detail) = object.get("detail").and_then(|value| value.as_str()) {
+                detail.to_string()
+            } else if let Some(error_type) = object.get("type").and_then(|value| value.as_str()) {
+                error_type.replace('_', " ")
+            } else {
+                value.to_string()
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn case_run_failure_reason(failure: &api::CaseRunFailure) -> String {
+    case_run_value_message(&failure.reason)
 }
 
 pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
@@ -1151,6 +1348,47 @@ async fn main() -> Result<()> {
                 } else {
                     print_context("Organization:", &organization_id);
                     print_forward_detail(&forward);
+                }
+            }
+        },
+        Commands::Cases { action } => match action {
+            CasesAction::Run {
+                endpoint_id,
+                target,
+                target_url,
+                target_id,
+                target_name,
+                wait,
+                timeout,
+                timeout_ms,
+                interval_ms,
+                org,
+            } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let token = ensure_valid_token(&mut config).await?;
+                let params = build_case_run_params(CaseRunInput {
+                    target,
+                    target_url,
+                    target_id,
+                    target_name,
+                    wait,
+                    timeout,
+                    timeout_ms,
+                    interval_ms,
+                })?;
+                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+                let result = client.run_endpoint_cases(&endpoint_id, &params).await?;
+
+                if json {
+                    print_json(&result)?;
+                } else {
+                    print_context("Organization:", &organization_id);
+                    print_case_run_result(&result);
+                }
+
+                if case_run_failed(&result) {
+                    std::process::exit(1);
                 }
             }
         },
@@ -2262,6 +2500,135 @@ fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
     }
 }
 
+fn print_case_run_result(result: &api::CaseRunResult) {
+    let status = if case_run_failed(result) {
+        OutputStatus::Err
+    } else if matches!(result.result_status.as_str(), "pending" | "completed") {
+        OutputStatus::Info
+    } else {
+        OutputStatus::Ok
+    };
+
+    print_status(status, "CASE RUN");
+    println!();
+    if let Some(run_id) = result.case_suite_run_id.as_deref().or(result.id.as_deref()) {
+        print_field("RUN ID", run_id);
+    }
+    if let Some(report_url) = result.case_suite_run_url.as_deref() {
+        print_field("REPORT", report_url);
+    }
+    print_field("RESULT", result.result_status.as_str().bold());
+    print_field("STATUS", &result.status);
+    print_field("ENDPOINT", &result.endpoint_id);
+    print_field("TARGET", case_run_target_label(&result.target));
+    if let Some(source) = result.source.as_deref() {
+        print_field("SOURCE", source.to_uppercase());
+    }
+    print_field("ASYNC", yes_no(result.async_run));
+    if let Some(waited) = result.waited {
+        print_field("WAITED", yes_no(waited));
+    }
+    if result.timed_out == Some(true) {
+        print_field("TIMED OUT", "yes".red());
+    }
+    print_field(
+        "COUNTS",
+        format!(
+            "total={} queued={} failed={}",
+            result.total_count, result.queued_count, result.failed_count
+        ),
+    );
+
+    if result.waited == Some(true) || result.completed_count > 0 {
+        print_field(
+            "RESULTS",
+            format!(
+                "completed={} waiting={} passed={} assertions_failed={} assertions_error={} not_configured={}",
+                result.completed_count,
+                result.waiting_count,
+                result.passed_count,
+                result.assertion_failed_count,
+                result.assertion_error_count,
+                result.not_configured_count
+            ),
+        );
+        print_field(
+            "FAILURES",
+            format!(
+                "queue={} delivery={}",
+                result.queue_failed_count, result.delivery_failed_count
+            ),
+        );
+    }
+
+    let problem_forwards = result
+        .forwards
+        .iter()
+        .filter(|forward| {
+            has_case_run_error(forward.error_message.as_ref())
+                || forward.status_code.is_some_and(|code| code >= 400)
+                || matches!(
+                    forward.assertion_status.as_deref(),
+                    Some("failed" | "error" | "timeout")
+                )
+        })
+        .collect::<Vec<_>>();
+
+    if !problem_forwards.is_empty() {
+        println!();
+        print_section("Failed Forwards");
+        let mut table = new_table(&[
+            "ID",
+            "Request",
+            "Case",
+            "Target",
+            "HTTP",
+            "Assertion",
+            "Error",
+        ]);
+        for forward in problem_forwards {
+            let status = forward
+                .status_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let assertion = forward
+                .assertion_status
+                .as_deref()
+                .unwrap_or("-")
+                .to_string();
+            let error = forward
+                .error_message
+                .as_ref()
+                .map(case_run_value_message)
+                .or_else(|| forward.poll_url.clone())
+                .unwrap_or_else(|| "-".to_string());
+            table.add_row(vec![
+                forward.id.as_str().to_string(),
+                forward.debug_request_id.clone(),
+                value_or_dash(forward.debug_request_case_id.as_deref()).to_string(),
+                case_run_forward_target(forward),
+                status,
+                assertion,
+                error,
+            ]);
+        }
+        println!("{table}");
+    }
+
+    if !result.failures.is_empty() {
+        println!();
+        print_section("Queue Failures");
+        let mut table = new_table(&["Case", "Reason"]);
+        for failure in &result.failures {
+            table.add_row(vec![
+                failure.case_id.as_str().to_string(),
+                case_run_failure_reason(failure),
+            ]);
+        }
+        println!("{table}");
+    }
+}
+
 fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
     if response.static_tunnels.is_empty() {
         print_status(OutputStatus::Info, "NO STATIC TUNNELS FOUND");
@@ -3074,6 +3441,130 @@ mod tests {
         assert!(!output.contains("Method"));
         assert_no_ansi_escape(&output);
         insta::assert_snapshot!("command_output_table_headers", output);
+    }
+
+    #[test]
+    fn cases_run_target_shorthand_maps_to_expected_body_fields() {
+        let url = build_case_run_params(CaseRunInput {
+            target: Some("https://example.test/webhooks".to_string()),
+            target_url: None,
+            target_id: None,
+            target_name: None,
+            wait: true,
+            timeout: Some("60s".to_string()),
+            timeout_ms: None,
+            interval_ms: None,
+        })
+        .unwrap();
+        assert_eq!(
+            url.target_url.as_deref(),
+            Some("https://example.test/webhooks")
+        );
+        assert_eq!(url.wait, Some(true));
+        assert_eq!(url.timeout_ms, Some(60_000));
+
+        let cli = build_case_run_params(CaseRunInput {
+            target: Some("cli".to_string()),
+            target_url: None,
+            target_id: None,
+            target_name: Some("Local CLI".to_string()),
+            wait: false,
+            timeout: None,
+            timeout_ms: None,
+            interval_ms: Some(500),
+        })
+        .unwrap();
+        assert_eq!(cli.target.as_deref(), Some("cli"));
+        assert_eq!(cli.target_name.as_deref(), Some("Local CLI"));
+        assert_eq!(cli.interval_ms, Some(500));
+
+        let saved = build_case_run_params(CaseRunInput {
+            target: Some("rt_123".to_string()),
+            target_url: None,
+            target_id: None,
+            target_name: None,
+            wait: false,
+            timeout: None,
+            timeout_ms: None,
+            interval_ms: None,
+        })
+        .unwrap();
+        assert_eq!(saved.target_id.as_deref(), Some("rt_123"));
+    }
+
+    #[test]
+    fn cases_run_rejects_ambiguous_targets() {
+        let err = build_case_run_params(CaseRunInput {
+            target: Some("cli".to_string()),
+            target_url: Some("http://localhost:3000".to_string()),
+            target_id: None,
+            target_name: None,
+            wait: false,
+            timeout: None,
+            timeout_ms: None,
+            interval_ms: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("Use --target by itself"));
+
+        let err = build_case_run_params(CaseRunInput {
+            target: None,
+            target_url: None,
+            target_id: None,
+            target_name: None,
+            wait: false,
+            timeout: None,
+            timeout_ms: None,
+            interval_ms: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("Target is required"));
+    }
+
+    #[test]
+    fn cases_run_timeout_parser_accepts_seconds_and_units() {
+        assert_eq!(parse_duration_to_ms("60").unwrap(), 60_000);
+        assert_eq!(parse_duration_to_ms("60s").unwrap(), 60_000);
+        assert_eq!(parse_duration_to_ms("2m").unwrap(), 120_000);
+        assert_eq!(parse_duration_to_ms("1500ms").unwrap(), 1_500);
+        assert!(parse_timeout_ms(Some("1s".to_string()), Some(1_000)).is_err());
+    }
+
+    #[test]
+    fn cases_run_clap_shape_matches_expected_command() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_123",
+            "--target",
+            "cli",
+            "--wait",
+            "--timeout",
+            "60s",
+            "--json",
+        ])
+        .unwrap();
+
+        assert!(cli.json);
+        match cli.command.unwrap() {
+            Commands::Cases {
+                action:
+                    CasesAction::Run {
+                        endpoint_id,
+                        target,
+                        wait,
+                        timeout,
+                        ..
+                    },
+            } => {
+                assert_eq!(endpoint_id, "ep_123");
+                assert_eq!(target.as_deref(), Some("cli"));
+                assert!(wait);
+                assert_eq!(timeout.as_deref(), Some("60s"));
+            }
+            _ => panic!("expected cases run command"),
+        }
     }
 
     #[test]

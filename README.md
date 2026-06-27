@@ -117,6 +117,7 @@ hooklistener --version
    hooklistener endpoint requests <endpoint-id>
    hooklistener endpoint request <endpoint-id> <request-id>
    hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks/stripe
+   hooklistener cases run <endpoint-id> --target http://localhost:3000/webhooks/stripe --wait
    ```
 
 ### No-login workflow
@@ -191,6 +192,11 @@ hooklistener endpoint request <endpoint-id> <request-id>
 
 # Replay a captured request to a target URL
 hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks
+
+# Run every saved case for an endpoint
+hooklistener cases run <endpoint-id> --target http://localhost:3000/webhooks --wait
+hooklistener cases run <endpoint-id> --target cli
+hooklistener cases run <endpoint-id> --target <saved-target-id> --timeout 60s
 
 # Review replay attempts
 hooklistener endpoint forwards <endpoint-id> <request-id>
