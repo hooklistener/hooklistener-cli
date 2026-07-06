@@ -24,6 +24,24 @@ fn json_value_to_string(v: &serde_json::Value) -> String {
     }
 }
 
+fn should_forward_request_header(key: &str) -> bool {
+    const HEADERS_TO_DROP: &[&str] = &[
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+
+    !HEADERS_TO_DROP
+        .iter()
+        .any(|header| key.eq_ignore_ascii_case(header))
+}
+
 fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
@@ -584,9 +602,9 @@ impl TunnelClient {
             }
         };
 
-        // Add headers (skip host — it will be set by reqwest)
+        // Add headers. reqwest sets request framing headers from the body we actually send.
         for (key, value) in &request.headers {
-            if key.to_lowercase() != "host" {
+            if should_forward_request_header(key) {
                 req_builder = req_builder.header(key, json_value_to_string(value));
             }
         }
@@ -1188,9 +1206,9 @@ impl TunnelForwarder {
             }
         };
 
-        // Add headers (skip host — it will be set by reqwest)
+        // Add headers. reqwest sets request framing headers from the body we actually send.
         for (key, value) in headers {
-            if key.to_lowercase() != "host" {
+            if should_forward_request_header(&key) {
                 let value_str = json_value_to_string(&value);
                 if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
                     && let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value_str)
@@ -1421,6 +1439,29 @@ mod tests {
         let json = r#"{"topic":"t","event":"e","payload":{}}"#;
         let msg: ChannelMessage = serde_json::from_str(json).unwrap();
         assert!(msg.reference.is_none());
+    }
+
+    #[test]
+    fn test_should_forward_request_header_filters_framing_headers() {
+        for header in [
+            "host",
+            "Host",
+            "content-length",
+            "Content-Length",
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "upgrade",
+        ] {
+            assert!(!should_forward_request_header(header));
+        }
+
+        assert!(should_forward_request_header("content-type"));
+        assert!(should_forward_request_header("authorization"));
+        assert!(should_forward_request_header("x-custom-header"));
     }
 
     // TunnelWebhookRequest tests
