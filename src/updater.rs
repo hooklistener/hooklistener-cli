@@ -233,6 +233,8 @@ async fn run_binary_self_update(json: bool) -> Result<()> {
             .repo_name(GITHUB_REPO_NAME)
             .bin_name("hooklistener")
             .show_download_progress(!json)
+            .show_output(!json)
+            .no_confirm(json)
             .current_version(CURRENT_VERSION)
             .build()
             .map_err(|e| UpdateError::UpdateFailed(e.to_string()))?
@@ -249,11 +251,11 @@ async fn run_binary_self_update(json: bool) -> Result<()> {
 
     if json {
         crate::print_json(&serde_json::json!({
-            "status": if status.updated() { "updated" } else { "up_to_date" },
+            "status": if status.is_updated() { "updated" } else { "up_to_date" },
             "current_version": CURRENT_VERSION,
             "latest_version": new_version,
         }))?;
-    } else if status.updated() {
+    } else if status.is_updated() {
         println!(
             "\n{}",
             crate::format_status_line(crate::OutputStatus::Ok, "UPDATED")

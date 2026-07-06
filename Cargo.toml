@@ -40,7 +40,7 @@ base64 = "0.22"
 thiserror = "2.0"
 arboard = "3.6"
 comfy-table = "7"
-self_update = { version = "0.44", default-features = false, features = ["reqwest", "default-tls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
+self_update = { version = "1.0.0-rc.2", default-features = false, features = ["reqwest", "native-tls", "github", "progress-bar", "archive-tar", "archive-zip", "compression-tar-gz", "compression-zip-deflate"] }
 
 [dev-dependencies]
 insta = "1.47"
