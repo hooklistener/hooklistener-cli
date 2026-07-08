@@ -170,11 +170,14 @@ hooklistener listen my-endpoint
 # Forward to a specific local route
 hooklistener listen my-endpoint --target http://localhost:8080/webhooks
 
+# Stream newline-delimited JSON receipts and request events for agents or scripts
+hooklistener --json listen my-endpoint --target http://localhost:8080/webhooks
+
 # Override the WebSocket endpoint for advanced or self-hosted setups
 hooklistener listen my-endpoint --ws-url wss://your-instance.example.com/socket/websocket
 ```
 
-This workflow is ideal when you want real inbound traffic plus an interactive terminal experience for inspecting headers, bodies, metadata, and replay results.
+This workflow is ideal when you want real inbound traffic plus an interactive terminal experience for inspecting headers, bodies, metadata, and replay results. With `--json`, `listen` skips the TUI and streams newline-delimited JSON events with stable `resource_uri` fields for captured requests.
 
 ### Create and manage debug endpoints
 
@@ -191,6 +194,7 @@ hooklistener endpoint requests <endpoint-id> --page 1 --page-size 50
 hooklistener endpoint request <endpoint-id> <request-id>
 
 # Replay a captured request to a target URL
+hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks --dry-run
 hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks
 
 # Run every saved case for an endpoint
@@ -223,9 +227,12 @@ hooklistener tunnel --host 127.0.0.1 --port 5000
 
 # Request a persistent slug for a reserved static tunnel
 hooklistener tunnel --slug my-cool-app
+
+# Stream newline-delimited JSON tunnel receipts and request events
+hooklistener --json tunnel --host 127.0.0.1 --port 5000
 ```
 
-`--slug` is intended for reserved static tunnel slugs and may depend on your Hooklistener plan.
+`--slug` is intended for reserved static tunnel slugs and may depend on your Hooklistener plan. With `--json`, `tunnel` skips the TUI and emits a `tunnel_established` receipt containing the public URL, local target URL, `resource_uri`, and follow-up request events.
 
 ### Reserve and manage static tunnel slugs
 
@@ -301,9 +308,15 @@ Most non-interactive commands support `--json`, which makes the CLI useful in sc
 hooklistener --json org list
 hooklistener --json endpoint list
 hooklistener --json endpoint request <endpoint-id> <request-id>
+hooklistener --json endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks --dry-run
+hooklistener --json listen <endpoint-slug>
+hooklistener --json tunnel --port 3000
 hooklistener --json share list <debug-request-id>
 hooklistener --json monitor list
 ```
+
+`endpoint forward-request --json` returns a durable command receipt with `resource_uri`, `poll_url`, and `next_actions` fields so automation can inspect the queued forward without parsing human output.
+Long-running `listen --json` and `tunnel --json` commands stream newline-delimited JSON. Each line is one receipt or event object, so agents can read startup state, connection status, captured request `resource_uri` values, and forwarding outcomes incrementally.
 
 Generate shell completions for your shell:
 

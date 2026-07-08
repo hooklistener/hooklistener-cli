@@ -26,6 +26,7 @@ use crossterm::{
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use reqwest::Url;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -48,7 +49,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Output non-interactive command responses as JSON
+    /// Output command responses or event streams as JSON
     #[arg(long, global = true)]
     json: bool,
 
@@ -283,6 +284,9 @@ enum EndpointAction {
         /// Optional HTTP method override (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)
         #[arg(long)]
         method: Option<String>,
+        /// Validate scope and print the forward plan without queueing delivery
+        #[arg(long)]
+        dry_run: bool,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
         org: Option<String>,
@@ -746,9 +750,924 @@ fn case_run_failure_reason(failure: &api::CaseRunFailure) -> String {
     case_run_value_message(&failure.reason)
 }
 
+fn validate_forward_target_url(target_url: &str) -> Result<()> {
+    let parsed = Url::parse(target_url)
+        .map_err(|err| anyhow!("Invalid target URL '{}': {}", target_url, err))?;
+
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        scheme => Err(anyhow!(
+            "Invalid target URL scheme '{}'. Use http or https.",
+            scheme
+        )),
+    }
+}
+
+fn request_resource_uri(request_id: &str) -> String {
+    format!("hooklistener://requests/{request_id}")
+}
+
+fn request_forwards_resource_uri(request_id: &str) -> String {
+    format!("hooklistener://requests/{request_id}/forwards")
+}
+
+fn endpoint_resource_uri(endpoint_id: &str) -> String {
+    format!("hooklistener://endpoints/{endpoint_id}")
+}
+
+fn endpoint_requests_resource_uri(endpoint_id: &str) -> String {
+    format!("hooklistener://endpoints/{endpoint_id}/requests")
+}
+
+fn endpoint_slug_resource_uri(endpoint_slug: &str) -> String {
+    format!("hooklistener://endpoints/by-slug/{endpoint_slug}")
+}
+
+fn forward_resource_uri(forward_id: &str) -> String {
+    format!("hooklistener://forwards/{forward_id}")
+}
+
+fn tunnel_resource_uri(tunnel_id: &str) -> String {
+    format!("hooklistener://tunnels/{tunnel_id}")
+}
+
+fn listen_session_resource_uri(endpoint_slug: &str) -> String {
+    format!("hooklistener://cli/listen/{endpoint_slug}")
+}
+
+fn tunnel_session_resource_uri(host: &str, port: u16) -> String {
+    format!("hooklistener://cli/tunnels/{host}:{port}")
+}
+
+fn forward_poll_path(forward_id: &str) -> String {
+    format!("/api/v1/forwards/{forward_id}")
+}
+
+fn forward_poll_command(forward_id: &str) -> String {
+    format!("hooklistener endpoint forward {forward_id}")
+}
+
+fn emitted_at() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn effective_listen_ws_url(ws_url: Option<&str>) -> String {
+    ws_url
+        .map(str::to_string)
+        .or_else(|| std::env::var("HOOKLISTENER_WS_URL").ok())
+        .unwrap_or_else(|| "wss://api.hooklistener.com".to_string())
+}
+
+fn command_event_receipt(
+    command: &str,
+    operation: &str,
+    event: &str,
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "event",
+        "event": event,
+        "status": status,
+        "command": command,
+        "operation": operation,
+        "emitted_at": emitted_at()
+    })
+}
+
+fn listen_event_base(
+    event: &str,
+    status: &str,
+    endpoint_slug: &str,
+    target_url: &str,
+) -> serde_json::Value {
+    let mut receipt = command_event_receipt("listen", "listen_endpoint", event, status);
+    receipt["endpoint_slug"] = serde_json::json!(endpoint_slug);
+    receipt["target_url"] = serde_json::json!(target_url);
+    receipt["resource_uri"] = serde_json::json!(listen_session_resource_uri(endpoint_slug));
+    receipt
+}
+
+fn tunnel_event_base(event: &str, status: &str) -> serde_json::Value {
+    command_event_receipt("tunnel", "start_local_tunnel", event, status)
+}
+
+fn reconnect_failure_reason(event: &TunnelEvent) -> Option<&str> {
+    match event {
+        TunnelEvent::ReconnectFailed { reason } => Some(reason),
+        _ => None,
+    }
+}
+
+fn path_with_query(path: &str, query_string: &str) -> String {
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
+    let query_string = query_string.trim().trim_start_matches('?');
+    if query_string.is_empty() {
+        path
+    } else {
+        format!("{path}?{query_string}")
+    }
+}
+
+fn public_tunnel_url(subdomain: &str) -> String {
+    let subdomain = subdomain.trim().trim_end_matches('/');
+    if subdomain.starts_with("http://") || subdomain.starts_with("https://") {
+        subdomain.to_string()
+    } else {
+        format!("https://{subdomain}")
+    }
+}
+
+fn local_tunnel_target_url(host: &str, port: u16) -> String {
+    format!("http://{host}:{port}")
+}
+
+fn local_tunnel_request_target(host: &str, port: u16, path: &str, query_string: &str) -> String {
+    format!(
+        "{}{}",
+        local_tunnel_target_url(host, port),
+        path_with_query(path, query_string)
+    )
+}
+
+fn endpoint_receipt_parts(
+    endpoint_slug: &str,
+    endpoint: Option<&api::DebugEndpointSummary>,
+) -> (String, String, serde_json::Value) {
+    match endpoint {
+        Some(endpoint) => (
+            endpoint_resource_uri(&endpoint.id),
+            endpoint_requests_resource_uri(&endpoint.id),
+            serde_json::json!({
+                "id": &endpoint.id,
+                "name": &endpoint.name,
+                "slug": &endpoint.slug,
+                "status": &endpoint.status,
+                "webhook_url": &endpoint.webhook_url,
+                "resource_uri": endpoint_resource_uri(&endpoint.id)
+            }),
+        ),
+        None => {
+            let endpoint_uri = endpoint_slug_resource_uri(endpoint_slug);
+            (
+                endpoint_uri.clone(),
+                format!("{endpoint_uri}/requests"),
+                serde_json::json!({
+                    "slug": endpoint_slug,
+                    "resource_uri": endpoint_uri,
+                    "resolution": "unresolved"
+                }),
+            )
+        }
+    }
+}
+
+fn listen_started_receipt(
+    endpoint_slug: &str,
+    target_url: &str,
+    ws_url: Option<&str>,
+    endpoint: Option<&api::DebugEndpointSummary>,
+) -> serde_json::Value {
+    let (endpoint_resource_uri, requests_resource_uri, endpoint_value) =
+        endpoint_receipt_parts(endpoint_slug, endpoint);
+    let session_resource_uri = listen_session_resource_uri(endpoint_slug);
+    let ws_url = effective_listen_ws_url(ws_url);
+    let inspect_command = endpoint
+        .map(|endpoint| format!("hooklistener endpoint requests {}", endpoint.id))
+        .unwrap_or_else(|| "hooklistener endpoint list --json".to_string());
+
+    serde_json::json!({
+        "type": "receipt",
+        "event": "listen_started",
+        "status": "running",
+        "command": "listen",
+        "operation": "listen_endpoint",
+        "emitted_at": emitted_at(),
+        "resource_uri": &session_resource_uri,
+        "endpoint_slug": endpoint_slug,
+        "target_url": target_url,
+        "ws_url": ws_url,
+        "endpoint": endpoint_value,
+        "resources": {
+            "self": session_resource_uri,
+            "endpoint": endpoint_resource_uri,
+            "requests": requests_resource_uri
+        },
+        "next_actions": [
+            format!("Send webhook traffic to endpoint slug `{endpoint_slug}`."),
+            inspect_command
+        ]
+    })
+}
+
+fn listen_event_receipt(
+    event: &TunnelEvent,
+    endpoint_slug: &str,
+    target_url: &str,
+    endpoint: Option<&api::DebugEndpointSummary>,
+) -> serde_json::Value {
+    let (endpoint_resource_uri, requests_resource_uri, _) =
+        endpoint_receipt_parts(endpoint_slug, endpoint);
+
+    match event {
+        TunnelEvent::Connecting => {
+            listen_event_base("connecting", "connecting", endpoint_slug, target_url)
+        }
+        TunnelEvent::Connected => {
+            let mut receipt =
+                listen_event_base("connected", "connected", endpoint_slug, target_url);
+            receipt["resources"] = serde_json::json!({
+                "endpoint": endpoint_resource_uri,
+                "requests": requests_resource_uri
+            });
+            receipt
+        }
+        TunnelEvent::WebhookReceived(request) => {
+            let request_resource_uri = request_resource_uri(&request.id);
+            let mut receipt =
+                listen_event_base("webhook_received", "received", endpoint_slug, target_url);
+            receipt["request_id"] = serde_json::json!(&request.id);
+            receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["endpoint_resource_uri"] = serde_json::json!(endpoint_resource_uri);
+            receipt["request"] = serde_json::json!({
+                "id": &request.id,
+                "method": &request.method,
+                "path": request.path.as_deref().unwrap_or(&request.url),
+                "url": &request.url,
+                "remote_addr": &request.remote_addr,
+                "content_length": request.content_length,
+                "created_at": &request.created_at,
+                "resource_uri": request_resource_uri
+            });
+            receipt["next_actions"] = serde_json::json!([format!(
+                "hooklistener endpoint request <endpoint-id> {}",
+                request.id
+            )]);
+            receipt
+        }
+        TunnelEvent::ForwardSuccess {
+            request_id,
+            target_url: forward_target_url,
+            status,
+            duration_ms,
+        } => {
+            let request_resource_uri = request_resource_uri(request_id);
+            let mut receipt =
+                listen_event_base("forward_succeeded", "succeeded", endpoint_slug, target_url);
+            receipt["request_id"] = serde_json::json!(request_id);
+            receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["request_resource_uri"] = serde_json::json!(request_resource_uri);
+            receipt["target_url"] = serde_json::json!(forward_target_url);
+            receipt["status_code"] = serde_json::json!(status);
+            receipt["duration_ms"] = serde_json::json!(duration_ms);
+            receipt
+        }
+        TunnelEvent::ForwardError {
+            request_id,
+            target_url: forward_target_url,
+            error,
+            duration_ms,
+        } => {
+            let request_resource_uri = request_resource_uri(request_id);
+            let mut receipt =
+                listen_event_base("forward_failed", "failed", endpoint_slug, target_url);
+            receipt["request_id"] = serde_json::json!(request_id);
+            receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["request_resource_uri"] = serde_json::json!(request_resource_uri);
+            receipt["target_url"] = serde_json::json!(forward_target_url);
+            receipt["error"] = serde_json::json!(error);
+            receipt["duration_ms"] = serde_json::json!(duration_ms);
+            receipt["next_actions"] = serde_json::json!([
+                "Check that the local target URL is reachable from this machine."
+            ]);
+            receipt
+        }
+        TunnelEvent::ConnectionError(error) => {
+            let mut receipt =
+                listen_event_base("connection_error", "error", endpoint_slug, target_url);
+            receipt["error"] = serde_json::json!(error);
+            receipt["retryable"] = serde_json::json!(true);
+            receipt["next_actions"] =
+                serde_json::json!(["Wait for automatic reconnect or restart the command."]);
+            receipt
+        }
+        TunnelEvent::Disconnected => {
+            listen_event_base("disconnected", "disconnected", endpoint_slug, target_url)
+        }
+        TunnelEvent::Reconnecting {
+            attempt,
+            max_attempts,
+            next_retry_in_secs,
+        } => {
+            let mut receipt =
+                listen_event_base("reconnecting", "reconnecting", endpoint_slug, target_url);
+            receipt["attempt"] = serde_json::json!(attempt);
+            receipt["max_attempts"] = serde_json::json!(max_attempts);
+            receipt["next_retry_in_secs"] = serde_json::json!(next_retry_in_secs);
+            receipt
+        }
+        TunnelEvent::ReconnectFailed { reason } => {
+            let mut receipt =
+                listen_event_base("reconnect_failed", "failed", endpoint_slug, target_url);
+            receipt["error"] = serde_json::json!(reason);
+            receipt["retryable"] = serde_json::json!(false);
+            receipt["next_actions"] = serde_json::json!([
+                "Verify authentication, endpoint slug, and network connectivity."
+            ]);
+            receipt
+        }
+        _ => listen_event_base("ignored", "ignored", endpoint_slug, target_url),
+    }
+}
+
+fn tunnel_started_receipt(
+    host: &str,
+    port: u16,
+    organization_id: Option<&str>,
+    slug: Option<&str>,
+) -> serde_json::Value {
+    let session_resource_uri = tunnel_session_resource_uri(host, port);
+    let local_target_url = local_tunnel_target_url(host, port);
+
+    serde_json::json!({
+        "type": "receipt",
+        "event": "tunnel_started",
+        "status": "starting",
+        "command": "tunnel",
+        "operation": "start_local_tunnel",
+        "emitted_at": emitted_at(),
+        "resource_uri": &session_resource_uri,
+        "local_host": host,
+        "local_port": port,
+        "local_target_url": local_target_url,
+        "organization_id": organization_id,
+        "requested_slug": slug,
+        "resources": {
+            "self": session_resource_uri
+        },
+        "next_actions": ["Wait for a tunnel_established event before sending external traffic."]
+    })
+}
+
+fn tunnel_event_receipt(
+    event: &TunnelEvent,
+    host: &str,
+    port: u16,
+    organization_id: Option<&str>,
+    requested_slug: Option<&str>,
+) -> serde_json::Value {
+    match event {
+        TunnelEvent::Connecting => {
+            let mut receipt = tunnel_event_base("connecting", "connecting");
+            receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
+            receipt["local_target_url"] = serde_json::json!(local_tunnel_target_url(host, port));
+            receipt["organization_id"] = serde_json::json!(organization_id);
+            receipt["requested_slug"] = serde_json::json!(requested_slug);
+            receipt
+        }
+        TunnelEvent::TunnelEstablished {
+            subdomain,
+            tunnel_id,
+            is_static,
+        } => {
+            let tunnel_resource_uri = tunnel_resource_uri(tunnel_id);
+            let public_url = public_tunnel_url(subdomain);
+            let mut receipt = tunnel_event_base("tunnel_established", "running");
+            receipt["type"] = serde_json::json!("receipt");
+            receipt["resource_uri"] = serde_json::json!(&tunnel_resource_uri);
+            receipt["tunnel_id"] = serde_json::json!(tunnel_id);
+            receipt["tunnel_resource_uri"] = serde_json::json!(&tunnel_resource_uri);
+            receipt["subdomain"] = serde_json::json!(subdomain);
+            receipt["public_url"] = serde_json::json!(public_url);
+            receipt["local_host"] = serde_json::json!(host);
+            receipt["local_port"] = serde_json::json!(port);
+            receipt["local_target_url"] = serde_json::json!(local_tunnel_target_url(host, port));
+            receipt["organization_id"] = serde_json::json!(organization_id);
+            receipt["requested_slug"] = serde_json::json!(requested_slug);
+            receipt["is_static"] = serde_json::json!(is_static);
+            receipt["resources"] = serde_json::json!({
+                "self": tunnel_resource_uri,
+                "session": tunnel_session_resource_uri(host, port)
+            });
+            receipt["next_actions"] = serde_json::json!([
+                format!("Send external traffic to {public_url}."),
+                "Watch subsequent request_received and request_forwarded events."
+            ]);
+            receipt
+        }
+        TunnelEvent::RequestReceived {
+            request_id,
+            method,
+            path,
+            headers,
+            body,
+            query_string,
+        } => {
+            let request_resource_uri = request_resource_uri(request_id);
+            let mut receipt = tunnel_event_base("request_received", "received");
+            receipt["request_id"] = serde_json::json!(request_id);
+            receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["method"] = serde_json::json!(method);
+            receipt["path"] = serde_json::json!(path);
+            receipt["query_string"] = serde_json::json!(query_string);
+            receipt["local_target_url"] =
+                serde_json::json!(local_tunnel_request_target(host, port, path, query_string));
+            receipt["headers"] = serde_json::json!(headers);
+            receipt["body_size"] = serde_json::json!(body.as_ref().map(String::len).unwrap_or(0));
+            receipt
+        }
+        TunnelEvent::RequestForwarded {
+            request_id,
+            status,
+            duration_ms,
+            response_headers,
+            response_body,
+        } => {
+            let request_resource_uri = request_resource_uri(request_id);
+            let mut receipt = tunnel_event_base("request_forwarded", "succeeded");
+            receipt["request_id"] = serde_json::json!(request_id);
+            receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["status_code"] = serde_json::json!(status);
+            receipt["duration_ms"] = serde_json::json!(duration_ms);
+            receipt["response_headers"] = serde_json::json!(response_headers);
+            receipt["response_body_size"] =
+                serde_json::json!(response_body.as_ref().map(String::len).unwrap_or(0));
+            receipt
+        }
+        TunnelEvent::RequestFailed { request_id, error } => {
+            let request_resource_uri = request_resource_uri(request_id);
+            let mut receipt = tunnel_event_base("request_failed", "failed");
+            receipt["request_id"] = serde_json::json!(request_id);
+            receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["error"] = serde_json::json!(error);
+            receipt["next_actions"] =
+                serde_json::json!(["Check that the local target is running and reachable."]);
+            receipt
+        }
+        TunnelEvent::ConnectionError(error) => {
+            let mut receipt = tunnel_event_base("connection_error", "error");
+            receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
+            receipt["local_target_url"] = serde_json::json!(local_tunnel_target_url(host, port));
+            receipt["error"] = serde_json::json!(error);
+            receipt["retryable"] = serde_json::json!(true);
+            receipt["next_actions"] =
+                serde_json::json!(["Wait for automatic reconnect or restart the command."]);
+            receipt
+        }
+        TunnelEvent::Disconnected => {
+            let mut receipt = tunnel_event_base("disconnected", "disconnected");
+            receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
+            receipt["local_target_url"] = serde_json::json!(local_tunnel_target_url(host, port));
+            receipt
+        }
+        TunnelEvent::Reconnecting {
+            attempt,
+            max_attempts,
+            next_retry_in_secs,
+        } => {
+            let mut receipt = tunnel_event_base("reconnecting", "reconnecting");
+            receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
+            receipt["local_target_url"] = serde_json::json!(local_tunnel_target_url(host, port));
+            receipt["attempt"] = serde_json::json!(attempt);
+            receipt["max_attempts"] = serde_json::json!(max_attempts);
+            receipt["next_retry_in_secs"] = serde_json::json!(next_retry_in_secs);
+            receipt
+        }
+        TunnelEvent::ReconnectFailed { reason } => {
+            let mut receipt = tunnel_event_base("reconnect_failed", "failed");
+            receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
+            receipt["local_target_url"] = serde_json::json!(local_tunnel_target_url(host, port));
+            receipt["error"] = serde_json::json!(reason);
+            receipt["retryable"] = serde_json::json!(false);
+            receipt["next_actions"] = serde_json::json!([
+                "Verify authentication, organization scope, requested slug, and network connectivity."
+            ]);
+            receipt
+        }
+        _ => {
+            let mut receipt = tunnel_event_base("ignored", "ignored");
+            receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
+            receipt["local_target_url"] = serde_json::json!(local_tunnel_target_url(host, port));
+            receipt
+        }
+    }
+}
+
+fn forward_method(method: Option<&str>, request: &api::DebugRequestDetail) -> String {
+    method
+        .map(str::to_string)
+        .unwrap_or_else(|| request.method.clone())
+}
+
+fn forward_request_preview_receipt(
+    organization_id: &str,
+    endpoint_id: &str,
+    request_id: &str,
+    target_url: &str,
+    method: Option<&str>,
+    request: &api::DebugRequestDetail,
+) -> serde_json::Value {
+    let method = forward_method(method, request);
+    let request_resource_uri = request_resource_uri(request_id);
+    let next_action = format!(
+        "Run `hooklistener endpoint forward-request {endpoint_id} {request_id} {target_url}` without --dry-run to queue the forward."
+    );
+
+    serde_json::json!({
+        "dry_run": true,
+        "status": "preview",
+        "command": "endpoint forward-request",
+        "operation": "forward_request",
+        "would_create": "debug_request_forward",
+        "risk_level": "external_side_effect",
+        "required_confirmation": true,
+        "organization_id": organization_id,
+        "endpoint_id": endpoint_id,
+        "request_id": request_id,
+        "target_url": target_url,
+        "method": method,
+        "source_request": {
+            "id": &request.id,
+            "method": &request.method,
+            "path": &request.path,
+            "url": &request.url,
+            "resource_uri": &request_resource_uri
+        },
+        "request_resource_uri": request_resource_uri,
+        "receipt_resource_uri_template": "hooklistener://forwards/{forward_id}",
+        "next_action": next_action
+    })
+}
+
+fn forward_request_receipt(
+    organization_id: &str,
+    endpoint_id: &str,
+    request_id: &str,
+    response: &api::EndpointRequestForwardResponse,
+) -> serde_json::Value {
+    let forward_resource_uri = forward_resource_uri(&response.forward_id);
+    let request_resource_uri = request_resource_uri(request_id);
+    let request_forwards_resource_uri = request_forwards_resource_uri(request_id);
+    let poll_url = forward_poll_path(&response.forward_id);
+    let poll_command = forward_poll_command(&response.forward_id);
+    let forwards_command = format!("hooklistener endpoint forwards {endpoint_id} {request_id}");
+
+    serde_json::json!({
+        "status": &response.status,
+        "delivery_status": "queued",
+        "command": "endpoint forward-request",
+        "operation": "forward_request",
+        "organization_id": organization_id,
+        "endpoint_id": endpoint_id,
+        "request_id": request_id,
+        "forward_id": &response.forward_id,
+        "resource_uri": &forward_resource_uri,
+        "forward_resource_uri": &forward_resource_uri,
+        "request_resource_uri": &request_resource_uri,
+        "poll_url": poll_url,
+        "resources": {
+            "self": forward_resource_uri,
+            "request": request_resource_uri,
+            "request_forwards": request_forwards_resource_uri
+        },
+        "next_actions": [
+            poll_command,
+            forwards_command
+        ],
+        "forward": response
+    })
+}
+
+fn print_forward_request_preview(
+    organization_id: &str,
+    endpoint_id: &str,
+    request_id: &str,
+    target_url: &str,
+    method: Option<&str>,
+    request: &api::DebugRequestDetail,
+) {
+    let method = forward_method(method, request);
+    let request_resource_uri = request_resource_uri(request_id);
+
+    print_status_block(
+        OutputStatus::Info,
+        "FORWARD PREVIEW",
+        &[
+            output_field("DRY RUN", "true"),
+            output_field("WOULD CREATE", "debug_request_forward"),
+            output_field("TARGET URL", target_url.underlined()),
+            output_field("METHOD", method.bold()),
+            output_field("REQUEST", request_id.dim()),
+            output_field("RESOURCE", request_resource_uri.dim()),
+            output_field("ENDPOINT", endpoint_id.dim()),
+            output_field("ORGANIZATION", organization_id.dim()),
+            output_field(
+                "NEXT",
+                "Run without --dry-run to queue the forward; receipt will be hooklistener://forwards/<forward_id>.",
+            ),
+        ],
+    );
+}
+
+fn print_forward_request_accepted(
+    organization_id: &str,
+    endpoint_id: &str,
+    request_id: &str,
+    response: &api::EndpointRequestForwardResponse,
+) {
+    print_status_block(
+        OutputStatus::Ok,
+        "FORWARD ACCEPTED",
+        &[
+            output_field("FORWARD ID", response.forward_id.as_str().bold()),
+            output_field("STATUS", response.status.as_str().bold()),
+            output_field("TARGET URL", response.target_url.as_str().underlined()),
+            output_field("RESOURCE", forward_resource_uri(&response.forward_id).dim()),
+            output_field("POLL", forward_poll_command(&response.forward_id).dim()),
+            output_field("REQUEST", request_id.dim()),
+            output_field("ENDPOINT", endpoint_id.dim()),
+            output_field("ORGANIZATION", organization_id.dim()),
+        ],
+    );
+}
+
+async fn run_endpoint_forward_request(
+    endpoint_id: String,
+    request_id: String,
+    target_url: String,
+    method: Option<String>,
+    dry_run: bool,
+    org: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let mut config = config::Config::load()?;
+    let organization_id = require_organization(org, &config)?;
+    let token = ensure_valid_token(&mut config).await?;
+    let normalized_method = normalize_http_method(method)?;
+    validate_forward_target_url(&target_url)?;
+    let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+
+    if dry_run {
+        let request = client
+            .get_endpoint_request(&endpoint_id, &request_id)
+            .await?;
+
+        if json {
+            print_json(&forward_request_preview_receipt(
+                &organization_id,
+                &endpoint_id,
+                &request_id,
+                &target_url,
+                normalized_method.as_deref(),
+                &request,
+            ))?;
+        } else {
+            print_forward_request_preview(
+                &organization_id,
+                &endpoint_id,
+                &request_id,
+                &target_url,
+                normalized_method.as_deref(),
+                &request,
+            );
+        }
+
+        return Ok(());
+    }
+
+    let response = client
+        .forward_endpoint_request(
+            &endpoint_id,
+            &request_id,
+            &target_url,
+            normalized_method.as_deref(),
+        )
+        .await?;
+
+    if json {
+        print_json(&forward_request_receipt(
+            &organization_id,
+            &endpoint_id,
+            &request_id,
+            &response,
+        ))?;
+    } else {
+        print_forward_request_accepted(&organization_id, &endpoint_id, &request_id, &response);
+    }
+
+    Ok(())
+}
+
 pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn print_json_line<T: serde::Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn exit_auth_required() -> ! {
+    eprint_status_block(
+        OutputStatus::Err,
+        "AUTH REQUIRED",
+        &[output_field(
+            "ACTION",
+            "Run 'hooklistener login' to authenticate first.",
+        )],
+    );
+    std::process::exit(1);
+}
+
+fn load_authenticated_config() -> Result<config::Config> {
+    let config = config::Config::load()?;
+
+    if !config.is_token_valid() {
+        exit_auth_required();
+    }
+
+    Ok(config)
+}
+
+async fn resolve_listen_endpoint(
+    access_token: &str,
+    organization_id: Option<String>,
+    endpoint_slug: &str,
+) -> Option<api::DebugEndpointSummary> {
+    let client = ApiClient::with_organization(access_token.to_string(), organization_id).ok()?;
+    let endpoints = tokio::time::timeout(Duration::from_secs(2), client.list_endpoints())
+        .await
+        .ok()?
+        .ok()?;
+
+    endpoints
+        .into_iter()
+        .find(|endpoint| endpoint.slug == endpoint_slug || endpoint.id == endpoint_slug)
+}
+
+async fn stream_listen_json_events(
+    mut event_rx: mpsc::Receiver<TunnelEvent>,
+    endpoint_slug: &str,
+    target_url: &str,
+    endpoint: Option<&api::DebugEndpointSummary>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    return Ok(());
+                };
+                let failure_reason = reconnect_failure_reason(&event);
+
+                print_json_line(&listen_event_receipt(&event, endpoint_slug, target_url, endpoint))?;
+
+                if let Some(reason) = failure_reason {
+                    return Err(anyhow!("Connection lost: {reason}"));
+                }
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                print_json_line(&serde_json::json!({
+                    "type": "event",
+                    "event": "stopped",
+                    "status": "stopped",
+                    "command": "listen",
+                    "operation": "listen_endpoint",
+                    "emitted_at": emitted_at(),
+                    "endpoint_slug": endpoint_slug,
+                    "target_url": target_url,
+                    "resource_uri": listen_session_resource_uri(endpoint_slug)
+                }))?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn run_listen_json(
+    access_token: String,
+    endpoint_slug: String,
+    target_url: String,
+    ws_url: Option<String>,
+    organization_id: Option<String>,
+) -> Result<()> {
+    let endpoint = resolve_listen_endpoint(&access_token, organization_id, &endpoint_slug).await;
+
+    print_json_line(&listen_started_receipt(
+        &endpoint_slug,
+        &target_url,
+        ws_url.as_deref(),
+        endpoint.as_ref(),
+    ))?;
+
+    let (event_tx, event_rx) = mpsc::channel(100);
+    let tunnel_client = tunnel::TunnelClient::new(
+        access_token,
+        endpoint_slug.clone(),
+        target_url.clone(),
+        ws_url,
+        event_tx,
+    );
+
+    tokio::spawn(async move {
+        if let Err(e) = tunnel_client
+            .connect_with_reconnect(tunnel::ReconnectConfig::default())
+            .await
+        {
+            error!("Tunnel client error: {}", e);
+        }
+    });
+
+    stream_listen_json_events(event_rx, &endpoint_slug, &target_url, endpoint.as_ref()).await
+}
+
+async fn stream_tunnel_json_events(
+    mut event_rx: mpsc::Receiver<TunnelEvent>,
+    host: &str,
+    port: u16,
+    organization_id: Option<&str>,
+    requested_slug: Option<&str>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    return Ok(());
+                };
+                let failure_reason = reconnect_failure_reason(&event);
+
+                print_json_line(&tunnel_event_receipt(
+                    &event,
+                    host,
+                    port,
+                    organization_id,
+                    requested_slug,
+                ))?;
+
+                if let Some(reason) = failure_reason {
+                    return Err(anyhow!("Connection lost: {reason}"));
+                }
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                print_json_line(&serde_json::json!({
+                    "type": "event",
+                    "event": "stopped",
+                    "status": "stopped",
+                    "command": "tunnel",
+                    "operation": "start_local_tunnel",
+                    "emitted_at": emitted_at(),
+                    "resource_uri": tunnel_session_resource_uri(host, port),
+                    "local_target_url": local_tunnel_target_url(host, port)
+                }))?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn run_tunnel_json(
+    access_token: String,
+    host: String,
+    port: u16,
+    organization_id: Option<String>,
+    slug: Option<String>,
+) -> Result<()> {
+    print_json_line(&tunnel_started_receipt(
+        &host,
+        port,
+        organization_id.as_deref(),
+        slug.as_deref(),
+    ))?;
+
+    let (event_tx, event_rx) = mpsc::channel(100);
+    tokio::spawn(run_tunnel_forwarder_connection(
+        access_token,
+        host.clone(),
+        port,
+        organization_id.clone(),
+        slug.clone(),
+        event_tx,
+    ));
+
+    stream_tunnel_json_events(
+        event_rx,
+        &host,
+        port,
+        organization_id.as_deref(),
+        slug.as_deref(),
+    )
+    .await
 }
 
 const SESSION_TOKEN_VALIDITY_DAYS: i64 = 60;
@@ -808,64 +1727,61 @@ async fn main() -> Result<()> {
             };
             let _logger = Logger::new(log_config)?;
 
-            // Load config for auth token
-            let config = config::Config::load()?;
-
-            // Check if authenticated
-            if !config.is_token_valid() {
-                eprint_status_block(
-                    OutputStatus::Err,
-                    "AUTH REQUIRED",
-                    &[output_field(
-                        "ACTION",
-                        "Run 'hooklistener login' to authenticate first.",
-                    )],
-                );
-                std::process::exit(1);
-            }
-
+            let config = load_authenticated_config()?;
             let access_token = config
                 .access_token
                 .ok_or_else(|| anyhow::anyhow!("No access token found"))?;
 
-            // Setup TUI for listen command
-            let mut terminal = setup_terminal()?;
-            let mut app = App::new()?;
+            if json {
+                run_listen_json(
+                    access_token,
+                    endpoint,
+                    target,
+                    ws_url,
+                    config.selected_organization_id.clone(),
+                )
+                .await?;
+            } else {
+                // Setup TUI for listen command
+                let mut terminal = setup_terminal()?;
+                let mut app = App::new()?;
 
-            // Set app state to listening
-            app.state = AppState::Listening;
-            app.listening_endpoint = endpoint.clone();
-            app.listening_target = target.clone();
+                // Set app state to listening
+                app.state = AppState::Listening;
+                app.listening_endpoint = endpoint.clone();
+                app.listening_target = target.clone();
 
-            // Create channel for tunnel events
-            let (event_tx, event_rx) = mpsc::channel(100);
+                // Create channel for tunnel events
+                let (event_tx, event_rx) = mpsc::channel(100);
 
-            // Create and spawn tunnel client
-            let tunnel_client = tunnel::TunnelClient::new(
-                access_token,
-                endpoint.clone(),
-                target.clone(),
-                ws_url,
-                event_tx,
-            );
+                // Create and spawn tunnel client
+                let tunnel_client = tunnel::TunnelClient::new(
+                    access_token,
+                    endpoint.clone(),
+                    target.clone(),
+                    ws_url,
+                    event_tx,
+                );
 
-            tokio::spawn(async move {
-                if let Err(e) = tunnel_client
-                    .connect_with_reconnect(tunnel::ReconnectConfig::default())
-                    .await
-                {
-                    error!("Tunnel client error: {}", e);
+                tokio::spawn(async move {
+                    if let Err(e) = tunnel_client
+                        .connect_with_reconnect(tunnel::ReconnectConfig::default())
+                        .await
+                    {
+                        error!("Tunnel client error: {}", e);
+                    }
+                });
+
+                let logo_rx = logo::spawn_logo_animation();
+                let res =
+                    run_app(&mut terminal, &mut app, event_rx, None, None, Some(logo_rx)).await;
+
+                restore_terminal(&mut terminal)?;
+
+                if let Err(err) = res {
+                    error!(error = %err, "Application terminated with error");
+                    display_error(&err);
                 }
-            });
-
-            let logo_rx = logo::spawn_logo_animation();
-            let res = run_app(&mut terminal, &mut app, event_rx, None, None, Some(logo_rx)).await;
-
-            restore_terminal(&mut terminal)?;
-
-            if let Err(err) = res {
-                error!(error = %err, "Application terminated with error");
-                display_error(&err);
             }
         }
         Commands::Diagnostics { output } => {
@@ -1269,42 +2185,19 @@ async fn main() -> Result<()> {
                 request_id,
                 target_url,
                 method,
+                dry_run,
                 org,
             } => {
-                let mut config = config::Config::load()?;
-                let organization_id = require_organization(org, &config)?;
-                let token = ensure_valid_token(&mut config).await?;
-                let normalized_method = normalize_http_method(method)?;
-                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let response = client
-                    .forward_endpoint_request(
-                        &endpoint_id,
-                        &request_id,
-                        &target_url,
-                        normalized_method.as_deref(),
-                    )
-                    .await?;
-                if json {
-                    print_json(&serde_json::json!({
-                        "organization_id": organization_id,
-                        "endpoint_id": endpoint_id,
-                        "request_id": request_id,
-                        "forward": response
-                    }))?;
-                } else {
-                    print_status_block(
-                        OutputStatus::Ok,
-                        "FORWARD ACCEPTED",
-                        &[
-                            output_field("FORWARD ID", response.forward_id.bold()),
-                            output_field("STATUS", response.status.bold()),
-                            output_field("TARGET URL", response.target_url.underlined()),
-                            output_field("REQUEST", request_id.dim()),
-                            output_field("ENDPOINT", endpoint_id.dim()),
-                            output_field("ORGANIZATION", organization_id.dim()),
-                        ],
-                    );
-                }
+                run_endpoint_forward_request(
+                    endpoint_id,
+                    request_id,
+                    target_url,
+                    method,
+                    dry_run,
+                    org,
+                    json,
+                )
+                .await?;
             }
             EndpointAction::Forwards {
                 endpoint_id,
@@ -1881,68 +2774,57 @@ async fn main() -> Result<()> {
             };
             let _logger = Logger::new(log_config)?;
 
-            // Load config for auth token
-            let config = config::Config::load()?;
-
-            // Check if authenticated
-            if !config.is_token_valid() {
-                eprint_status_block(
-                    OutputStatus::Err,
-                    "AUTH REQUIRED",
-                    &[output_field(
-                        "ACTION",
-                        "Run 'hooklistener login' to authenticate first.",
-                    )],
-                );
-                std::process::exit(1);
-            }
-
+            let config = load_authenticated_config()?;
             let selected_org = resolve_tunnel_org(org, &config);
 
             let access_token = config
                 .access_token
                 .ok_or_else(|| anyhow::anyhow!("No access token found"))?;
 
-            // Setup TUI for tunnel command
-            let mut terminal = setup_terminal()?;
-            let mut app = App::new()?;
+            if json {
+                run_tunnel_json(access_token, host, port, selected_org, slug).await?;
+            } else {
+                // Setup TUI for tunnel command
+                let mut terminal = setup_terminal()?;
+                let mut app = App::new()?;
 
-            // Set app state to tunneling
-            app.state = AppState::Tunneling;
-            app.tunnel_local_host = host.clone();
-            app.tunnel_local_port = port;
-            // Prefer explicit CLI org, then fall back to configured organization.
-            app.tunnel_org_id = selected_org.clone();
-            app.tunnel_requested_slug = slug.clone();
+                // Set app state to tunneling
+                app.state = AppState::Tunneling;
+                app.tunnel_local_host = host.clone();
+                app.tunnel_local_port = port;
+                // Prefer explicit CLI org, then fall back to configured organization.
+                app.tunnel_org_id = selected_org.clone();
+                app.tunnel_requested_slug = slug.clone();
 
-            // Create channel for tunnel events
-            let (event_tx, event_rx) = mpsc::channel(100);
+                // Create channel for tunnel events
+                let (event_tx, event_rx) = mpsc::channel(100);
 
-            // Create and spawn tunnel forwarder manager
-            let reconnect_tx = spawn_tunnel_forwarder_manager(
-                access_token,
-                host,
-                port,
-                selected_org,
-                slug,
-                event_tx.clone(),
-            );
+                // Create and spawn tunnel forwarder manager
+                let reconnect_tx = spawn_tunnel_forwarder_manager(
+                    access_token,
+                    host,
+                    port,
+                    selected_org,
+                    slug,
+                    event_tx.clone(),
+                );
 
-            let res = run_app(
-                &mut terminal,
-                &mut app,
-                event_rx,
-                Some(reconnect_tx),
-                Some(event_tx),
-                Some(logo::spawn_logo_animation()),
-            )
-            .await;
+                let res = run_app(
+                    &mut terminal,
+                    &mut app,
+                    event_rx,
+                    Some(reconnect_tx),
+                    Some(event_tx),
+                    Some(logo::spawn_logo_animation()),
+                )
+                .await;
 
-            restore_terminal(&mut terminal)?;
+                restore_terminal(&mut terminal)?;
 
-            if let Err(err) = res {
-                error!(error = %err, "Application terminated with error");
-                display_error(&err);
+                if let Err(err) = res {
+                    error!(error = %err, "Application terminated with error");
+                    display_error(&err);
+                }
             }
         }
     }
@@ -3168,10 +4050,10 @@ where
                         std::time::Instant::now(),
                     ));
                 }
-                TunnelEvent::ForwardSuccess => {
+                TunnelEvent::ForwardSuccess { .. } => {
                     app.listening_stats.successful_forwards += 1;
                 }
-                TunnelEvent::ForwardError => {
+                TunnelEvent::ForwardError { .. } => {
                     app.listening_stats.failed_forwards += 1;
                 }
                 TunnelEvent::Reconnecting {
@@ -3849,6 +4731,185 @@ mod tests {
         let err = ensure_valid_token(&mut config).await.unwrap_err();
         assert!(
             err.to_string().contains("Session expired"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn forward_request_receipt_includes_agent_links() {
+        let response = api::EndpointRequestForwardResponse {
+            forward_id: "fwd_123".to_string(),
+            debug_request_id: "req_123".to_string(),
+            target_url: "https://example.com/webhook".to_string(),
+            status: "pending".to_string(),
+        };
+
+        let receipt = forward_request_receipt("org_123", "ep_123", "req_123", &response);
+
+        assert_eq!(receipt["status"], "pending");
+        assert_eq!(receipt["delivery_status"], "queued");
+        assert_eq!(receipt["resource_uri"], "hooklistener://forwards/fwd_123");
+        assert_eq!(
+            receipt["request_resource_uri"],
+            "hooklistener://requests/req_123"
+        );
+        assert_eq!(receipt["poll_url"], "/api/v1/forwards/fwd_123");
+        assert_eq!(
+            receipt["resources"]["request_forwards"],
+            "hooklistener://requests/req_123/forwards"
+        );
+        assert_eq!(
+            receipt["next_actions"][0],
+            "hooklistener endpoint forward fwd_123"
+        );
+    }
+
+    #[test]
+    fn listen_started_receipt_includes_endpoint_resources() {
+        let endpoint = api::DebugEndpointSummary {
+            id: "ep_123".to_string(),
+            name: "GitHub".to_string(),
+            slug: "github-webhooks".to_string(),
+            status: "active".to_string(),
+            webhook_url: "https://hooks.example.dev/github-webhooks".to_string(),
+            created_at: None,
+            updated_at: None,
+        };
+
+        let receipt = listen_started_receipt(
+            "github-webhooks",
+            "http://localhost:3000/webhooks",
+            Some("wss://api.example.dev/socket/websocket"),
+            Some(&endpoint),
+        );
+
+        assert_eq!(receipt["type"], "receipt");
+        assert_eq!(receipt["event"], "listen_started");
+        assert_eq!(receipt["status"], "running");
+        assert_eq!(
+            receipt["resource_uri"],
+            "hooklistener://cli/listen/github-webhooks"
+        );
+        assert_eq!(receipt["endpoint"]["id"], "ep_123");
+        assert_eq!(
+            receipt["resources"]["endpoint"],
+            "hooklistener://endpoints/ep_123"
+        );
+        assert_eq!(
+            receipt["resources"]["requests"],
+            "hooklistener://endpoints/ep_123/requests"
+        );
+    }
+
+    #[test]
+    fn listen_webhook_event_includes_request_resource_uri() {
+        let request = models::WebhookRequest {
+            id: "req_123".to_string(),
+            timestamp: 1_781_000_000,
+            remote_addr: "Tunnel".to_string(),
+            headers: std::collections::HashMap::new(),
+            content_length: 42,
+            method: "POST".to_string(),
+            url: "/webhooks/github".to_string(),
+            path: Some("/webhooks/github".to_string()),
+            query_params: std::collections::HashMap::new(),
+            created_at: "2026-07-08T10:00:00Z".to_string(),
+            body_preview: None,
+            body: None,
+        };
+        let event = TunnelEvent::WebhookReceived(Box::new(request));
+        let receipt = listen_event_receipt(
+            &event,
+            "github-webhooks",
+            "http://localhost:3000/webhooks",
+            None,
+        );
+
+        assert_eq!(receipt["event"], "webhook_received");
+        assert_eq!(receipt["request_id"], "req_123");
+        assert_eq!(receipt["resource_uri"], "hooklistener://requests/req_123");
+        assert_eq!(
+            receipt["endpoint_resource_uri"],
+            "hooklistener://endpoints/by-slug/github-webhooks"
+        );
+        assert_eq!(receipt["request"]["method"], "POST");
+    }
+
+    #[test]
+    fn listen_forward_success_event_includes_delivery_receipt() {
+        let event = TunnelEvent::ForwardSuccess {
+            request_id: "req_123".to_string(),
+            target_url: "http://localhost:3000/webhooks/github".to_string(),
+            status: 204,
+            duration_ms: 37,
+        };
+        let receipt = listen_event_receipt(
+            &event,
+            "github-webhooks",
+            "http://localhost:3000/webhooks",
+            None,
+        );
+
+        assert_eq!(receipt["event"], "forward_succeeded");
+        assert_eq!(receipt["status"], "succeeded");
+        assert_eq!(receipt["status_code"], 204);
+        assert_eq!(receipt["duration_ms"], 37);
+        assert_eq!(
+            receipt["request_resource_uri"],
+            "hooklistener://requests/req_123"
+        );
+    }
+
+    #[test]
+    fn tunnel_established_event_includes_public_url_and_resource() {
+        let event = TunnelEvent::TunnelEstablished {
+            subdomain: "plant-07.hook.events".to_string(),
+            tunnel_id: "tun_123".to_string(),
+            is_static: false,
+        };
+        let receipt = tunnel_event_receipt(&event, "localhost", 3000, Some("org_123"), None);
+
+        assert_eq!(receipt["type"], "receipt");
+        assert_eq!(receipt["event"], "tunnel_established");
+        assert_eq!(receipt["resource_uri"], "hooklistener://tunnels/tun_123");
+        assert_eq!(receipt["public_url"], "https://plant-07.hook.events");
+        assert_eq!(receipt["local_target_url"], "http://localhost:3000");
+        assert_eq!(receipt["organization_id"], "org_123");
+    }
+
+    #[test]
+    fn tunnel_request_event_includes_local_target_and_request_resource() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let event = TunnelEvent::RequestReceived {
+            request_id: "req_123".to_string(),
+            method: "POST".to_string(),
+            path: "webhooks/github".to_string(),
+            headers,
+            body: Some("{\"ok\":true}".to_string()),
+            query_string: "delivery=abc".to_string(),
+        };
+        let receipt = tunnel_event_receipt(&event, "127.0.0.1", 8080, None, Some("dev"));
+
+        assert_eq!(receipt["event"], "request_received");
+        assert_eq!(receipt["resource_uri"], "hooklistener://requests/req_123");
+        assert_eq!(
+            receipt["local_target_url"],
+            "http://127.0.0.1:8080/webhooks/github?delivery=abc"
+        );
+        assert_eq!(receipt["body_size"], 11);
+        assert_eq!(receipt["headers"]["content-type"], "application/json");
+    }
+
+    #[test]
+    fn validate_forward_target_url_requires_http_or_https() {
+        assert!(validate_forward_target_url("http://localhost:3000/webhook").is_ok());
+        assert!(validate_forward_target_url("https://example.com/webhook").is_ok());
+
+        let err = validate_forward_target_url("ftp://example.com/webhook").unwrap_err();
+        assert!(
+            err.to_string().contains("Use http or https"),
             "unexpected error: {}",
             err
         );

@@ -134,8 +134,18 @@ pub enum TunnelEvent {
         error: String,
     },
     WebhookReceived(Box<crate::models::WebhookRequest>),
-    ForwardSuccess,
-    ForwardError,
+    ForwardSuccess {
+        request_id: String,
+        target_url: String,
+        status: u16,
+        duration_ms: u64,
+    },
+    ForwardError {
+        request_id: String,
+        target_url: String,
+        error: String,
+        duration_ms: u64,
+    },
     Reconnecting {
         attempt: u32,
         max_attempts: u32,
@@ -631,7 +641,15 @@ impl TunnelClient {
                     "Request forwarded successfully"
                 );
 
-                let _ = self.event_tx.send(TunnelEvent::ForwardSuccess).await;
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::ForwardSuccess {
+                        request_id: request.id.clone(),
+                        target_url: target_with_query.clone(),
+                        status: status_code,
+                        duration_ms,
+                    })
+                    .await;
 
                 // Send acknowledgment back to server
                 let payload = with_forward_id(
@@ -653,13 +671,23 @@ impl TunnelClient {
             Err(e) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
 
+                let error_message = e.to_string();
+
                 error!(
                     request_id = %request.id,
-                    error = %e,
+                    error = %error_message,
                     "Failed to forward request"
                 );
 
-                let _ = self.event_tx.send(TunnelEvent::ForwardError).await;
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::ForwardError {
+                        request_id: request.id.clone(),
+                        target_url: target_with_query.clone(),
+                        error: error_message.clone(),
+                        duration_ms,
+                    })
+                    .await;
 
                 // Send error acknowledgment
                 let payload = with_forward_id(
@@ -667,7 +695,7 @@ impl TunnelClient {
                         "request_id": &request.id,
                         "status": "error",
                         "proxied_to": &target_with_query,
-                        "error": e.to_string(),
+                        "error": error_message,
                         "duration_ms": duration_ms,
                     }),
                     request.forward_id.as_deref(),
