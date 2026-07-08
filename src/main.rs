@@ -1477,28 +1477,6 @@ fn print_json_line<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
-fn exit_auth_required() -> ! {
-    eprint_status_block(
-        OutputStatus::Err,
-        "AUTH REQUIRED",
-        &[output_field(
-            "ACTION",
-            "Run 'hooklistener login' to authenticate first.",
-        )],
-    );
-    std::process::exit(1);
-}
-
-fn load_authenticated_config() -> Result<config::Config> {
-    let config = config::Config::load()?;
-
-    if !config.is_token_valid() {
-        exit_auth_required();
-    }
-
-    Ok(config)
-}
-
 async fn resolve_listen_endpoint(
     access_token: &str,
     organization_id: Option<String>,
@@ -1555,12 +1533,13 @@ async fn stream_listen_json_events(
 }
 
 async fn run_listen_json(
-    access_token: String,
+    access_token_rx: watch::Receiver<String>,
     endpoint_slug: String,
     target_url: String,
     ws_url: Option<String>,
     organization_id: Option<String>,
 ) -> Result<()> {
+    let access_token = access_token_rx.borrow().clone();
     let endpoint = resolve_listen_endpoint(&access_token, organization_id, &endpoint_slug).await;
 
     print_json_line(&listen_started_receipt(
@@ -1572,7 +1551,7 @@ async fn run_listen_json(
 
     let (event_tx, event_rx) = mpsc::channel(100);
     let tunnel_client = tunnel::TunnelClient::new(
-        access_token,
+        access_token_rx,
         endpoint_slug.clone(),
         target_url.clone(),
         ws_url,
@@ -1637,7 +1616,7 @@ async fn stream_tunnel_json_events(
 }
 
 async fn run_tunnel_json(
-    access_token: String,
+    access_token_rx: watch::Receiver<String>,
     host: String,
     port: u16,
     organization_id: Option<String>,
@@ -1652,7 +1631,7 @@ async fn run_tunnel_json(
 
     let (event_tx, event_rx) = mpsc::channel(100);
     tokio::spawn(run_tunnel_forwarder_connection(
-        access_token,
+        access_token_rx,
         host.clone(),
         port,
         organization_id.clone(),
@@ -1727,18 +1706,18 @@ async fn main() -> Result<()> {
             };
             let _logger = Logger::new(log_config)?;
 
-            let config = load_authenticated_config()?;
-            let access_token = config
-                .access_token
-                .ok_or_else(|| anyhow::anyhow!("No access token found"))?;
+            let mut config = config::Config::load()?;
+            let access_token = ensure_valid_token(&mut config).await?;
+            let selected_organization_id = config.selected_organization_id.clone();
+            let access_token_rx = refreshed_access_token_rx(access_token, config);
 
             if json {
                 run_listen_json(
-                    access_token,
+                    access_token_rx,
                     endpoint,
                     target,
                     ws_url,
-                    config.selected_organization_id.clone(),
+                    selected_organization_id,
                 )
                 .await?;
             } else {
@@ -1756,7 +1735,7 @@ async fn main() -> Result<()> {
 
                 // Create and spawn tunnel client
                 let tunnel_client = tunnel::TunnelClient::new(
-                    access_token,
+                    access_token_rx,
                     endpoint.clone(),
                     target.clone(),
                     ws_url,
@@ -2774,15 +2753,13 @@ async fn main() -> Result<()> {
             };
             let _logger = Logger::new(log_config)?;
 
-            let config = load_authenticated_config()?;
+            let mut config = config::Config::load()?;
             let selected_org = resolve_tunnel_org(org, &config);
-
-            let access_token = config
-                .access_token
-                .ok_or_else(|| anyhow::anyhow!("No access token found"))?;
+            let access_token = ensure_valid_token(&mut config).await?;
+            let access_token_rx = refreshed_access_token_rx(access_token, config);
 
             if json {
-                run_tunnel_json(access_token, host, port, selected_org, slug).await?;
+                run_tunnel_json(access_token_rx, host, port, selected_org, slug).await?;
             } else {
                 // Setup TUI for tunnel command
                 let mut terminal = setup_terminal()?;
@@ -2801,7 +2778,7 @@ async fn main() -> Result<()> {
 
                 // Create and spawn tunnel forwarder manager
                 let reconnect_tx = spawn_tunnel_forwarder_manager(
-                    access_token,
+                    access_token_rx,
                     host,
                     port,
                     selected_org,
@@ -2984,6 +2961,57 @@ fn resolve_tunnel_org(cli_org: Option<String>, config: &config::Config) -> Optio
     cli_org.or_else(|| config.selected_organization_id.clone())
 }
 
+const ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
+const ACCESS_TOKEN_REFRESH_RETRY_SECONDS: u64 = 30;
+
+fn refreshed_access_token_rx(
+    access_token: String,
+    config: config::Config,
+) -> watch::Receiver<String> {
+    let (token_tx, token_rx) = watch::channel(access_token);
+
+    if config.is_refresh_token_valid() {
+        tokio::spawn(refresh_access_token_loop(config, token_tx));
+    }
+
+    token_rx
+}
+
+async fn refresh_access_token_loop(mut config: config::Config, token_tx: watch::Sender<String>) {
+    loop {
+        if config.refresh_token.is_none() || !config.is_refresh_token_valid() {
+            return;
+        }
+
+        sleep(access_token_refresh_delay(&config)).await;
+
+        match refresh_access_token_from_config(&mut config).await {
+            Ok(access_token) => {
+                if token_tx.send(access_token).is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to refresh CLI access token");
+                sleep(Duration::from_secs(ACCESS_TOKEN_REFRESH_RETRY_SECONDS)).await;
+            }
+        }
+    }
+}
+
+fn access_token_refresh_delay(config: &config::Config) -> Duration {
+    let Some(expires_at) = config.token_expires_at.as_ref() else {
+        return Duration::from_secs(0);
+    };
+
+    let duration_until_refresh = expires_at.signed_duration_since(Utc::now())
+        - ChronoDuration::seconds(ACCESS_TOKEN_REFRESH_SKEW_SECONDS);
+
+    duration_until_refresh
+        .to_std()
+        .unwrap_or_else(|_| Duration::from_secs(0))
+}
+
 async fn ensure_valid_token(config: &mut config::Config) -> Result<String> {
     // 1. If access token is still valid, return it
     if config.is_token_valid() {
@@ -2994,25 +3022,44 @@ async fn ensure_valid_token(config: &mut config::Config) -> Result<String> {
     }
 
     // 2. If refresh token is valid, try refreshing
-    if let Some(ref refresh_token) = config.refresh_token.clone()
-        && config.is_refresh_token_valid()
-        && let Ok(response) = api::refresh_access_token(refresh_token).await
-    {
-        let expires_at = Utc::now() + ChronoDuration::seconds(response.expires_in as i64);
-        config.set_tokens(
-            response.access_token.clone(),
-            expires_at,
-            config.refresh_token.clone(),
-            config.refresh_token_expires_at,
-        );
-        config.save()?;
-        return Ok(response.access_token);
+    if config.refresh_token.is_some() && config.is_refresh_token_valid() {
+        return refresh_access_token_from_config(config)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "Session expired. Please run `hooklistener login` to re-authenticate. ({err})"
+                )
+            });
     }
 
     // 3. No valid tokens
     Err(anyhow!(
         "Session expired. Please run `hooklistener login` to re-authenticate."
     ))
+}
+
+async fn refresh_access_token_from_config(config: &mut config::Config) -> Result<String> {
+    let refresh_token = config
+        .refresh_token
+        .clone()
+        .ok_or_else(|| anyhow!("No refresh token found"))?;
+
+    if !config.is_refresh_token_valid() {
+        return Err(anyhow!("Refresh token expired"));
+    }
+
+    let response = api::refresh_access_token(&refresh_token).await?;
+    let expires_at = Utc::now() + ChronoDuration::seconds(response.expires_in as i64);
+
+    config.set_tokens(
+        response.access_token.clone(),
+        expires_at,
+        Some(refresh_token),
+        config.refresh_token_expires_at,
+    );
+    config.save()?;
+
+    Ok(response.access_token)
 }
 
 fn require_organization(cli_org: Option<String>, config: &config::Config) -> Result<String> {
@@ -3822,7 +3869,7 @@ fn print_uptime_checks(response: &api::UptimeChecksResponse) {
 }
 
 fn spawn_tunnel_forwarder_manager(
-    access_token: String,
+    access_token_rx: watch::Receiver<String>,
     host: String,
     port: u16,
     org: Option<String>,
@@ -3833,7 +3880,7 @@ fn spawn_tunnel_forwarder_manager(
 
     tokio::spawn(async move {
         let mut worker = tokio::spawn(run_tunnel_forwarder_connection(
-            access_token.clone(),
+            access_token_rx.clone(),
             host.clone(),
             port,
             org.clone(),
@@ -3849,7 +3896,7 @@ fn spawn_tunnel_forwarder_manager(
             while reconnect_rx.try_recv().is_ok() {}
 
             worker = tokio::spawn(run_tunnel_forwarder_connection(
-                access_token.clone(),
+                access_token_rx.clone(),
                 host.clone(),
                 port,
                 org.clone(),
@@ -3866,7 +3913,7 @@ fn spawn_tunnel_forwarder_manager(
 }
 
 async fn run_tunnel_forwarder_connection(
-    access_token: String,
+    access_token_rx: watch::Receiver<String>,
     host: String,
     port: u16,
     org: Option<String>,
@@ -3874,7 +3921,7 @@ async fn run_tunnel_forwarder_connection(
     event_tx: mpsc::Sender<TunnelEvent>,
 ) {
     let tunnel_forwarder =
-        tunnel::TunnelForwarder::new(access_token, host, port, org, slug, event_tx);
+        tunnel::TunnelForwarder::new(access_token_rx, host, port, org, slug, event_tx);
 
     if let Err(e) = tunnel_forwarder
         .connect_with_reconnect(tunnel::ReconnectConfig::default())

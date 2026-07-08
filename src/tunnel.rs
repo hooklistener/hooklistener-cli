@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, error::Error as WsError, http::StatusCode},
@@ -247,7 +247,7 @@ pub fn calculate_backoff(attempt: u32, config: &ReconnectConfig) -> Duration {
 
 /// Tunnel client for WebSocket connection to Hooklistener server
 pub struct TunnelClient {
-    access_token: String,
+    access_token_rx: watch::Receiver<String>,
     endpoint_slug: String,
     target_url: String,
     base_url: String,
@@ -256,7 +256,7 @@ pub struct TunnelClient {
 
 impl TunnelClient {
     pub fn new(
-        access_token: String,
+        access_token_rx: watch::Receiver<String>,
         endpoint_slug: String,
         target_url: String,
         base_url: Option<String>,
@@ -268,7 +268,7 @@ impl TunnelClient {
             .unwrap_or_else(|| "wss://api.hooklistener.com".to_string());
 
         Self {
-            access_token,
+            access_token_rx,
             endpoint_slug,
             target_url,
             base_url,
@@ -285,12 +285,13 @@ impl TunnelClient {
         );
 
         // Build WebSocket URL with auth token
+        let access_token = self.access_token_rx.borrow().clone();
         let ws_url = format!(
             "{}/socket/websocket?token={}",
             self.base_url
                 .replace("https://", "wss://")
                 .replace("http://", "ws://"),
-            self.access_token
+            access_token
         );
 
         debug!("WebSocket URL: {}", ws_url);
@@ -794,7 +795,7 @@ impl TunnelClient {
 
 /// HTTP Tunnel forwarder - connects to /tunnel endpoint and forwards HTTP requests
 pub struct TunnelForwarder {
-    access_token: String,
+    access_token_rx: watch::Receiver<String>,
     local_host: String,
     local_port: u16,
     org_id: Option<String>,
@@ -805,7 +806,7 @@ pub struct TunnelForwarder {
 
 impl TunnelForwarder {
     pub fn new(
-        access_token: String,
+        access_token_rx: watch::Receiver<String>,
         local_host: String,
         local_port: u16,
         org_id: Option<String>,
@@ -816,7 +817,7 @@ impl TunnelForwarder {
             .unwrap_or_else(|_| "https://app.hooklistener.com".to_string());
 
         Self {
-            access_token,
+            access_token_rx,
             local_host,
             local_port,
             org_id,
@@ -836,12 +837,13 @@ impl TunnelForwarder {
         let _ = self.event_tx.send(TunnelEvent::Connecting).await;
 
         // Build WebSocket URL - connect to /tunnel/websocket endpoint (Phoenix default)
+        let access_token = self.access_token_rx.borrow().clone();
         let ws_url = format!(
             "{}/tunnel/websocket?token={}",
             self.base_url
                 .replace("https://", "wss://")
                 .replace("http://", "ws://"),
-            self.access_token
+            access_token
         );
 
         debug!("Tunnel WebSocket URL: {}", ws_url);
