@@ -1,85 +1,23 @@
 # Hooklistener CLI
 
 [![CI](https://github.com/hooklistener/hooklistener-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hooklistener/hooklistener-cli/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/hooklistener/hooklistener-cli/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/hooklistener/hooklistener-cli/actions/workflows/codeql.yml)
 [![Release](https://img.shields.io/github/v/release/hooklistener/hooklistener-cli?sort=semver)](https://github.com/hooklistener/hooklistener-cli/releases)
 [![crates.io](https://img.shields.io/crates/v/hooklistener-cli.svg)](https://crates.io/crates/hooklistener-cli)
 [![npm](https://img.shields.io/npm/v/hooklistener.svg)](https://www.npmjs.com/package/hooklistener)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Debug, forward, share, and monitor webhooks from your terminal.
+Inspect webhooks, replay failures, and expose localhost from your terminal.
 
-Hooklistener CLI is a Rust-based command-line tool for developers who need to inspect inbound webhooks, replay requests to local services, expose localhost with public URLs, and manage Hooklistener resources without leaving the terminal. It combines an interactive terminal UI with automation-friendly commands for endpoints, tunnels, request sharing, uptime monitoring, diagnostics, and shell integration.
-
-![Hooklistener CLI Demo](docs/images/hooklistener-cli.gif)
-
-## Why Hooklistener CLI
-
-- Inspect webhook traffic in a fast, keyboard-first terminal interface.
-- Forward requests from existing Hooklistener endpoints straight to your local app.
-- Expose a local service with a public tunnel when an external provider needs a callback URL.
-- Replay captured requests, inspect forward attempts, and share payloads with teammates.
-- Create temporary anonymous endpoints when you need quick testing without login.
-- Manage organizations, endpoints, tunnels, shares, and monitors with scriptable commands and JSON output.
-
-## Use Cases
-
-| Use case | Command | Best when |
-| --- | --- | --- |
-| Forward webhook traffic to localhost | `hooklistener listen` | You already have a Hooklistener endpoint receiving real events |
-| Expose a local app publicly | `hooklistener tunnel` | A third-party service needs to call your machine directly |
-| Manage webhook endpoints and captured requests | `hooklistener endpoint` | You want to create endpoints, inspect payloads, and replay traffic |
-| Reserve a stable tunnel subdomain | `hooklistener static-tunnel` | You need a persistent public URL for a development workflow |
-| Create a temporary endpoint without login | `hooklistener anon` | You want a short-lived, low-friction test endpoint |
-| Share a request with teammates | `hooklistener share` | You need to send a captured payload or replay history for review |
-| Monitor endpoint uptime | `hooklistener monitor` | You want recurring checks and failure visibility for webhook URLs |
+Hooklistener CLI combines live terminal views with scriptable commands for forwarding webhook traffic, managing captures, sharing requests, and monitoring endpoints.
 
 ## Installation
 
-Choose the install method that fits your environment.
+| Method | Command |
+| --- | --- |
+| Homebrew (macOS or Linux) | `brew install hooklistener/tap/hooklistener` |
+| npm | `npm install -g hooklistener` |
+| Cargo | `cargo install hooklistener-cli` |
 
-### Homebrew (macOS / Linux)
-
-```bash
-brew tap hooklistener/tap
-brew install hooklistener
-```
-
-### npm
-
-```bash
-npm install -g hooklistener
-```
-
-### Cargo
-
-```bash
-cargo install hooklistener-cli
-```
-
-### Quick Install Script
-
-macOS / Linux:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.sh | sh
-```
-
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.ps1 | iex
-```
-
-### Manual Binary Install
-
-Download the appropriate archive from the [Releases page](https://github.com/hooklistener/hooklistener-cli/releases), extract it, and place the `hooklistener` binary somewhere on your `PATH`.
-
-Example on macOS or Linux:
-
-```bash
-sudo mv hooklistener /usr/local/bin/hooklistener
-```
+Prebuilt binaries are available on the [Releases page](https://github.com/hooklistener/hooklistener-cli/releases). You can also use the install scripts for [macOS or Linux](https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.sh) and [Windows PowerShell](https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.ps1).
 
 Verify the installation:
 
@@ -87,410 +25,166 @@ Verify the installation:
 hooklistener --version
 ```
 
-## Quick Start
+## Quick start
 
-### Authenticated workflow
+Sign in, then expose your local server with a public HTTPS URL:
 
-1. Sign in:
+```bash
+hooklistener login
+hooklistener tunnel --port 3000
+```
 
-   ```bash
-   hooklistener login
-   ```
+Use the public URL printed by the CLI as the callback URL in Stripe, GitHub, Shopify, or any other webhook provider. Incoming requests and responses appear in the live terminal view.
 
-2. Pick the default organization for API-backed commands:
+If the provider already sends events to a Hooklistener debug endpoint, forward those events to your local app instead:
 
-   ```bash
-   hooklistener org list
-   hooklistener org use <organization-id>
-   ```
+```bash
+hooklistener listen stripe-sandbox \
+  --target http://localhost:3000/webhooks/stripe
+```
 
-3. Create a debug endpoint and start forwarding traffic to your local app:
+### Try it without logging in
 
-   ```bash
-   hooklistener endpoint create "Stripe Sandbox" --slug stripe-sandbox
-   hooklistener listen stripe-sandbox --target http://localhost:3000/webhooks/stripe
-   ```
-
-4. Inspect, replay, or list captured traffic:
-
-   ```bash
-   hooklistener endpoint requests <endpoint-id>
-   hooklistener endpoint request <endpoint-id> <request-id>
-   hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks/stripe
-   hooklistener cases run <endpoint-id> --target http://localhost:3000/webhooks/stripe --wait
-   ```
-
-### No-login workflow
-
-If you want to evaluate Hooklistener quickly or create a short-lived endpoint for temporary sharing, use anonymous endpoints:
+Create a temporary anonymous endpoint:
 
 ```bash
 hooklistener anon create --ttl 3600
 ```
 
-The command returns the temporary endpoint details. Use the returned endpoint ID and viewer token with `hooklistener anon show`, `hooklistener anon events`, and `hooklistener anon event`.
+The result includes the endpoint URL, endpoint ID, and viewer token needed to inspect captured events.
 
-## Core Workflows
+## Choose the right workflow
 
-### Authenticate and manage session state
+| Goal | Command | Use it when |
+| --- | --- | --- |
+| Forward an existing Hooklistener endpoint | `hooklistener listen` | Events already arrive at Hooklistener and should be forwarded to your local app |
+| Expose a local server | `hooklistener tunnel` | A provider needs a public URL that points directly to localhost |
+| Inspect and replay captured requests | `hooklistener endpoint` | You need stored payloads, headers, and forwarding history |
+| Run saved endpoint cases | `hooklistener cases` | You want to replay a repeatable test suite against a URL or saved target |
+| Create a temporary endpoint | `hooklistener anon` | You need a short-lived capture URL without an account |
+| Share a captured request | `hooklistener share` | A teammate needs access to a payload and its forwarding history |
+| Check an HTTP endpoint | `hooklistener monitor` | You need recurring uptime checks and failure visibility |
 
-Most commands that interact with your Hooklistener account require login. The CLI uses a secure device flow and stores session state locally.
+Reserved static tunnel slugs depend on your Hooklistener plan.
 
-```bash
-hooklistener login
-hooklistener login --force
-hooklistener logout
-```
+## Work with captured requests
 
-### Select an organization
-
-Most account-backed commands operate against a selected organization. Set it once, or override it per command with `--org`.
+Select an organization once for account-backed commands:
 
 ```bash
 hooklistener org list
 hooklistener org use <organization-id>
-hooklistener org clear
 ```
 
-You can inspect or set the same value directly through config:
+Create an endpoint, inspect its traffic, and replay a request:
 
 ```bash
-hooklistener config show
-hooklistener config set selected_organization_id <organization-id>
-```
-
-### Forward webhooks from an existing endpoint
-
-Use `listen` when the external service is already posting to a Hooklistener endpoint and you want those requests forwarded into your local environment.
-
-```bash
-# Forward to the default local target
-hooklistener listen my-endpoint
-
-# Forward to a specific local route
-hooklistener listen my-endpoint --target http://localhost:8080/webhooks
-
-# Stream newline-delimited JSON receipts and request events for agents or scripts
-hooklistener --json listen my-endpoint --target http://localhost:8080/webhooks
-
-# Override the WebSocket endpoint for advanced or self-hosted setups
-hooklistener listen my-endpoint --ws-url wss://your-instance.example.com/socket/websocket
-```
-
-This workflow is ideal when you want real inbound traffic plus an interactive terminal experience for inspecting headers, bodies, metadata, and replay results. With `--json`, `listen` skips the TUI and streams newline-delimited JSON events with stable `resource_uri` fields for captured requests.
-
-### Create and manage debug endpoints
-
-Use `endpoint` to manage endpoints and the requests captured by them.
-
-```bash
-# Create and inspect endpoints
 hooklistener endpoint create "Billing Webhooks" --slug billing-webhooks
-hooklistener endpoint list
-hooklistener endpoint show <endpoint-id>
-
-# Browse captured requests
-hooklistener endpoint requests <endpoint-id> --page 1 --page-size 50
+hooklistener endpoint requests <endpoint-id>
 hooklistener endpoint request <endpoint-id> <request-id>
-
-# Replay a captured request to a target URL
-hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks --dry-run
-hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks
-
-# Run every saved case for an endpoint
-hooklistener cases run <endpoint-id> --target http://localhost:3000/webhooks --wait
-hooklistener cases run <endpoint-id> --target cli
-hooklistener cases run <endpoint-id> --target <saved-target-id> --timeout 60s
-
-# Review replay attempts
-hooklistener endpoint forwards <endpoint-id> <request-id>
-hooklistener endpoint forward <forward-id>
-
-# Delete captured traffic or the endpoint itself
-hooklistener endpoint delete-request <endpoint-id> <request-id>
-hooklistener endpoint delete <endpoint-id>
+hooklistener endpoint forward-request \
+  <endpoint-id> <request-id> http://localhost:3000/webhooks
 ```
 
-Destructive commands show the resource and organization before asking for confirmation. In scripts, non-interactive shells, and JSON mode, add `--yes` after verifying the identifiers.
-
-### Expose a local server with a public tunnel
-
-Use `tunnel` when a provider needs to reach your machine directly. Hooklistener creates a public URL and forwards traffic to your chosen host and port.
+Run every saved case for an endpoint and wait for the result:
 
 ```bash
-# Default: localhost:3000
-hooklistener tunnel
-
-# Forward to a different local port
-hooklistener tunnel --port 8080
-
-# Forward to a specific host and port
-hooklistener tunnel --host 127.0.0.1 --port 5000
-
-# Request a persistent slug for a reserved static tunnel
-hooklistener tunnel --slug my-cool-app
-
-# Stream newline-delimited JSON tunnel receipts and request events
-hooklistener --json tunnel --host 127.0.0.1 --port 5000
+hooklistener cases run <endpoint-id> \
+  --target http://localhost:3000/webhooks \
+  --wait --timeout 60s
 ```
 
-`--slug` is intended for reserved static tunnel slugs and may depend on your Hooklistener plan. With `--json`, `tunnel` skips the TUI and emits a `tunnel_established` receipt containing the public URL, local target URL, `resource_uri`, and follow-up request events.
+Use `hooklistener <command> --help` for every option and subcommand.
 
-### Reserve and manage static tunnel slugs
+## Command overview
 
-Static tunnel slugs let you request a stable public subdomain with `hooklistener tunnel --slug`.
+| Command | Purpose |
+| --- | --- |
+| `login`, `logout` | Manage the authenticated session |
+| `org`, `config` | Select an organization and inspect local configuration |
+| `listen` | Stream an existing endpoint and forward events to a local URL |
+| `tunnel`, `static-tunnel` | Expose localhost and manage reserved tunnel slugs |
+| `endpoint`, `cases` | Manage captures, requests, forwards, and saved replay cases |
+| `anon` | Create and inspect temporary anonymous endpoints |
+| `share` | Create, inspect, and revoke public request links |
+| `monitor` | Manage uptime monitors and their checks |
+| `diagnostics`, `clean-logs` | Collect support information and remove old logs |
+| `completions`, `update` | Generate shell completions and update direct binary installs |
 
-```bash
-hooklistener static-tunnel list
-hooklistener static-tunnel create my-cool-app --name "Local App"
-hooklistener static-tunnel delete <slug-id>
-```
+Run `hooklistener --help` for the complete command list.
 
-Static tunnel slugs are plan-gated. Document them in team workflows when you need a consistent callback URL for local development or demos.
+## Automation
 
-### Create temporary anonymous endpoints
-
-Anonymous endpoints are useful when you need a short-lived endpoint without authenticating first.
-
-```bash
-# Create a temporary endpoint with a one-hour TTL
-hooklistener anon create --ttl 3600
-
-# Check endpoint status
-hooklistener anon show <endpoint-id>
-
-# List or inspect captured events using the viewer token returned at creation time
-hooklistener anon events <endpoint-id> --token <viewer-token>
-hooklistener anon event <endpoint-id> <event-id> --token <viewer-token>
-```
-
-This is the fastest way to test a webhook payload, share a temporary endpoint, or validate a sender integration without setting up an account-backed workflow.
-
-### Share a captured request
-
-Use `share` to generate a public link for a captured request. Shares can have expirations, optional passwords, and optional replay history attached.
-
-```bash
-# Create a share link
-hooklistener share create <debug-request-id> --expires-in-hours 24 --include-forwards
-
-# Add password protection when needed
-hooklistener share create <debug-request-id> --password my-secret
-
-# List, view, and revoke shares
-hooklistener share list <debug-request-id>
-hooklistener share show <share-token>
-hooklistener share revoke <share-token>
-```
-
-### Monitor an endpoint or webhook URL
-
-Use `monitor` when you want recurring checks against an HTTP endpoint and a simple operational view from the CLI.
-
-```bash
-# Create a monitor
-hooklistener monitor create "Production Webhook" https://example.com/webhook --interval 5 --expected-status 200
-
-# Require a string in the response body
-hooklistener monitor create "Healthcheck" https://example.com/health --body-contains ok
-
-# Disable email notifications explicitly
-hooklistener monitor create "Internal Healthcheck" https://example.com/health --email=false
-
-# Review and manage monitors
-hooklistener monitor list
-hooklistener monitor show <monitor-id>
-hooklistener monitor checks <monitor-id>
-hooklistener monitor update <monitor-id> --interval 10 --failure-threshold 3
-hooklistener monitor delete <monitor-id>
-```
-
-## Automation and Shell Integration
-
-Most non-interactive commands support `--json`, which makes the CLI useful in scripts, internal tooling, and CI jobs.
+Most non-interactive commands support `--json` for scripts, agents, and CI:
 
 ```bash
 hooklistener --json org list
-hooklistener --json endpoint list
 hooklistener --json endpoint request <endpoint-id> <request-id>
-hooklistener --json endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhooks --dry-run
-hooklistener --json listen <endpoint-slug>
-hooklistener --json tunnel --port 3000
-hooklistener --json share list <debug-request-id>
-hooklistener --json monitor list
+hooklistener --json endpoint forward-request \
+  <endpoint-id> <request-id> http://localhost:3000/webhooks --dry-run
 ```
 
-`endpoint forward-request --json` returns a durable command receipt with `resource_uri`, `poll_url`, and `next_actions` fields so automation can inspect the queued forward without parsing human output.
-Long-running `listen --json` and `tunnel --json` commands stream newline-delimited JSON. Each line is one receipt or event object, so agents can read startup state, connection status, captured request `resource_uri` values, and forwarding outcomes incrementally.
+Long-running `listen --json` and `tunnel --json` commands emit newline-delimited JSON. Each line is a receipt or event, so consumers can process connection state, captured request URIs, and forwarding outcomes as they happen.
 
-Runtime failures use the same machine-readable envelope:
+```bash
+hooklistener --json listen <endpoint-slug>
+hooklistener --json tunnel --port 3000
+```
+
+Runtime errors use a consistent envelope:
 
 ```json
 {"error":{"causes":[],"code":"command_failed","hint":null,"message":"..."},"ok":false}
 ```
 
-`login` and `completions` do not support JSON and reject that combination explicitly. Exit status `0` means success, `1` means a runtime or command failure, and `2` means command-line parsing failed. Destructive commands in automation require `--yes`.
+Exit status `0` means success, `1` means a runtime failure, and `2` means command-line parsing failed. Destructive commands in scripts require `--yes`. `login` and `completions` do not support JSON output.
 
-## Terminal Output and Accessibility
+## Terminal behavior
 
-Human output uses terminal-aware styling by default. Styling is removed when stdout or stderr is redirected, when `NO_COLOR` is set, or when you pass `--color never`. Use `--color always` only when the destination supports ANSI control sequences.
+Human output adapts to the terminal. Styling is disabled when output is redirected, when `NO_COLOR` is set, or when you pass `--color never`.
 
 ```bash
 hooklistener --color never endpoint list
 NO_COLOR=1 hooklistener monitor list
 ```
 
-The same policy applies to the TUI. In monochrome mode, state remains visible through labels, status tokens, selection carets, and text weight. The TUI is keyboard operated; its status bar shows the shortcuts available in the current view.
-
-Tunnel filters accept free text and field filters:
-
-```text
-method:post
-status:500
-path:/billing
-header:stripe
-pinned:true
-```
-
-Request exports first use the system clipboard. If a clipboard is unavailable, such as in some SSH or headless sessions, the TUI writes the requested cURL or JSON export to the current directory and reports the path.
-
-Generate shell completions for your shell:
-
-```bash
-hooklistener completions bash > ~/.local/share/bash-completion/completions/hooklistener
-hooklistener completions zsh > ~/.zfunc/_hooklistener
-hooklistener completions fish > ~/.config/fish/completions/hooklistener.fish
-```
-
-Available completion targets are `bash`, `zsh`, `fish`, `power-shell`, and `elvish`.
+Live views are keyboard operated and show the available shortcuts in their status bar. Generate completions with `hooklistener completions <shell>`; accepted shell names are `bash`, `zsh`, `fish`, `power-shell`, and `elvish`.
 
 ## Configuration
 
-The CLI stores configuration under your operating system's standard config directory.
-On Linux, that is typically:
+Hooklistener stores its configuration and logs in the standard configuration directory for your operating system. On Linux, the default locations are:
 
 ```text
 ~/.config/hooklistener/config.json
-```
-
-By default, logs are written under the same config root.
-On Linux, that is typically:
-
-```text
 ~/.config/hooklistener/logs
 ```
 
-The config file stores items such as:
-
-- Access and refresh token metadata
-- Selected default organization
-- Cached update-check information
-
-The CLI manages tokens automatically. You generally only need to care about configuration when selecting an organization, overriding runtime settings, or debugging local issues.
-
-### Environment variables
-
-Use these variables for advanced setups, testing, or self-hosting:
-
-- `HOOKLISTENER_API_URL`: Override the base HTTP API URL.
-- `HOOKLISTENER_WS_URL`: Override the WebSocket base URL used by tunnels and listeners.
-- `HOOKLISTENER_DEVICE_PORTAL_URL`: Override the device authentication portal URL.
-
-### Logging options
-
-All commands support these global logging flags:
-
-- `--log-level <trace|debug|info|warn|error>`
-- `--log-dir <path>`
-- `--log-stdout`
-
-## Diagnostics and Updates
-
-Generate a diagnostic bundle for support or debugging:
+Inspect the active configuration with:
 
 ```bash
-hooklistener diagnostics --output ./debug-bundle
+hooklistener config show
 ```
 
-Clean up older log files:
+Advanced and self-hosted setups can override the service URLs with `HOOKLISTENER_API_URL`, `HOOKLISTENER_WS_URL`, and `HOOKLISTENER_DEVICE_PORTAL_URL`.
 
-```bash
-hooklistener clean-logs --keep 5
-```
+## Documentation
 
-Update behavior depends on how you installed the CLI:
-
-```bash
-# Direct binary installs
-hooklistener update
-
-# Homebrew installs
-brew upgrade hooklistener
-
-# npm installs
-npm update -g hooklistener
-
-# Cargo installs
-cargo install hooklistener-cli
-```
-
-## FAQ
-
-### Do I need to log in to use the CLI?
-
-No. Most account-backed workflows require login, but `hooklistener anon ...` is designed for temporary anonymous endpoints and does not require authentication.
-
-### What is the difference between `listen` and `tunnel`?
-
-Use `listen` when Hooklistener is already receiving webhook traffic on one of your endpoints and you want those captured requests forwarded to your local app. Use `tunnel` when an external system needs a public URL that points directly at your machine.
-
-### How do I choose the organization a command uses?
-
-Set a default once with `hooklistener org use <organization-id>`, or pass `--org <organization-id>` to supported commands when you want to override it for a single invocation.
-
-### Can I use Hooklistener CLI in scripts or CI?
-
-Yes. Use `--json` with non-interactive commands to get machine-readable output. Interactive workflows such as live terminal views are better suited to local development sessions.
-
-### Where are configuration and logs stored?
-
-They are stored under your operating system's config directory. On Linux, that is typically `~/.config/hooklistener/config.json` for config and `~/.config/hooklistener/logs` for logs.
-
-### Are static tunnel slugs available on every plan?
-
-Not necessarily. Static tunnel slugs are plan-gated. If `hooklistener tunnel --slug ...` is part of your workflow, confirm that your Hooklistener plan includes reserved static tunnels.
-
-### How can I share a webhook payload safely?
-
-Use `hooklistener share create` with an expiration and, when needed, `--password`. Revoke it later with `hooklistener share revoke <share-token>`.
-
-### How does `hooklistener update` work?
-
-For direct binary installs, `hooklistener update` performs the self-update. If you installed through Homebrew, npm, or Cargo, use the corresponding package manager command instead.
+- [Hooklistener documentation](https://docs.hooklistener.com)
+- [CLI releases](https://github.com/hooklistener/hooklistener-cli/releases)
+- [Issue tracker](https://github.com/hooklistener/hooklistener-cli/issues)
 
 ## Development
 
-### Prerequisites
-
-- Rust 1.75+
-- Cargo
-
-### Build and run
+Building from source requires Rust 1.85 or later and Cargo.
 
 ```bash
 git clone https://github.com/hooklistener/hooklistener-cli.git
 cd hooklistener-cli
-
-# Run locally
-cargo run -- listen my-endpoint
-
-# Build a release binary
-cargo build --release
+cargo build
+cargo test
 ```
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete development workflow and contribution guidelines.
 
 ## License
 
