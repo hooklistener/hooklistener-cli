@@ -1,5 +1,6 @@
 ---
 source: src/ui.rs
+assertion_line: 3300
 expression: snapshot
 ---
 
@@ -9,11 +10,11 @@ expression: snapshot
  │                                                                                      │
  └──────────────────────────────────────────────────────────────────────────────────────┘
  ┌ Enter Target URL ────────────────────────────────────────────────────────────────────┐
- │http://localhost:8080/github                                                          │
+ │http://localhost:8080/github▎                                                         │
  └──────────────────────────────────────────────────────────────────────────────────────┘
+                                 [OK] Target URL is ready.
 
                                Enter: Forward | Esc: Cancel
-
                          Example: https://your-server.com/webhook
 
 

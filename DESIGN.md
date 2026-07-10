@@ -47,12 +47,13 @@ components:
     textColor: "{colors.warning}"
     typography: "{typography.label}"
   panel:
-    backgroundColor: "{colors.surface}"
-    textColor: "{colors.ink}"
+    backgroundColor: "terminal default"
+    textColor: "terminal default"
     rounded: "{rounded.none}"
   selection-row:
-    backgroundColor: "{colors.selection}"
-    textColor: "{colors.ink}"
+    backgroundColor: "terminal default"
+    textColor: "terminal default"
+    indicator: "▸"
 ---
 
 # Design System: Hooklistener CLI
@@ -63,7 +64,7 @@ components:
 
 Hooklistener CLI should feel like a durable terminal instrument for live webhook operations. The interface is not decorative software; it is a working surface for inspecting traffic, forwarding events, replaying payloads, and proving what happened. The design language should draw from U.S. Graphics, technical manuals, public infrastructure labels, lab instruments, and control room readouts.
 
-The current codebase contains a soft pastel Ratatui palette in `src/ui.rs` and `src/syntax.rs`. Treat that as legacy implementation detail, not the desired long-term identity. The target system is industrial, restrained, monospace-native, and robust. It keeps useful terminal glyphs such as arrows, rules, selection carets, box drawing, and spinners, but rejects emoji as interface.
+The runtime palette in `src/theme.rs` maps these semantic roles to terminal-controlled ANSI colors. The target system is industrial, restrained, monospace-native, and robust. It keeps useful terminal glyphs such as arrows, rules, selection carets, box drawing, and spinners, but rejects emoji as interface.
 
 **Key Characteristics:**
 
@@ -102,11 +103,15 @@ The palette is a restrained industrial terminal palette: near-black surfaces, wa
 
 ### Named Rules
 
+**The Terminal Theme Rule.** The hex values document the dark reference palette, not colors to paint unconditionally. TUI text and backgrounds inherit the user's terminal defaults, while semantic accents use ANSI roles resolved by the active terminal theme. Selection uses a caret and weight rather than a fixed background fill. `NO_COLOR` and `--color never` remove every foreground and background color while preserving labels, status tokens, carets, and text weight.
+
 **The State-First Rule.** Color may reinforce state, but the words must carry the state. `connected`, `pending`, `ERR`, `200`, and `[OK]` must remain meaningful when color is removed.
+
+**The Feedback Rule.** Operational feedback has an explicit success, info, warning, or error kind. The token and message determine meaning; semantic color only reinforces it.
 
 **The Accent Scarcity Rule.** Amber and blue are operational signals, not decoration. If more than one accent competes in the same view, reduce the weaker one to muted ink.
 
-**The Legacy Pastel Rule.** Do not add new pastel roles. Existing pastel constants should be migrated toward the industrial palette as affected screens are touched.
+**The Legacy Pastel Rule.** Do not add pastel roles.
 
 ## 3. Typography
 

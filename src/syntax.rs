@@ -1,22 +1,10 @@
 use std::borrow::Cow;
 
+use crate::theme as colors;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-
-// Syntax roles mapped to the terminal design palette.
-mod colors {
-    use ratatui::style::Color;
-
-    pub const STRUCTURE: Color = Color::Rgb(212, 177, 95); // Braces, brackets
-    pub const KEY: Color = Color::Rgb(127, 167, 200); // JSON keys
-    pub const STRING: Color = Color::Rgb(143, 174, 121); // String values
-    pub const NUMBER: Color = Color::Rgb(212, 177, 95); // Numbers
-    pub const KEYWORD: Color = Color::Rgb(127, 167, 200); // true, false, null
-    pub const PUNCTUATION: Color = Color::Rgb(143, 147, 138); // Commas
-    pub const TEXT: Color = Color::Rgb(216, 216, 210); // Colons, whitespace
-}
 
 pub struct JsonHighlighter;
 

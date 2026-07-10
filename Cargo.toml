@@ -33,7 +33,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "ansi", "chrono"] }
 tracing-appender = "0.2"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
 clap_complete = "4.6"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 base64 = "0.22"

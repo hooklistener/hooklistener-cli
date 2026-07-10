@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashMap, VecDeque};
 
+pub const MAX_LISTENING_REQUESTS: usize = 500;
 pub const MAX_TUNNEL_REQUESTS: usize = 500;
 pub const MAX_BODY_SIZE: usize = 256 * 1024;
 pub const TRUNCATED_BODY_MARKER: &str = "\n...(truncated)";
@@ -42,6 +43,31 @@ pub enum AppState {
         message: String,
         hint: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedbackKind {
+    Success,
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug)]
+pub struct FeedbackMessage {
+    pub kind: FeedbackKind,
+    pub message: String,
+    pub created_at: std::time::Instant,
+}
+
+impl FeedbackMessage {
+    fn new(kind: FeedbackKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            created_at: std::time::Instant::now(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -272,7 +298,7 @@ pub struct App {
     pub logo_frame: Option<String>,
 
     // Listening mode state (debug endpoints)
-    pub listening_requests: Vec<WebhookRequest>,
+    pub listening_requests: VecDeque<WebhookRequest>,
     pub listening_stats: ListeningStats,
     pub listening_connected: bool,
     pub listening_error: Option<String>,
@@ -304,8 +330,11 @@ pub struct App {
     pub tunnel_pinned_only: bool,
 
     // Status messages (auto-expire)
-    pub tunnel_status_message: Option<(String, std::time::Instant)>,
-    pub status_message: Option<(String, std::time::Instant)>,
+    pub tunnel_status_message: Option<FeedbackMessage>,
+    pub status_message: Option<FeedbackMessage>,
+
+    // Accessible display mode strips all foreground and background colors after rendering.
+    pub monochrome: bool,
 
     // Search/filter
     pub search_active: bool,
@@ -332,7 +361,7 @@ impl App {
             should_quit: false,
             loading_frame: 0,
             logo_frame: None,
-            listening_requests: Vec::new(),
+            listening_requests: VecDeque::new(),
             listening_stats: ListeningStats::default(),
             listening_connected: false,
             listening_error: None,
@@ -362,6 +391,7 @@ impl App {
             tunnel_pinned_only: false,
             tunnel_status_message: None,
             status_message: None,
+            monochrome: false,
             search_active: false,
             search_query: String::new(),
         }
@@ -428,14 +458,21 @@ impl App {
                     }
                     KeyCode::Char('f') => {
                         self.forward_url_input.clear();
+                        self.status_message = None;
                         self.state = AppState::InputForwardUrl;
                     }
-                    KeyCode::Char('r')
+                    KeyCode::Char('r') => {
                         if !self.forward_url_input.is_empty()
                             && self.is_valid_url(&self.forward_url_input)
-                            && self.selected_request.is_some() =>
-                    {
-                        self.state = AppState::ForwardingRequest;
+                            && self.selected_request.is_some()
+                        {
+                            self.state = AppState::ForwardingRequest;
+                        } else {
+                            self.set_status_feedback(
+                                FeedbackKind::Warning,
+                                "Replay unavailable: forward this request to set a valid target URL.",
+                            );
+                        }
                     }
                     KeyCode::Char('e') if self.selected_request.is_some() => {
                         self.state = AppState::ExportMenu;
@@ -800,49 +837,33 @@ impl App {
                 KeyCode::Char('1') | KeyCode::Char('c') => {
                     if let Some(request) = &self.selected_request {
                         let curl = Self::generate_curl(request);
-                        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&curl)) {
-                            Ok(_) => {
-                                self.status_message = Some((
-                                    "cURL command copied to clipboard!".into(),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            Err(e) => {
-                                self.status_message = Some((
-                                    format!("Failed to copy: {}", e),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                        }
+                        let request_id = request.id.clone();
+                        self.copy_or_save_export(
+                            &curl,
+                            &request_id,
+                            "sh",
+                            "cURL command copied to clipboard.",
+                        );
                     }
                     self.state = AppState::ShowRequestDetail;
                 }
                 KeyCode::Char('2') | KeyCode::Char('j') => {
                     if let Some(request) = &self.selected_request {
+                        let request_id = request.id.clone();
                         match Self::generate_json_export(request) {
                             Ok(json) => {
-                                match arboard::Clipboard::new()
-                                    .and_then(|mut cb| cb.set_text(&json))
-                                {
-                                    Ok(_) => {
-                                        self.status_message = Some((
-                                            "JSON copied to clipboard!".into(),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        self.status_message = Some((
-                                            format!("Failed to copy: {}", e),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
+                                self.copy_or_save_export(
+                                    &json,
+                                    &request_id,
+                                    "json",
+                                    "JSON copied to clipboard.",
+                                );
                             }
                             Err(e) => {
-                                self.status_message = Some((
-                                    format!("Failed to serialize: {}", e),
-                                    std::time::Instant::now(),
-                                ));
+                                self.set_status_feedback(
+                                    FeedbackKind::Error,
+                                    format!("Failed to serialize request: {e}"),
+                                );
                             }
                         }
                     }
@@ -854,17 +875,29 @@ impl App {
                 _ => {}
             },
             AppState::InputForwardUrl => match key.code {
-                KeyCode::Enter
-                    if !self.forward_url_input.is_empty()
-                        && self.is_valid_url(&self.forward_url_input) =>
-                {
-                    self.state = AppState::ForwardingRequest;
+                KeyCode::Enter => {
+                    if self.forward_url_input.is_empty() {
+                        self.set_status_feedback(
+                            FeedbackKind::Error,
+                            "Enter a target URL before forwarding.",
+                        );
+                    } else if !self.is_valid_url(&self.forward_url_input) {
+                        self.set_status_feedback(
+                            FeedbackKind::Error,
+                            "Target URL needs a host and an http:// or https:// scheme.",
+                        );
+                    } else {
+                        self.status_message = None;
+                        self.state = AppState::ForwardingRequest;
+                    }
                 }
                 KeyCode::Char(c) => {
                     self.forward_url_input.push(c);
+                    self.status_message = None;
                 }
                 KeyCode::Backspace => {
                     self.forward_url_input.pop();
+                    self.status_message = None;
                 }
                 KeyCode::Esc => {
                     self.state = AppState::ShowRequestDetail;
@@ -881,8 +914,22 @@ impl App {
                 _ => {}
             },
             AppState::Error { .. } => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
+                KeyCode::Char('q') => {
                     self.should_quit = true;
+                }
+                KeyCode::Char('b') | KeyCode::Esc => {
+                    self.state = AppState::ShowRequestDetail;
+                }
+                KeyCode::Char('r') => {
+                    if self.selected_request.is_some() && self.is_valid_url(&self.forward_url_input)
+                    {
+                        self.state = AppState::ForwardingRequest;
+                    } else {
+                        self.set_status_feedback(
+                            FeedbackKind::Warning,
+                            "Retry unavailable: return to the request and set a valid target URL.",
+                        );
+                    }
                 }
                 _ => {}
             },
@@ -893,7 +940,9 @@ impl App {
     }
 
     pub fn is_valid_url(&self, url: &str) -> bool {
-        url.starts_with("http://") || url.starts_with("https://")
+        reqwest::Url::parse(url).is_ok_and(|parsed| {
+            matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+        })
     }
 
     pub async fn forward_request(&mut self) -> Result<()> {
@@ -961,7 +1010,60 @@ impl App {
         Ok(serde_json::to_string_pretty(request)?)
     }
 
-    pub fn filter_requests(requests: &[WebhookRequest], query: &str) -> Vec<usize> {
+    fn export_filename(request_id: &str, extension: &str) -> String {
+        let safe_id = request_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        format!("hooklistener-{safe_id}.{extension}")
+    }
+
+    fn save_export_fallback(
+        content: &str,
+        request_id: &str,
+        extension: &str,
+    ) -> Result<std::path::PathBuf> {
+        let path = std::env::current_dir()?.join(Self::export_filename(request_id, extension));
+        std::fs::write(&path, content)?;
+        Ok(path)
+    }
+
+    fn copy_or_save_export(
+        &mut self,
+        content: &str,
+        request_id: &str,
+        extension: &str,
+        success_message: &'static str,
+    ) {
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(content)) {
+            Ok(()) => self.set_status_feedback(FeedbackKind::Success, success_message),
+            Err(clipboard_error) => {
+                match Self::save_export_fallback(content, request_id, extension) {
+                    Ok(path) => self.set_status_feedback(
+                        FeedbackKind::Warning,
+                        format!(
+                            "Clipboard unavailable; saved export to {}.",
+                            path.display()
+                        ),
+                    ),
+                    Err(file_error) => self.set_status_feedback(
+                        FeedbackKind::Error,
+                        format!(
+                            "Export failed: clipboard unavailable ({clipboard_error}); file write failed ({file_error})."
+                        ),
+                    ),
+                }
+            }
+        }
+    }
+
+    pub fn filter_requests(requests: &VecDeque<WebhookRequest>, query: &str) -> Vec<usize> {
         if query.is_empty() {
             return (0..requests.len()).collect();
         }
@@ -982,6 +1084,38 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    pub fn push_listening_request(&mut self, mut request: WebhookRequest) {
+        let selected_request_id =
+            Self::filter_requests(&self.listening_requests, &self.search_query)
+                .get(self.selected_request_index)
+                .and_then(|index| self.listening_requests.get(*index))
+                .map(|request| request.id.clone());
+
+        request.body = truncate_body(request.body);
+        request.body_preview = truncate_body(request.body_preview);
+        self.listening_requests.push_back(request);
+        self.listening_stats.total_requests += 1;
+
+        if self.listening_requests.len() > MAX_LISTENING_REQUESTS {
+            self.listening_requests.pop_front();
+        }
+
+        let filtered = Self::filter_requests(&self.listening_requests, &self.search_query);
+        if let Some(selected_request_id) = selected_request_id
+            && let Some(position) = filtered.iter().position(|index| {
+                self.listening_requests
+                    .get(*index)
+                    .is_some_and(|request| request.id == selected_request_id)
+            })
+        {
+            self.selected_request_index = position;
+        } else {
+            self.selected_request_index = self
+                .selected_request_index
+                .min(filtered.len().saturating_sub(1));
+        }
     }
 
     fn contains_query(value: &str, query: &str) -> bool {
@@ -1174,17 +1308,17 @@ impl App {
 
     fn request_selected_tunnel_replay(&mut self) {
         let Some(replay_request) = self.selected_tunnel_replay_request() else {
-            self.set_tunnel_status("No request selected to replay");
+            self.set_tunnel_feedback(FeedbackKind::Warning, "No request selected to replay");
             return;
         };
 
         if is_truncated_body(replay_request.body.as_deref()) {
-            self.set_tunnel_status("Replay unavailable: body truncated");
+            self.set_tunnel_feedback(FeedbackKind::Warning, "Replay unavailable: body truncated");
             return;
         }
 
         self.tunnel_replay_requested = Some(replay_request);
-        self.set_tunnel_status("Replaying selected request...");
+        self.set_tunnel_feedback(FeedbackKind::Info, "Replaying selected request...");
     }
 
     fn request_tunnel_reconnect(&mut self) {
@@ -1192,7 +1326,7 @@ impl App {
         self.tunnel_connected = false;
         self.tunnel_connected_at = None;
         self.tunnel_error = Some("Manual reconnect requested...".to_string());
-        self.set_tunnel_status("Restarting tunnel connection...");
+        self.set_tunnel_feedback(FeedbackKind::Info, "Restarting tunnel connection...");
     }
 
     fn copy_tunnel_base_url(&mut self) {
@@ -1200,7 +1334,7 @@ impl App {
             let url = format!("https://{}", subdomain);
             self.copy_tunnel_text_to_clipboard(&url, "Base URL copied to clipboard!");
         } else {
-            self.set_tunnel_status("Tunnel URL is not ready yet");
+            self.set_tunnel_feedback(FeedbackKind::Warning, "Tunnel URL is not ready yet");
         }
     }
 
@@ -1208,7 +1342,7 @@ impl App {
         if let Some(url) = self.selected_tunnel_request_url() {
             self.copy_tunnel_text_to_clipboard(&url, "Request URL copied to clipboard!");
         } else {
-            self.set_tunnel_status("No request URL selected to copy");
+            self.set_tunnel_feedback(FeedbackKind::Warning, "No request URL selected to copy");
         }
     }
 
@@ -1216,13 +1350,13 @@ impl App {
         if let Some(request_id) = self.selected_tunnel_request_id() {
             self.copy_tunnel_text_to_clipboard(&request_id, "Request ID copied to clipboard!");
         } else {
-            self.set_tunnel_status("No request ID selected to copy");
+            self.set_tunnel_feedback(FeedbackKind::Warning, "No request ID selected to copy");
         }
     }
 
     fn toggle_selected_tunnel_request_pin(&mut self) {
         let Some(request_index) = self.selected_tunnel_request_index() else {
-            self.set_tunnel_status("No request selected to pin");
+            self.set_tunnel_feedback(FeedbackKind::Warning, "No request selected to pin");
             return;
         };
 
@@ -1238,7 +1372,7 @@ impl App {
         } else {
             "Request unpinned"
         };
-        self.set_tunnel_status(status_message);
+        self.set_tunnel_feedback(FeedbackKind::Info, status_message);
 
         if let Some(position) = self.find_visible_tunnel_request_position(&request_id) {
             self.tunnel_selected_index = position;
@@ -1275,22 +1409,26 @@ impl App {
         } else {
             "Showing all requests"
         };
-        self.set_tunnel_status(status_message);
+        self.set_tunnel_feedback(FeedbackKind::Info, status_message);
     }
 
     fn copy_tunnel_text_to_clipboard(&mut self, text: &str, success_message: &'static str) {
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
             Ok(_) => {
-                self.set_tunnel_status(success_message);
+                self.set_tunnel_feedback(FeedbackKind::Success, success_message);
             }
             Err(e) => {
-                self.set_tunnel_status(format!("Failed to copy: {}", e));
+                self.set_tunnel_feedback(FeedbackKind::Error, format!("Failed to copy: {e}"));
             }
         }
     }
 
-    fn set_tunnel_status(&mut self, message: impl Into<String>) {
-        self.tunnel_status_message = Some((message.into(), std::time::Instant::now()));
+    pub fn set_tunnel_feedback(&mut self, kind: FeedbackKind, message: impl Into<String>) {
+        self.tunnel_status_message = Some(FeedbackMessage::new(kind, message));
+    }
+
+    fn set_status_feedback(&mut self, kind: FeedbackKind, message: impl Into<String>) {
+        self.status_message = Some(FeedbackMessage::new(kind, message));
     }
 
     fn clamp_tunnel_selection(&mut self) {
@@ -1352,10 +1490,7 @@ impl App {
         if let Some(request_index) = self.selected_tunnel_request_index() {
             self.open_tunnel_request_detail(request_index);
         } else {
-            self.tunnel_status_message = Some((
-                "No request selected for details".into(),
-                std::time::Instant::now(),
-            ));
+            self.set_tunnel_feedback(FeedbackKind::Warning, "No request selected for details");
         }
     }
 
@@ -1410,15 +1545,15 @@ impl App {
         self.loading_frame = (self.loading_frame + 1) % 8;
 
         // Expire tunnel status message after 2s
-        if let Some((_, created_at)) = &self.tunnel_status_message
-            && created_at.elapsed() > std::time::Duration::from_secs(2)
+        if let Some(feedback) = &self.tunnel_status_message
+            && feedback.created_at.elapsed() > std::time::Duration::from_secs(2)
         {
             self.tunnel_status_message = None;
         }
 
         // Expire general status message after 3s
-        if let Some((_, created_at)) = &self.status_message
-            && created_at.elapsed() > std::time::Duration::from_secs(3)
+        if let Some(feedback) = &self.status_message
+            && feedback.created_at.elapsed() > std::time::Duration::from_secs(3)
         {
             self.status_message = None;
         }
@@ -1521,6 +1656,12 @@ mod tests {
     fn test_is_valid_url_garbage() {
         let app = App::with_config(make_config());
         assert!(!app.is_valid_url("not a url"));
+    }
+
+    #[test]
+    fn test_is_valid_url_requires_host() {
+        let app = App::with_config(make_config());
+        assert!(!app.is_valid_url("http://"));
     }
 
     // tick tests
@@ -1788,7 +1929,7 @@ mod tests {
         assert_eq!(
             app.tunnel_status_message
                 .as_ref()
-                .map(|(message, _)| message.as_str()),
+                .map(|feedback| feedback.message.as_str()),
             Some("Request pinned")
         );
 
@@ -1806,7 +1947,7 @@ mod tests {
         assert_eq!(
             app.tunnel_status_message
                 .as_ref()
-                .map(|(message, _)| message.as_str()),
+                .map(|feedback| feedback.message.as_str()),
             Some("No request selected to pin")
         );
     }
@@ -1829,7 +1970,7 @@ mod tests {
         assert_eq!(
             app.tunnel_status_message
                 .as_ref()
-                .map(|(message, _)| message.as_str()),
+                .map(|feedback| feedback.message.as_str()),
             Some("Showing pinned requests")
         );
 
@@ -2004,7 +2145,7 @@ mod tests {
         assert_eq!(
             app.tunnel_status_message
                 .as_ref()
-                .map(|(message, _)| message.as_str()),
+                .map(|feedback| feedback.message.as_str()),
             Some("No request selected to replay")
         );
     }
@@ -2022,7 +2163,7 @@ mod tests {
         assert_eq!(
             app.tunnel_status_message
                 .as_ref()
-                .map(|(message, _)| message.as_str()),
+                .map(|feedback| feedback.message.as_str()),
             Some("Replay unavailable: body truncated")
         );
     }
@@ -2351,10 +2492,11 @@ mod tests {
     fn test_tunnel_status_message_clears_after_tick() {
         let mut app = App::with_config(make_config());
         // Set a message with an instant far in the past
-        app.tunnel_status_message = Some((
-            "Test".to_string(),
-            std::time::Instant::now() - std::time::Duration::from_secs(5),
-        ));
+        app.tunnel_status_message = Some(FeedbackMessage {
+            kind: FeedbackKind::Info,
+            message: "Test".to_string(),
+            created_at: std::time::Instant::now() - std::time::Duration::from_secs(5),
+        });
         app.tick();
         assert!(app.tunnel_status_message.is_none());
     }
@@ -2362,7 +2504,7 @@ mod tests {
     #[test]
     fn test_tunnel_status_message_persists_when_fresh() {
         let mut app = App::with_config(make_config());
-        app.tunnel_status_message = Some(("Test".to_string(), std::time::Instant::now()));
+        app.tunnel_status_message = Some(FeedbackMessage::new(FeedbackKind::Info, "Test"));
         app.tick();
         assert!(app.tunnel_status_message.is_some());
     }
@@ -2394,6 +2536,48 @@ mod tests {
         app.forward_url_input = "not-a-url".to_string();
         app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
         assert!(matches!(app.state, AppState::ShowRequestDetail));
+    }
+
+    #[test]
+    fn invalid_forward_url_reports_error_without_leaving_input() {
+        let mut app = make_app_with_state(AppState::InputForwardUrl);
+        app.selected_request = Some(make_request("POST", "/webhook"));
+        app.forward_url_input = "ftp://example.com".to_string();
+
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(app.state, AppState::InputForwardUrl));
+        assert_eq!(
+            app.status_message.as_ref().map(|feedback| feedback.kind),
+            Some(FeedbackKind::Error)
+        );
+    }
+
+    #[test]
+    fn error_escape_returns_to_request_detail() {
+        let mut app = make_app_with_state(AppState::Error {
+            message: "Forward failed".to_string(),
+            hint: None,
+        });
+
+        app.handle_key_event(key_event(KeyCode::Esc)).unwrap();
+
+        assert!(matches!(app.state, AppState::ShowRequestDetail));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn error_retry_restarts_forward_when_target_is_valid() {
+        let mut app = make_app_with_state(AppState::Error {
+            message: "Forward failed".to_string(),
+            hint: None,
+        });
+        app.selected_request = Some(make_request("POST", "/webhook"));
+        app.forward_url_input = "http://localhost:3000".to_string();
+
+        app.handle_key_event(key_event(KeyCode::Char('r'))).unwrap();
+
+        assert!(matches!(app.state, AppState::ForwardingRequest));
     }
 
     // === Export tests ===
@@ -2485,7 +2669,7 @@ mod tests {
 
     #[test]
     fn test_filter_requests_empty_query_returns_all() {
-        let requests = vec![make_request("GET", "/a"), make_request("POST", "/b")];
+        let requests = vec![make_request("GET", "/a"), make_request("POST", "/b")].into();
         let result = App::filter_requests(&requests, "");
         assert_eq!(result, vec![0, 1]);
     }
@@ -2496,7 +2680,8 @@ mod tests {
             make_request("GET", "/a"),
             make_request("POST", "/b"),
             make_request("GET", "/c"),
-        ];
+        ]
+        .into();
         let result = App::filter_requests(&requests, "POST");
         assert_eq!(result, vec![1]);
     }
@@ -2507,7 +2692,8 @@ mod tests {
             make_request("GET", "/api/webhook"),
             make_request("POST", "/api/users"),
             make_request("GET", "/webhook/test"),
-        ];
+        ]
+        .into();
         let result = App::filter_requests(&requests, "webhook");
         assert_eq!(result, vec![0, 2]);
     }
@@ -2517,9 +2703,57 @@ mod tests {
         let requests = vec![
             make_request("GET", "/API/Webhook"),
             make_request("POST", "/other"),
-        ];
+        ]
+        .into();
         let result = App::filter_requests(&requests, "webhook");
         assert_eq!(result, vec![0]);
+    }
+
+    #[test]
+    fn listening_history_is_bounded_while_total_remains_lifetime_count() {
+        let mut app = App::with_config(make_config());
+
+        for index in 0..=MAX_LISTENING_REQUESTS {
+            let mut request = make_request("POST", "/webhook");
+            request.id = format!("req-{index}");
+            app.push_listening_request(request);
+        }
+
+        assert_eq!(app.listening_requests.len(), MAX_LISTENING_REQUESTS);
+        assert_eq!(
+            app.listening_stats.total_requests,
+            (MAX_LISTENING_REQUESTS + 1) as u64
+        );
+        assert_eq!(
+            app.listening_requests
+                .front()
+                .map(|request| request.id.as_str()),
+            Some("req-1")
+        );
+    }
+
+    #[test]
+    fn listening_history_truncates_oversized_bodies_before_storage() {
+        let mut app = App::with_config(make_config());
+        let mut request = make_request("POST", "/webhook");
+        request.body = Some("x".repeat(MAX_BODY_SIZE + 1));
+
+        app.push_listening_request(request);
+
+        assert!(
+            app.listening_requests
+                .front()
+                .and_then(|request| request.body.as_deref())
+                .is_some_and(|body| body.ends_with(TRUNCATED_BODY_MARKER))
+        );
+    }
+
+    #[test]
+    fn export_filename_replaces_unsafe_characters() {
+        assert_eq!(
+            App::export_filename("req/../../unsafe", "json"),
+            "hooklistener-req_______unsafe.json"
+        );
     }
 
     #[test]
@@ -2533,10 +2767,11 @@ mod tests {
     #[test]
     fn test_status_message_clears_after_tick() {
         let mut app = App::with_config(make_config());
-        app.status_message = Some((
-            "Copied!".to_string(),
-            std::time::Instant::now() - std::time::Duration::from_secs(5),
-        ));
+        app.status_message = Some(FeedbackMessage {
+            kind: FeedbackKind::Success,
+            message: "Copied!".to_string(),
+            created_at: std::time::Instant::now() - std::time::Duration::from_secs(5),
+        });
         app.tick();
         assert!(app.status_message.is_none());
     }

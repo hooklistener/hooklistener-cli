@@ -1,5 +1,6 @@
-use crate::app::{App, AppState, TRUNCATED_BODY_MARKER, TunnelRequest};
+use crate::app::{App, AppState, FeedbackKind, TRUNCATED_BODY_MARKER, TunnelRequest};
 use crate::syntax::JsonHighlighter;
+use crate::theme as colors;
 use ratatui::{
     prelude::*,
     widgets::{
@@ -7,36 +8,6 @@ use ratatui::{
         Table, TableState, Tabs, Wrap,
     },
 };
-
-// Industrial terminal palette. Keep semantic roles readable without color.
-mod colors {
-    use ratatui::style::Color;
-
-    pub const PRIMARY: Color = Color::Rgb(212, 177, 95); // Signal amber
-    pub const SECONDARY: Color = Color::Rgb(127, 167, 200); // Instrument blue
-    pub const SUCCESS: Color = Color::Rgb(143, 174, 121); // Field green
-    pub const ERROR: Color = Color::Rgb(199, 111, 100); // Fault red
-    pub const WARNING: Color = Color::Rgb(212, 177, 95); // Signal amber
-    pub const INFO: Color = Color::Rgb(127, 167, 200); // Instrument blue
-    pub const MUTED: Color = Color::Rgb(143, 147, 138); // Muted ink
-    pub const TEXT: Color = Color::Rgb(216, 216, 210); // Industrial ink
-    pub const ACCENT: Color = Color::Rgb(212, 177, 95); // Primary accent
-    pub const BACKGROUND: Color = Color::Rgb(23, 25, 22); // Panel surface
-    pub const SURFACE: Color = Color::Rgb(42, 48, 41); // Selection row
-
-    /// Map an HTTP status code to an appropriate color.
-    pub fn for_http_status(status: u16) -> Color {
-        if (200..300).contains(&status) {
-            SUCCESS
-        } else if (400..500).contains(&status) {
-            WARNING
-        } else if status >= 500 {
-            ERROR
-        } else {
-            INFO
-        }
-    }
-}
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -62,11 +33,49 @@ pub fn draw(frame: &mut Frame, app: &App) {
             }
         }
         AppState::ExportMenu => draw_export_menu(frame, app, chunks[0]),
-        AppState::Error { message, hint } => draw_error(frame, message, hint.as_deref(), chunks[0]),
+        AppState::Error { message, hint } => {
+            draw_error(frame, app, message, hint.as_deref(), chunks[0])
+        }
     }
 
     // Draw status bar
     draw_status_bar(frame, app, chunks[1]);
+
+    if app.monochrome {
+        for cell in &mut frame.buffer_mut().content {
+            cell.fg = Color::Reset;
+            cell.bg = Color::Reset;
+            cell.underline_color = Color::Reset;
+        }
+    }
+}
+
+fn feedback_color(kind: FeedbackKind) -> Color {
+    match kind {
+        FeedbackKind::Success => colors::SUCCESS,
+        FeedbackKind::Info => colors::INFO,
+        FeedbackKind::Warning => colors::WARNING,
+        FeedbackKind::Error => colors::ERROR,
+    }
+}
+
+fn feedback_label(kind: FeedbackKind) -> &'static str {
+    match kind {
+        FeedbackKind::Success => "OK",
+        FeedbackKind::Info => "INFO",
+        FeedbackKind::Warning => "WARN",
+        FeedbackKind::Error => "ERR",
+    }
+}
+
+fn listening_history_title(app: &App) -> String {
+    let retained = app.listening_requests.len();
+    let total = app.listening_stats.total_requests;
+    if total > retained as u64 {
+        format!(" Live Requests ({retained} retained of {total}) ")
+    } else {
+        " Live Requests ".to_string()
+    }
 }
 
 fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
@@ -256,7 +265,7 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
         };
         let no_requests_block = Block::default()
             .borders(Borders::ALL)
-            .title(" Live Requests ")
+            .title(listening_history_title(app))
             .border_style(Style::default().fg(colors::MUTED));
 
         let mut lines = Vec::new();
@@ -333,11 +342,11 @@ fn draw_listening(frame: &mut Frame, app: &App, area: Rect) {
         .header(headers)
         .block(
             Block::default()
-                .title(" Live Requests ")
+                .title(listening_history_title(app))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(colors::PRIMARY)),
         )
-        .row_highlight_style(Style::default().bg(colors::SURFACE))
+        .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
         let mut table_state = TableState::default();
@@ -354,11 +363,20 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         colors::MUTED
     };
     let cursor = if app.search_active { "▎" } else { "" };
+    let title = if matches!(app.state, AppState::Tunneling) {
+        if area.width >= 74 {
+            " Filter: method: status: path: header: pinned: "
+        } else {
+            " Filter: field:value "
+        }
+    } else {
+        " Filter "
+    };
     let search = Paragraph::new(format!("/{}{}", app.search_query, cursor))
         .style(Style::default().fg(colors::TEXT))
         .block(
             Block::default()
-                .title(" Filter ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(search_border_color)),
         );
@@ -439,8 +457,6 @@ fn tunnel_metric_cells(
             7,
         ),
         TunnelMetric::new("Err", app.tunnel_stats.failed.to_string(), colors::ERROR, 7),
-        TunnelMetric::new("Avg", avg_duration, colors::SECONDARY, 8),
-        TunnelMetric::new("Last", last_display, last_color, 9),
     ];
 
     if pinned_count > 0 {
@@ -452,33 +468,34 @@ fn tunnel_metric_cells(
         ));
     }
 
-    metrics.push(TunnelMetric::new("View", view_display, view_color, 10));
     metrics.push(TunnelMetric::new(
         "Follow",
         follow_display,
         follow_color,
         13,
     ));
+    metrics.push(TunnelMetric::new("View", view_display, view_color, 10));
+    metrics.push(TunnelMetric::new("Avg", avg_duration, colors::SECONDARY, 8));
+    metrics.push(TunnelMetric::new("Last", last_display, last_color, 9));
 
     metrics
 }
 
 fn render_tunnel_metric_row(frame: &mut Frame, area: Rect, metrics: &[TunnelMetric]) {
-    if metrics.is_empty() || area.is_empty() {
+    if area.is_empty() {
         return;
     }
 
-    let metric_constraints = metrics
-        .iter()
-        .map(|metric| Constraint::Length(metric.width()))
-        .chain(std::iter::once(Constraint::Min(0)));
+    let right = area.x.saturating_add(area.width);
+    let mut x = area.x;
 
-    let metric_areas = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(metric_constraints)
-        .split(area);
+    for metric in metrics {
+        let width = metric.width();
+        if x.saturating_add(width) > right {
+            break;
+        }
 
-    for (metric, area) in metrics.iter().zip(metric_areas.iter()) {
+        let metric_area = Rect::new(x, area.y, width, area.height);
         let metric_text = Line::from(vec![
             Span::styled(metric.label, Style::default().fg(colors::MUTED)),
             Span::raw(" "),
@@ -490,7 +507,34 @@ fn render_tunnel_metric_row(frame: &mut Frame, area: Rect, metrics: &[TunnelMetr
             ),
         ]);
 
-        frame.render_widget(Paragraph::new(metric_text), *area);
+        frame.render_widget(Paragraph::new(metric_text), metric_area);
+        x = x.saturating_add(width);
+    }
+}
+
+fn tunnel_table_constraints(width: u16) -> [Constraint; 8] {
+    if width < 90 {
+        [
+            Constraint::Length(8),  // ID
+            Constraint::Length(5),  // Age
+            Constraint::Length(7),  // Method
+            Constraint::Min(14),    // Path
+            Constraint::Length(7),  // Status
+            Constraint::Length(9),  // Duration
+            Constraint::Length(0),  // Size moves to details at narrow widths
+            Constraint::Length(15), // From
+        ]
+    } else {
+        [
+            Constraint::Length(8),  // ID
+            Constraint::Length(6),  // Age
+            Constraint::Length(8),  // Method
+            Constraint::Min(20),    // Path
+            Constraint::Length(8),  // Status
+            Constraint::Length(10), // Duration
+            Constraint::Length(8),  // Size
+            Constraint::Length(15), // From
+        ]
     }
 }
 
@@ -630,22 +674,9 @@ fn tunnel_request_tone(request: &TunnelRequest) -> TunnelRequestTone {
     }
 }
 
-fn tunnel_row_style(request: &TunnelRequest, expanded: bool) -> Style {
+fn tunnel_row_style(request: &TunnelRequest) -> Style {
     let tone = tunnel_request_tone(request);
-    let bg = match tone {
-        TunnelRequestTone::Success | TunnelRequestTone::Other if expanded => {
-            Some(colors::BACKGROUND)
-        }
-        TunnelRequestTone::ClientError => Some(Color::Rgb(48, 43, 32)),
-        TunnelRequestTone::ServerError | TunnelRequestTone::Failed => Some(Color::Rgb(52, 37, 36)),
-        TunnelRequestTone::Pending => Some(Color::Rgb(43, 43, 34)),
-        _ => None,
-    };
-
     let mut style = Style::default();
-    if let Some(bg) = bg {
-        style = style.bg(bg);
-    }
     if matches!(
         tone,
         TunnelRequestTone::ServerError | TunnelRequestTone::Failed
@@ -718,7 +749,7 @@ fn tunnel_request_table_row(request: &TunnelRequest) -> Row<'static> {
         Cell::from(size_display).style(Style::default().fg(colors::MUTED)),
         Cell::from(source_display).style(Style::default().fg(colors::MUTED)),
     ])
-    .style(tunnel_row_style(request, false))
+    .style(tunnel_row_style(request))
 }
 
 fn compact_content_type(headers: &std::collections::HashMap<String, String>) -> Option<String> {
@@ -870,7 +901,7 @@ fn tunnel_expanded_request_section_row(request: &TunnelRequest) -> Row<'static> 
         Cell::from(tunnel_request_source(&request.headers))
             .style(Style::default().fg(colors::TEXT)),
     ])
-    .style(tunnel_row_style(request, true))
+    .style(tunnel_row_style(request))
 }
 
 fn tunnel_expanded_response_section_row(request: &TunnelRequest) -> Row<'static> {
@@ -895,7 +926,7 @@ fn tunnel_expanded_response_section_row(request: &TunnelRequest) -> Row<'static>
             .style(Style::default().fg(colors::TEXT)),
         Cell::from(""),
     ])
-    .style(tunnel_row_style(request, true))
+    .style(tunnel_row_style(request))
 }
 
 fn tunnel_expanded_preview_row(
@@ -923,7 +954,7 @@ fn tunnel_expanded_preview_row(
         Cell::from(""),
         Cell::from(""),
     ])
-    .style(tunnel_row_style(request, true))
+    .style(tunnel_row_style(request))
 }
 
 fn tunnel_expanded_body_rows(
@@ -1268,11 +1299,11 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     // Show tunnel status message (e.g. "URL copied to clipboard!")
-    if let Some((msg, _)) = &app.tunnel_status_message {
+    if let Some(feedback) = &app.tunnel_status_message {
         header_text.push(Line::from(Span::styled(
-            format!(" {}", msg),
+            format!(" [{}] {}", feedback_label(feedback.kind), feedback.message),
             Style::default()
-                .fg(colors::SUCCESS)
+                .fg(feedback_color(feedback.kind))
                 .add_modifier(Modifier::BOLD),
         )));
     }
@@ -1459,28 +1490,16 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
             )
         };
 
-        let requests_table = Table::new(
-            rows,
-            [
-                Constraint::Length(8),  // ID
-                Constraint::Length(6),  // Age
-                Constraint::Length(8),  // Method
-                Constraint::Min(20),    // Path
-                Constraint::Length(8),  // Status
-                Constraint::Length(10), // Duration
-                Constraint::Length(8),  // Size
-                Constraint::Length(15), // From
-            ],
-        )
-        .header(headers)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(colors::MUTED)),
-        )
-        .row_highlight_style(Style::default().bg(colors::SURFACE))
-        .highlight_symbol("▸ ");
+        let requests_table = Table::new(rows, tunnel_table_constraints(table_area.width))
+            .header(headers)
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(colors::MUTED)),
+            )
+            .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
+            .highlight_symbol("▸ ");
 
         let mut table_state = TableState::default();
         table_state.select(selected_row_index);
@@ -1499,7 +1518,7 @@ fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     if let Some(request) = &app.selected_request {
-        // Tab titles — include Response tab when tunnel response data is available
+        // Include the Response tab only when tunnel response data is available.
         let mut titles = vec!["Info", "Headers", "Body"];
         if app.selected_tunnel_response.is_some() {
             titles.push("Response");
@@ -1610,13 +1629,13 @@ fn draw_info_tab(
         ));
     }
 
-    if let Some((msg, _)) = &app.status_message {
+    if let Some(feedback) = &app.status_message {
         rows.push(info_table_row(
             "Status",
             Line::from(Span::styled(
-                msg.clone(),
+                format!("[{}] {}", feedback_label(feedback.kind), feedback.message),
                 Style::default()
-                    .fg(colors::SUCCESS)
+                    .fg(feedback_color(feedback.kind))
                     .add_modifier(Modifier::BOLD),
             )),
             value_width,
@@ -2108,7 +2127,7 @@ fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_error(frame: &mut Frame, error_msg: &str, hint: Option<&str>, area: Rect) {
+fn draw_error(frame: &mut Frame, app: &App, error_msg: &str, hint: Option<&str>, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
@@ -2141,15 +2160,36 @@ fn draw_error(frame: &mut Frame, error_msg: &str, hint: Option<&str>, area: Rect
 
     frame.render_widget(error, chunks[0]);
 
-    let help_text = vec![Line::from(vec![
+    let can_retry = app.selected_request.is_some() && app.is_valid_url(&app.forward_url_input);
+    let mut help_spans = Vec::new();
+    if can_retry {
+        help_spans.extend([
+            Span::styled(
+                "r",
+                Style::default()
+                    .fg(colors::SECONDARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": Retry | ", Style::default().fg(colors::TEXT)),
+        ]);
+    }
+    help_spans.extend([
         Span::styled(
-            "q/Esc",
+            "b/Esc",
+            Style::default()
+                .fg(colors::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": Back | ", Style::default().fg(colors::TEXT)),
+        Span::styled(
+            "q",
             Style::default()
                 .fg(colors::ERROR)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(": Quit", Style::default().fg(colors::TEXT)),
-    ])];
+    ]);
+    let help_text = vec![Line::from(help_spans)];
 
     let help = Paragraph::new(help_text)
         .alignment(Alignment::Center)
@@ -2209,14 +2249,36 @@ fn draw_forward_url_input(frame: &mut Frame, app: &App, area: Rect) {
             },
         );
 
-    let input = Paragraph::new(app.forward_url_input.as_str())
+    let input = Paragraph::new(format!("{}▎", app.forward_url_input))
         .style(Style::default().fg(colors::TEXT))
         .block(input_block);
 
     frame.render_widget(input, chunks[1]);
 
     // Help text
+    let validation = if app.forward_url_input.is_empty() {
+        (
+            "INFO",
+            "Enter an http:// or https:// target URL.",
+            colors::INFO,
+        )
+    } else if app.is_valid_url(&app.forward_url_input) {
+        ("OK", "Target URL is ready.", colors::SUCCESS)
+    } else {
+        (
+            "ERR",
+            "Target URL needs a host and an http:// or https:// scheme.",
+            colors::ERROR,
+        )
+    };
+
     let help_text = vec![
+        Line::from(Span::styled(
+            format!("[{}] {}", validation.0, validation.1),
+            Style::default()
+                .fg(validation.2)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -2234,7 +2296,6 @@ fn draw_forward_url_input(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(": Cancel", Style::default().fg(colors::TEXT)),
         ]),
-        Line::from(""),
         Line::from(vec![
             Span::styled("Example: ", Style::default().fg(colors::MUTED)),
             Span::styled(
@@ -2450,6 +2511,40 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, popup_width, height.min(area.height))
 }
 
+fn tunnel_status_shortcuts(app: &App) -> (String, String) {
+    let filter_shortcut = if app.search_query.is_empty() {
+        "/ Filter"
+    } else {
+        "Esc Clear | / Filter"
+    };
+    let follow_shortcut = if app.is_tunnel_follow_pinned() {
+        " | Home Top"
+    } else {
+        ""
+    };
+    let view_shortcut = if app.tunnel_pinned_only {
+        "Tab All"
+    } else {
+        "Tab Pins"
+    };
+    let compact_filter_shortcut = if app.search_query.is_empty() {
+        "/ Filter"
+    } else {
+        "Esc Clear"
+    };
+
+    let shortcuts = format!(
+        "↑↓ Select | Enter Expand | {} | P Pin | A Actions{} | {} | Q Quit",
+        view_shortcut, follow_shortcut, filter_shortcut
+    );
+    let compact_shortcuts = format!(
+        "↑↓ | Enter Expand | A Menu | {} | Q Quit",
+        compact_filter_shortcut
+    );
+
+    (shortcuts, compact_shortcuts)
+}
+
 fn selected_visible_tunnel_request(app: &App) -> Option<&TunnelRequest> {
     app.visible_tunnel_request_indices()
         .get(app.tunnel_selected_index)
@@ -2619,77 +2714,110 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    // Build status text with shortcuts based on current state
-    let (status_text, shortcuts): (String, String) = match &app.state {
-        AppState::ShowRequestDetail => (
-            "Request".to_string(),
-            "Tab Tabs | ↑↓ Scroll | F Forward | R Replay | E Export | B Back | Q Quit".to_string(),
+    let (status_text, shortcuts, compact_shortcuts) = match &app.state {
+        AppState::ShowRequestDetail => {
+            let replay =
+                if app.selected_request.is_some() && app.is_valid_url(&app.forward_url_input) {
+                    " | R Replay"
+                } else {
+                    ""
+                };
+            (
+                "Request".to_string(),
+                format!("Tab Tabs | ↑↓ Scroll | F Forward{replay} | E Export | B Back | Q Quit"),
+                Some("Tab Tabs | ↑↓ Scroll | F Forward | B Back | Q Quit".to_string()),
+            )
+        }
+        AppState::InputForwardUrl => (
+            "Forward".to_string(),
+            "Enter Send | Esc Cancel".to_string(),
+            None,
         ),
-        AppState::InputForwardUrl => ("Forward".to_string(), "Enter Send | Esc Cancel".to_string()),
         AppState::ForwardingRequest => {
             let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
             let spinner = spinner_chars[app.loading_frame % spinner_chars.len()];
-            (format!("{} Forwarding", spinner), "Please wait".to_string())
+            (
+                format!("{} Forwarding", spinner),
+                "Please wait".to_string(),
+                None,
+            )
         }
-        AppState::ForwardResult => ("Forward result".to_string(), "B Back | Q Quit".to_string()),
+        AppState::ForwardResult => (
+            "Forward result".to_string(),
+            "B Back | Q Quit".to_string(),
+            None,
+        ),
         AppState::ExportMenu => (
             "Export".to_string(),
             "1 cURL | 2 JSON | Esc Cancel".to_string(),
+            None,
         ),
         AppState::Listening => {
-            let total_requests = app.listening_requests.len();
+            let retained = app.listening_requests.len();
+            let total = app.listening_stats.total_requests;
+            let count = if total > retained as u64 {
+                format!("{retained}/{total}")
+            } else {
+                retained.to_string()
+            };
             (
-                format!("Listen ({})", total_requests),
+                format!("Listen ({count})"),
                 "↑↓ Select | Enter Details | / Search | Q Quit".to_string(),
+                Some("↑↓ | Enter Details | / Search | Q Quit".to_string()),
             )
         }
         AppState::Tunneling => {
             let total_requests = app.tunnel_requests.len();
-            let filter_shortcut = if app.search_query.is_empty() {
-                "/ Filter"
-            } else {
-                "Esc Clear | / Filter"
-            };
-            let latest_shortcut = if app.is_tunnel_follow_pinned() {
-                " | Home Top"
-            } else {
-                ""
-            };
-            let view_shortcut = if app.tunnel_pinned_only {
-                "Tab All"
-            } else {
-                "Tab Pins"
-            };
+            let (shortcuts, compact_shortcuts) = tunnel_status_shortcuts(app);
+
             (
                 format!("Tunnel ({})", total_requests),
-                format!(
-                    "↑↓ Select | Enter Expand | {} | P Pin | A Actions{} | {} | Q Quit",
-                    view_shortcut, latest_shortcut, filter_shortcut
-                ),
+                shortcuts,
+                Some(compact_shortcuts),
             )
         }
-        AppState::Error { .. } => ("Error".to_string(), "Q/Esc Quit".to_string()),
+        AppState::Error { .. } => {
+            let shortcuts =
+                if app.selected_request.is_some() && app.is_valid_url(&app.forward_url_input) {
+                    "R Retry | B/Esc Back | Q Quit"
+                } else {
+                    "B/Esc Back | Q Quit"
+                };
+            ("Error".to_string(), shortcuts.to_string(), None)
+        }
     };
 
-    // Left side: Status and shortcuts
+    let (status_text, status_color) = if let Some(feedback) = &app.status_message {
+        (
+            format!("{} {}", feedback_label(feedback.kind), feedback.message),
+            feedback_color(feedback.kind),
+        )
+    } else {
+        (status_text, colors::SECONDARY)
+    };
+
+    let full_status_width = status_text.chars().count() + 2 + shortcuts.chars().count();
+    let shortcuts = if full_status_width <= usize::from(chunks[0].width) {
+        shortcuts
+    } else {
+        compact_shortcuts.unwrap_or(shortcuts)
+    };
+
     let status_spans = vec![
         Span::styled(
             status_text,
             Style::default()
-                .fg(colors::SECONDARY)
+                .fg(status_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(shortcuts, Style::default().fg(colors::MUTED)),
     ];
 
-    let status_paragraph = Paragraph::new(Line::from(status_spans))
-        .style(Style::default().bg(colors::BACKGROUND))
-        .alignment(Alignment::Left);
+    let status_paragraph = Paragraph::new(Line::from(status_spans)).alignment(Alignment::Left);
 
     frame.render_widget(status_paragraph, chunks[0]);
 
-    // Right side: API connection status
     let connection_status = if app.config.access_token.is_some() && app.config.is_token_valid() {
         Span::styled(
             "API connected",
@@ -2706,9 +2834,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         )
     };
 
-    let connection_paragraph = Paragraph::new(Line::from(vec![connection_status]))
-        .style(Style::default().bg(colors::BACKGROUND))
-        .alignment(Alignment::Center);
+    let connection_paragraph =
+        Paragraph::new(Line::from(vec![connection_status])).alignment(Alignment::Center);
 
     frame.render_widget(connection_paragraph, chunks[1]);
 }
@@ -2718,11 +2845,11 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use chrono::{Duration as ChronoDuration, Utc};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
-    fn render_app_to_text(app: &App, width: u16, height: u16) -> String {
+    fn render_app_to_buffer(app: &App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal should be created");
 
@@ -2730,7 +2857,11 @@ mod tests {
             .draw(|frame| draw(frame, app))
             .expect("app should render into test terminal");
 
-        let buffer = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_app_to_text(app: &App, width: u16, height: u16) -> String {
+        let buffer = render_app_to_buffer(app, width, height);
         let area = *buffer.area();
         let mut lines = Vec::with_capacity(area.height as usize);
 
@@ -2743,6 +2874,14 @@ mod tests {
         }
 
         lines.join("\n")
+    }
+
+    fn render_tunnel_80x24_to_buffer() -> Buffer {
+        render_app_to_buffer(&app_with_tunnel_rows(), 80, 24)
+    }
+
+    fn render_tunnel_80x24_to_text() -> String {
+        render_app_to_text(&app_with_tunnel_rows(), 80, 24)
     }
 
     fn valid_test_config() -> Config {
@@ -2971,11 +3110,74 @@ mod tests {
 
     #[test]
     fn tunneling_live_requests_80x24_snapshot() {
-        let app = app_with_tunnel_rows();
-
-        let snapshot = render_app_to_text(&app, 80, 24);
+        let snapshot = render_tunnel_80x24_to_text();
 
         insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn tunneling_inherits_terminal_background() {
+        let buffer = render_tunnel_80x24_to_buffer();
+
+        assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn monochrome_mode_strips_all_rendered_colors() {
+        let mut app = app_with_tunnel_rows();
+        app.monochrome = true;
+        let buffer = render_app_to_buffer(&app, 80, 24);
+
+        assert!(buffer.content().iter().all(|cell| {
+            cell.fg == Color::Reset
+                && cell.bg == Color::Reset
+                && cell.underline_color == Color::Reset
+        }));
+    }
+
+    #[test]
+    fn tunneling_selection_uses_weight_instead_of_background() {
+        let buffer = render_tunnel_80x24_to_buffer();
+        let selection = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "▸")
+            .expect("selected tunnel row should render a caret");
+
+        assert!(selection.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tunneling_metrics_remain_complete_at_80_columns() {
+        let rendered = render_tunnel_80x24_to_text();
+
+        assert!(rendered.contains("Follow Paused"));
+    }
+
+    #[test]
+    fn tunneling_source_remains_complete_at_80_columns() {
+        let rendered = render_tunnel_80x24_to_text();
+
+        assert!(rendered.contains("198.51.100.11"));
+    }
+
+    #[test]
+    fn tunneling_shortcuts_remain_complete_at_80_columns() {
+        let rendered = render_tunnel_80x24_to_text();
+
+        assert!(rendered.contains("A Menu | / Filter | Q Quit"));
+    }
+
+    #[test]
+    fn tunnel_actions_remain_identifiable_at_80_columns() {
+        let mut app = app_with_tunnel_rows();
+        app.tunnel_actions_open = true;
+
+        let rendered = render_app_to_text(&app, 80, 24);
+
+        assert!(rendered.contains("Copy request URL"));
+        assert!(rendered.contains("Replay"));
+        assert!(rendered.contains("Esc  Close"));
     }
 
     #[test]
@@ -2999,6 +3201,19 @@ mod tests {
         let snapshot = render_app_to_text(&app, 110, 24);
 
         insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn request_detail_keeps_recovery_controls_at_80_columns() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.selected_request = Some(make_detail_request());
+
+        let rendered = render_app_to_text(&app, 80, 24);
+
+        assert!(rendered.contains("F Forward"));
+        assert!(rendered.contains("B Back"));
+        assert!(rendered.contains("Q Quit"));
     }
 
     #[test]
@@ -3105,11 +3320,33 @@ mod tests {
                 96,
                 &[("user-agent", "GitHub-Hookshot")],
             ),
-        ];
+        ]
+        .into();
 
         let snapshot = render_app_to_text(&app, 80, 24);
 
         insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn listening_view_reports_retained_and_lifetime_counts_after_eviction() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::Listening;
+        app.listening_connected = true;
+        app.listening_stats.total_requests = 2;
+        app.listening_requests.push_back(listening_request_fixture(
+            "req-listen-002",
+            "POST",
+            "/webhooks/orders",
+            "198.51.100.20",
+            128,
+            &[],
+        ));
+
+        let rendered = render_app_to_text(&app, 80, 24);
+
+        assert!(rendered.contains("Live Requests (1 retained of 2)"));
+        assert!(rendered.contains("Listen (1/2)"));
     }
 
     #[test]
@@ -3122,6 +3359,20 @@ mod tests {
         let snapshot = render_app_to_text(&app, 90, 20);
 
         insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn invalid_forward_url_has_text_error_at_80_columns() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::InputForwardUrl;
+        app.selected_request = Some(make_detail_request());
+        app.forward_url_input = "ftp://example.com/webhook".to_string();
+
+        let rendered = render_app_to_text(&app, 80, 20);
+
+        assert!(
+            rendered.contains("[ERR] Target URL needs a host and an http:// or https:// scheme.")
+        );
     }
 
     #[test]
@@ -3140,12 +3391,29 @@ mod tests {
         let mut app = App::with_config(valid_test_config());
         app.state = AppState::Error {
             message: "Tunnel connection failed: upstream returned 503".to_string(),
-            hint: Some("Check the local service and press q to exit".to_string()),
+            hint: Some("Check the local service, then press r to retry".to_string()),
         };
+        app.selected_request = Some(make_detail_request());
+        app.forward_url_input = "http://localhost:3000/webhook".to_string();
 
         let snapshot = render_app_to_text(&app, 90, 18);
 
         insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn error_recovery_controls_fit_at_80_columns() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::Error {
+            message: "Forwarding failed".to_string(),
+            hint: Some("Check the local service, then retry".to_string()),
+        };
+        app.selected_request = Some(make_detail_request());
+        app.forward_url_input = "http://localhost:3000/webhook".to_string();
+
+        let rendered = render_app_to_text(&app, 80, 18);
+
+        assert!(rendered.contains("R Retry | B/Esc Back | Q Quit"));
     }
 
     #[test]

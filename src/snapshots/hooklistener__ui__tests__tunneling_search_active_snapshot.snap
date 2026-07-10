@@ -1,5 +1,6 @@
 ---
 source: src/ui.rs
+assertion_line: 3164
 expression: snapshot
 ---
 
@@ -8,9 +9,9 @@ expression: snapshot
  │ https://plant-07.hook.events  →  localhost:8080                                                │
  └────────────────────────────────────────────────────────────────────────────────────────────────┘
   Statistics ──────────────────────────────────────────────────────────────────────────────────────
-  Requests 5  2xx 2  4xx 1  5xx 1  Err 0  Avg 467ms  Last 200  View All  Follow Paused
+  Requests 5  2xx 2  4xx 1  5xx 1  Err 0  Follow Paused  View All  Avg 467ms  Last 200
 
- ┌ Filter ────────────────────────────────────────────────────────────────────────────────────────┐
+ ┌ Filter: method: status: path: header: pinned: ─────────────────────────────────────────────────┐
  │/billing▎                                                                                       │
  └────────────────────────────────────────────────────────────────────────────────────────────────┘
   Live Requests (1) filtered from 5 | Enter expand | D details ────────────────────────────────────
@@ -24,4 +25,4 @@ expression: snapshot
 
 
 
- Tunnel (5)  ↑↓ Select | Enter Expand | Tab Pins | P Pin | A Actions | Home Top | E  API connected
+ Tunnel (5)  ↑↓ | Enter Expand | A Menu | Esc Clear | Q Quit                         API connected

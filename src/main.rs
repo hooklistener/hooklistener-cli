@@ -6,20 +6,21 @@ mod errors;
 mod logger;
 mod logo;
 mod models;
+mod output;
 mod syntax;
+mod theme;
 mod tunnel;
 mod ui;
 mod updater;
 
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
 use crossterm::{
     cursor::{MoveToColumn, Show},
     event::{self, Event, KeyEventKind},
     execute,
-    style::Stylize,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
@@ -27,7 +28,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use reqwest::Url;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::{
@@ -37,21 +38,33 @@ use tokio::{
 use tracing::error;
 
 use api::ApiClient;
-use app::{App, AppState};
+use app::{App, AppState, FeedbackKind};
 use logger::{LogConfig, Logger};
+use output::{ColorMode, Stylize};
 use tunnel::TunnelEvent;
 
 #[derive(Parser)]
 #[command(name = "hooklistener")]
 #[command(about = "A CLI tool for debugging webhooks")]
 #[command(version)]
+#[command(
+    after_help = "COMMAND GROUPS:\n  Capture and delivery: listen, tunnel, endpoint, static-tunnel, anon\n  Review and automation: cases, share, monitor\n  Account and settings: login, logout, org, config\n  Maintenance: diagnostics, clean-logs, completions, update\n\nCOMMON WORKFLOWS:\n  Inspect an existing debug endpoint:\n    hooklistener listen <endpoint> --target http://localhost:3000\n\n  Expose a local HTTP server:\n    hooklistener tunnel --port 3000\n\n  Create and inspect hosted captures:\n    hooklistener endpoint create <name>\n    hooklistener endpoint requests <endpoint-id>"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Output command responses or event streams as JSON
+    /// Output supported command responses or event streams as JSON
     #[arg(long, global = true)]
     json: bool,
+
+    /// Styling policy for human output
+    #[arg(long, global = true, value_enum, default_value_t)]
+    color: ColorMode,
+
+    /// Confirm destructive commands without an interactive prompt
+    #[arg(long, global = true)]
+    yes: bool,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info", value_parser = validate_log_level)]
@@ -74,7 +87,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Start WebSocket tunnel to forward webhooks to local server
+    /// Connect an existing debug endpoint and forward its WebSocket events
     Listen {
         /// Debug endpoint slug to listen to
         endpoint: String,
@@ -126,7 +139,7 @@ enum Commands {
         #[command(subcommand)]
         action: StaticTunnelAction,
     },
-    /// Anonymous (temporary) debug endpoints — no login required
+    /// Anonymous temporary debug endpoints (no login required)
     Anon {
         #[command(subcommand)]
         action: AnonAction,
@@ -149,7 +162,7 @@ enum Commands {
     },
     /// Update hooklistener to the latest version
     Update,
-    /// Start HTTP tunnel to forward requests to local server
+    /// Expose a local HTTP server on a public Hooklistener URL
     Tunnel {
         /// Local port to forward requests to
         #[arg(short, long, default_value = "3000")]
@@ -324,13 +337,13 @@ enum CasesAction {
         /// Debug endpoint ID
         endpoint_id: String,
         /// Target URL, saved target ID, or "cli"
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["target_url", "target_id"])]
         target: Option<String>,
         /// Explicit target URL to replay cases to
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["target", "target_id"])]
         target_url: Option<String>,
         /// Explicit saved replay target ID
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["target", "target_url"])]
         target_id: Option<String>,
         /// Optional display name for the target
         #[arg(long)]
@@ -339,10 +352,10 @@ enum CasesAction {
         #[arg(long)]
         wait: bool,
         /// Timeout for --wait, such as 60, 60s, 2m, or 1h
-        #[arg(long)]
+        #[arg(long, conflicts_with = "timeout_ms")]
         timeout: Option<String>,
         /// Timeout for --wait in milliseconds
-        #[arg(long)]
+        #[arg(long, conflicts_with = "timeout")]
         timeout_ms: Option<u64>,
         /// Poll interval for --wait in milliseconds
         #[arg(long)]
@@ -489,8 +502,14 @@ enum MonitorAction {
         /// Number of consecutive failures before alerting
         #[arg(long, default_value = "2")]
         failure_threshold: u32,
-        /// Enable email notifications
-        #[arg(long, default_value = "true")]
+        /// Enable or disable email notifications (true or false)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
         email: bool,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
@@ -1652,20 +1671,44 @@ async fn run_tunnel_json(
 const SESSION_TOKEN_VALIDITY_DAYS: i64 = 60;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    let cli = Cli::parse();
+    output::configure(cli.color, cli.json);
+    let json = cli.json;
+
+    if let Err(err) = run(cli).await {
+        display_error(&err, json);
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let Cli {
         command,
         json,
+        color: _,
+        yes,
         log_level,
         log_dir,
         log_stdout,
-    } = Cli::parse();
+    } = cli;
 
     let Some(command) = command else {
         Cli::command().print_help()?;
         println!();
         return Ok(());
     };
+
+    if json
+        && matches!(
+            &command,
+            Commands::Login { .. } | Commands::Completions { .. }
+        )
+    {
+        return Err(anyhow!(
+            "This command does not support --json. Run it without --json."
+        ));
+    }
 
     // Spawn background version check for non-interactive, non-update commands
     let update_handle =
@@ -1724,6 +1767,7 @@ async fn main() -> Result<()> {
                 // Setup TUI for listen command
                 let mut terminal = setup_terminal()?;
                 let mut app = App::new()?;
+                app.monochrome = !output::styles_enabled();
 
                 // Set app state to listening
                 app.state = AppState::Listening;
@@ -1759,7 +1803,7 @@ async fn main() -> Result<()> {
 
                 if let Err(err) = res {
                     error!(error = %err, "Application terminated with error");
-                    display_error(&err);
+                    return Err(err);
                 }
             }
         }
@@ -1894,7 +1938,11 @@ async fn main() -> Result<()> {
                                     output_field("KEY", "selected_organization_id"),
                                     output_field(
                                         "VALUE",
-                                        config.selected_organization_id.as_deref().unwrap().bold(),
+                                        config
+                                            .selected_organization_id
+                                            .as_deref()
+                                            .unwrap_or_default()
+                                            .bold(),
                                     ),
                                 ],
                             );
@@ -1902,15 +1950,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ => {
-                    eprint_status_block(
-                        OutputStatus::Err,
-                        "UNKNOWN CONFIG KEY",
-                        &[
-                            output_field("KEY", key),
-                            output_field("AVAILABLE", "selected_organization_id"),
-                        ],
-                    );
-                    std::process::exit(1);
+                    return Err(anyhow!(
+                        "Unknown config key `{key}`. Available key: selected_organization_id."
+                    ));
                 }
             },
         },
@@ -2059,6 +2101,15 @@ async fn main() -> Result<()> {
             EndpointAction::Delete { endpoint_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
+                if !confirm_destructive_action(
+                    "DELETE ENDPOINT?",
+                    &format!("endpoint {endpoint_id}"),
+                    &organization_id,
+                    yes,
+                    json,
+                )? {
+                    return Ok(());
+                }
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 client.delete_endpoint(&endpoint_id).await?;
@@ -2135,6 +2186,15 @@ async fn main() -> Result<()> {
             } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
+                if !confirm_destructive_action(
+                    "DELETE CAPTURED REQUEST?",
+                    &format!("request {request_id} from endpoint {endpoint_id}"),
+                    &organization_id,
+                    yes,
+                    json,
+                )? {
+                    return Ok(());
+                }
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 client
@@ -2311,6 +2371,15 @@ async fn main() -> Result<()> {
             StaticTunnelAction::Delete { slug_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
+                if !confirm_destructive_action(
+                    "DELETE STATIC TUNNEL?",
+                    &format!("static tunnel {slug_id}"),
+                    &organization_id,
+                    yes,
+                    json,
+                )? {
+                    return Ok(());
+                }
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let response = client
@@ -2507,6 +2576,15 @@ async fn main() -> Result<()> {
             ShareAction::Revoke { token, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
+                if !confirm_destructive_action(
+                    "REVOKE SHARED LINK?",
+                    &format!("share {token}"),
+                    &organization_id,
+                    yes,
+                    json,
+                )? {
+                    return Ok(());
+                }
                 let access_token = ensure_valid_token(&mut config).await?;
                 let client =
                     ApiClient::with_organization(access_token, Some(organization_id.clone()))?;
@@ -2671,6 +2749,15 @@ async fn main() -> Result<()> {
             MonitorAction::Delete { id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
+                if !confirm_destructive_action(
+                    "DELETE MONITOR?",
+                    &format!("monitor {id}"),
+                    &organization_id,
+                    yes,
+                    json,
+                )? {
+                    return Ok(());
+                }
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 client.delete_uptime_monitor(&id).await?;
@@ -2764,6 +2851,7 @@ async fn main() -> Result<()> {
                 // Setup TUI for tunnel command
                 let mut terminal = setup_terminal()?;
                 let mut app = App::new()?;
+                app.monochrome = !output::styles_enabled();
 
                 // Set app state to tunneling
                 app.state = AppState::Tunneling;
@@ -2800,7 +2888,7 @@ async fn main() -> Result<()> {
 
                 if let Err(err) = res {
                     error!(error = %err, "Application terminated with error");
-                    display_error(&err);
+                    return Err(err);
                 }
             }
         }
@@ -3070,12 +3158,54 @@ fn require_organization(cli_org: Option<String>, config: &config::Config) -> Res
     })
 }
 
+fn confirmation_is_yes(input: &str) -> bool {
+    input.trim().eq_ignore_ascii_case("yes")
+}
+
+fn confirm_destructive_action(
+    title: &str,
+    resource: &str,
+    organization_id: &str,
+    confirmed: bool,
+    json: bool,
+) -> Result<bool> {
+    if confirmed {
+        return Ok(true);
+    }
+
+    if json || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(anyhow!(
+            "Confirmation required for {resource}. Re-run with --yes after verifying the resource and organization."
+        ));
+    }
+
+    eprint_status(OutputStatus::Warn, title);
+    eprintln!();
+    eprint_field("RESOURCE", resource);
+    eprint_field("ORGANIZATION", organization_id);
+    eprint_field("CONSEQUENCE", "This action cannot be undone.");
+    eprint!("TYPE YES      Type `yes` to continue: ");
+    io::stderr().flush()?;
+
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    if confirmation_is_yes(&response) {
+        return Ok(true);
+    }
+
+    eprintln!();
+    eprint_status(OutputStatus::Info, "COMMAND CANCELED");
+    eprint_field("ACTION", "No changes were made.");
+    Ok(false)
+}
+
 const FIELD_LABEL_WIDTH: usize = 14;
 
 #[derive(Clone, Copy)]
 pub(crate) enum OutputStatus {
     Ok,
     Err,
+    Warn,
     Info,
 }
 
@@ -3084,6 +3214,7 @@ impl OutputStatus {
         match self {
             Self::Ok => "[OK]",
             Self::Err => "[ERR]",
+            Self::Warn => "[WARN]",
             Self::Info => "[INFO]",
         }
     }
@@ -3118,11 +3249,58 @@ pub(crate) fn format_field_line(label: &str, value: impl std::fmt::Display) -> S
     format!("{} {}", output_label(label), value)
 }
 
+fn wrap_plain_text(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+
+    for paragraph in value.lines() {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.chars().count() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current);
+                current = word.to_string();
+            }
+        }
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn format_wrapped_field_lines(label: &str, value: &str, width: u16) -> String {
+    let label = output_label(label);
+    let prefix_width = label.chars().count() + 1;
+    let value_width = usize::from(width).saturating_sub(prefix_width).max(1);
+    let continuation = " ".repeat(prefix_width);
+
+    wrap_plain_text(value, value_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                format!("{label} {line}")
+            } else {
+                format!("{continuation}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn styled_status_line(status: OutputStatus, title: &str) -> String {
     let line = format_status_line(status, title);
     match status {
         OutputStatus::Ok => line.green().bold().to_string(),
         OutputStatus::Err => line.red().bold().to_string(),
+        OutputStatus::Warn => line.yellow().bold().to_string(),
         OutputStatus::Info => line.blue().bold().to_string(),
     }
 }
@@ -3177,22 +3355,21 @@ fn print_status_block(status: OutputStatus, title: &str, fields: &[OutputField])
     }
 }
 
+fn print_empty_state(title: &str, action: &str) {
+    print_status(OutputStatus::Info, title);
+    println!();
+    println!(
+        "{}",
+        format_wrapped_field_lines("ACTION", action, output::terminal_width())
+    );
+}
+
 fn eprint_field(label: &str, value: impl std::fmt::Display) {
     eprintln!("{} {}", output_label(label).bold(), value);
 }
 
 fn eprint_status(status: OutputStatus, title: &str) {
     eprintln!("{}", styled_status_line(status, title));
-}
-
-fn eprint_status_block(status: OutputStatus, title: &str, fields: &[OutputField]) {
-    eprint_status(status, title);
-    if !fields.is_empty() {
-        eprintln!();
-    }
-    for field in fields {
-        eprint_field(field.label, &field.value);
-    }
 }
 
 fn print_field(label: &str, value: impl std::fmt::Display) {
@@ -3249,6 +3426,7 @@ fn new_table(headers: &[&str]) -> Table {
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL_CONDENSED)
+        .set_width(output::terminal_width())
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(headers);
     table
@@ -3256,7 +3434,10 @@ fn new_table(headers: &[&str]) -> Table {
 
 fn print_organizations(organizations: &[api::Organization], selected_org: Option<&str>) {
     if organizations.is_empty() {
-        print_status(OutputStatus::Info, "NO ORGANIZATIONS FOUND");
+        print_empty_state(
+            "NO ORGANIZATIONS FOUND",
+            "Run `hooklistener login --force` to refresh account access.",
+        );
         return;
     }
 
@@ -3274,7 +3455,10 @@ fn print_organizations(organizations: &[api::Organization], selected_org: Option
 
 fn print_endpoints(endpoints: &[api::DebugEndpointSummary]) {
     if endpoints.is_empty() {
-        print_status(OutputStatus::Info, "NO DEBUG ENDPOINTS FOUND");
+        print_empty_state(
+            "NO DEBUG ENDPOINTS FOUND",
+            "Run `hooklistener endpoint create <name>` to create one.",
+        );
         return;
     }
 
@@ -3304,7 +3488,10 @@ fn print_endpoint_detail(endpoint: &api::DebugEndpointSummary) {
 
 fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
     if response.data.is_empty() {
-        print_status(OutputStatus::Info, "NO REQUESTS FOUND");
+        print_empty_state(
+            "NO REQUESTS FOUND",
+            "Send a webhook, then run `hooklistener endpoint requests <endpoint-id>` again.",
+        );
         return;
     }
 
@@ -3354,7 +3541,10 @@ fn print_endpoint_request_detail(request: &api::DebugRequestDetail) {
 
 fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsResponse) {
     if response.data.is_empty() {
-        print_status(OutputStatus::Info, "NO FORWARDS FOUND");
+        print_empty_state(
+            "NO FORWARDS FOUND",
+            "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <target-url>`.",
+        );
         return;
     }
 
@@ -3560,7 +3750,10 @@ fn print_case_run_result(result: &api::CaseRunResult) {
 
 fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
     if response.static_tunnels.is_empty() {
-        print_status(OutputStatus::Info, "NO STATIC TUNNELS FOUND");
+        print_empty_state(
+            "NO STATIC TUNNELS FOUND",
+            "Run `hooklistener static-tunnel create <slug>` to reserve one.",
+        );
     } else {
         let mut table = new_table(&["ID", "Slug", "Name"]);
         for tunnel in &response.static_tunnels {
@@ -3578,7 +3771,10 @@ fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
 
 fn print_anon_events(response: &api::AnonEventsResponse) {
     if response.data.is_empty() {
-        print_status(OutputStatus::Info, "NO EVENTS CAPTURED");
+        print_empty_state(
+            "NO EVENTS CAPTURED",
+            "Send a webhook, then run `hooklistener anon events <endpoint-id> --token <token>`.",
+        );
     } else {
         let mut table = new_table(&["ID", "Method", "Received At"]);
         for event in &response.data {
@@ -3613,7 +3809,10 @@ fn print_anon_event_detail(event: &api::AnonEvent) {
 
 fn print_shared_requests(shares: &[api::SharedRequestSummary]) {
     if shares.is_empty() {
-        print_status(OutputStatus::Info, "NO SHARES FOUND");
+        print_empty_state(
+            "NO SHARES FOUND",
+            "Run `hooklistener share create <request-id>` to create one.",
+        );
         return;
     }
 
@@ -3724,7 +3923,10 @@ fn style_monitor_status(status: Option<&str>) -> String {
 
 fn print_monitors(monitors: &[api::UptimeMonitor]) {
     if monitors.is_empty() {
-        print_status(OutputStatus::Info, "NO UPTIME MONITORS FOUND");
+        print_empty_state(
+            "NO UPTIME MONITORS FOUND",
+            "Run `hooklistener monitor create <name> <url>` to create one.",
+        );
         return;
     }
 
@@ -3838,7 +4040,10 @@ fn print_uptime_checks(response: &api::UptimeChecksResponse) {
     }
 
     if response.data.is_empty() {
-        print_status(OutputStatus::Info, "NO CHECKS RECORDED");
+        print_empty_state(
+            "NO CHECKS RECORDED",
+            "Wait for the first interval, then run `hooklistener monitor checks <monitor-id>`.",
+        );
     } else {
         let mut table = new_table(&["ID", "Status", "Code", "Response", "Checked At", "Error"]);
         for check in &response.data {
@@ -4019,8 +4224,7 @@ where
                     app.tunnel_connected = false;
                 }
                 TunnelEvent::WebhookReceived(request) => {
-                    app.listening_requests.push(*request);
-                    app.listening_stats.total_requests += 1;
+                    app.push_listening_request(*request);
                 }
                 TunnelEvent::RequestReceived {
                     request_id,
@@ -4086,16 +4290,16 @@ where
                     status,
                     duration_ms,
                 } => {
-                    app.tunnel_status_message = Some((
-                        format!("Replayed {} {} {}ms", request_id, status, duration_ms),
-                        std::time::Instant::now(),
-                    ));
+                    app.set_tunnel_feedback(
+                        FeedbackKind::Success,
+                        format!("Replayed {request_id} {status} {duration_ms}ms"),
+                    );
                 }
                 TunnelEvent::ReplayFailed { request_id, error } => {
-                    app.tunnel_status_message = Some((
-                        format!("Replay {} failed: {}", request_id, error),
-                        std::time::Instant::now(),
-                    ));
+                    app.set_tunnel_feedback(
+                        FeedbackKind::Error,
+                        format!("Replay {request_id} failed: {error}"),
+                    );
                 }
                 TunnelEvent::ForwardSuccess { .. } => {
                     app.listening_stats.successful_forwards += 1;
@@ -4150,8 +4354,7 @@ where
                 if let Some(tx) = tunnel_event_tx.as_ref() {
                     spawn_tunnel_replay(replay_request, tx.clone());
                 } else {
-                    app.tunnel_status_message =
-                        Some(("Replay unavailable".to_string(), std::time::Instant::now()));
+                    app.set_tunnel_feedback(FeedbackKind::Warning, "Replay unavailable");
                 }
             }
 
@@ -4191,10 +4394,76 @@ fn error_hint(err: &anyhow::Error) -> Option<&str> {
     if let Some(e) = err.downcast_ref::<errors::UpdateError>() {
         return e.hint();
     }
+
+    let message = err.to_string();
+    if message.contains("Session expired") || message.contains("No access token") {
+        return Some("Run `hooklistener login` to re-authenticate.");
+    }
+    if message.contains("No organization selected") {
+        return Some("Run `hooklistener org use <organization-id>` or pass --org to the command.");
+    }
+    if message.contains("Confirmation required") {
+        return Some("Verify the resource and organization, then re-run with --yes.");
+    }
     None
 }
 
-fn display_error(err: &anyhow::Error) {
+fn error_code(err: &anyhow::Error) -> &'static str {
+    if err.downcast_ref::<errors::ApiError>().is_some() {
+        "api_error"
+    } else if err.downcast_ref::<errors::TunnelError>().is_some() {
+        "tunnel_error"
+    } else if err.downcast_ref::<errors::ConfigError>().is_some() {
+        "config_error"
+    } else if err.downcast_ref::<errors::UpdateError>().is_some() {
+        "update_error"
+    } else {
+        let message = err.to_string();
+        if message.contains("Confirmation required") {
+            "confirmation_required"
+        } else if message.contains("does not support --json") {
+            "unsupported_output_mode"
+        } else if message.contains("Session expired") || message.contains("No access token") {
+            "authentication_required"
+        } else if message.contains("No organization selected") {
+            "organization_required"
+        } else if message.contains("Unknown config key") {
+            "invalid_config_key"
+        } else {
+            "command_failed"
+        }
+    }
+}
+
+fn json_error_receipt(err: &anyhow::Error) -> serde_json::Value {
+    let causes = err
+        .chain()
+        .skip(1)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": error_code(err),
+            "message": err.to_string(),
+            "hint": error_hint(err),
+            "causes": causes,
+        }
+    })
+}
+
+fn display_error(err: &anyhow::Error, json: bool) {
+    if json {
+        match serde_json::to_string(&json_error_receipt(err)) {
+            Ok(receipt) => eprintln!("{receipt}"),
+            Err(_) => eprintln!(
+                r#"{{"ok":false,"error":{{"code":"serialization_error","message":"Failed to serialize the command error."}}}}"#
+            ),
+        }
+        return;
+    }
+
     eprint_status(OutputStatus::Err, "COMMAND FAILED");
     eprintln!();
     eprint_field("MESSAGE", err);
@@ -4292,8 +4561,12 @@ mod tests {
         output
     }
 
-    fn render_empty_status(title: &str) -> String {
-        format!("{}\n", format_status_line(OutputStatus::Info, title))
+    fn render_empty_status(title: &str, action: &str) -> String {
+        format!(
+            "{}\n\n{}\n",
+            format_status_line(OutputStatus::Info, title),
+            format_wrapped_field_lines("ACTION", action, 80)
+        )
     }
 
     fn make_config(selected_org: Option<&str>) -> config::Config {
@@ -4301,6 +4574,82 @@ mod tests {
             selected_organization_id: selected_org.map(String::from),
             ..config::Config::default()
         }
+    }
+
+    #[test]
+    fn json_error_receipt_has_stable_machine_readable_shape() {
+        let receipt = json_error_receipt(&anyhow!("Something failed"));
+
+        assert_eq!(receipt["ok"], false);
+        assert_eq!(receipt["error"]["code"], "command_failed");
+        assert_eq!(receipt["error"]["message"], "Something failed");
+        assert!(receipt["error"]["causes"].is_array());
+    }
+
+    #[test]
+    fn confirmation_requires_the_full_yes_token() {
+        assert!(confirmation_is_yes("yes\n"));
+        assert!(!confirmation_is_yes("y"));
+    }
+
+    #[test]
+    fn destructive_commands_accept_global_yes_flag() {
+        let cli =
+            Cli::try_parse_from(["hooklistener", "endpoint", "delete", "ep_123", "--yes"]).unwrap();
+
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn monitor_email_accepts_explicit_false() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--email=false",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Monitor {
+                action: MonitorAction::Create { email, .. },
+            }) => assert!(!email),
+            _ => panic!("expected monitor create command"),
+        }
+    }
+
+    #[test]
+    fn cases_run_parser_rejects_conflicting_target_options() {
+        let result = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_123",
+            "--target",
+            "cli",
+            "--target-url",
+            "http://localhost:3000",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn command_tables_fit_the_default_terminal_width() {
+        let output = render_table(
+            &["ID", "Method", "Status", "Webhook URL", "Name"],
+            [[
+                "endpoint_identifier_123",
+                "POST",
+                "active",
+                "https://example.hooklistener.dev/a/very/long/webhook/path",
+                "Production webhook receiver",
+            ]],
+        );
+
+        assert!(output.lines().all(|line| line.chars().count() <= 80));
     }
 
     #[test]
@@ -4700,23 +5049,63 @@ mod tests {
         let output = render_snapshot_sections(vec![
             (
                 "endpoint list",
-                render_empty_status("NO DEBUG ENDPOINTS FOUND"),
+                render_empty_status(
+                    "NO DEBUG ENDPOINTS FOUND",
+                    "Run `hooklistener endpoint create <name>` to create one.",
+                ),
             ),
-            ("request list", render_empty_status("NO REQUESTS FOUND")),
-            ("forward list", render_empty_status("NO FORWARDS FOUND")),
-            ("share list", render_empty_status("NO SHARES FOUND")),
+            (
+                "request list",
+                render_empty_status(
+                    "NO REQUESTS FOUND",
+                    "Send a webhook, then run `hooklistener endpoint requests <endpoint-id>` again.",
+                ),
+            ),
+            (
+                "forward list",
+                render_empty_status(
+                    "NO FORWARDS FOUND",
+                    "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <target-url>`.",
+                ),
+            ),
+            (
+                "share list",
+                render_empty_status(
+                    "NO SHARES FOUND",
+                    "Run `hooklistener share create <request-id>` to create one.",
+                ),
+            ),
             (
                 "monitor list",
-                render_empty_status("NO UPTIME MONITORS FOUND"),
+                render_empty_status(
+                    "NO UPTIME MONITORS FOUND",
+                    "Run `hooklistener monitor create <name> <url>` to create one.",
+                ),
             ),
-            ("monitor checks", render_empty_status("NO CHECKS RECORDED")),
+            (
+                "monitor checks",
+                render_empty_status(
+                    "NO CHECKS RECORDED",
+                    "Wait for the first interval, then run `hooklistener monitor checks <monitor-id>`.",
+                ),
+            ),
             (
                 "static tunnel list",
-                render_empty_status("NO STATIC TUNNELS FOUND"),
+                render_empty_status(
+                    "NO STATIC TUNNELS FOUND",
+                    "Run `hooklistener static-tunnel create <slug>` to reserve one.",
+                ),
             ),
-            ("anon events", render_empty_status("NO EVENTS CAPTURED")),
+            (
+                "anon events",
+                render_empty_status(
+                    "NO EVENTS CAPTURED",
+                    "Send a webhook, then run `hooklistener anon events <endpoint-id> --token <token>`.",
+                ),
+            ),
         ]);
 
+        assert!(output.lines().all(|line| line.chars().count() <= 80));
         insta::assert_snapshot!("command_output_empty_states", output);
     }
 

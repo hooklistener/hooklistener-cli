@@ -211,6 +211,8 @@ hooklistener endpoint delete-request <endpoint-id> <request-id>
 hooklistener endpoint delete <endpoint-id>
 ```
 
+Destructive commands show the resource and organization before asking for confirmation. In scripts, non-interactive shells, and JSON mode, add `--yes` after verifying the identifiers.
+
 ### Expose a local server with a public tunnel
 
 Use `tunnel` when a provider needs to reach your machine directly. Hooklistener creates a public URL and forwards traffic to your chosen host and port.
@@ -292,6 +294,9 @@ hooklistener monitor create "Production Webhook" https://example.com/webhook --i
 # Require a string in the response body
 hooklistener monitor create "Healthcheck" https://example.com/health --body-contains ok
 
+# Disable email notifications explicitly
+hooklistener monitor create "Internal Healthcheck" https://example.com/health --email=false
+
 # Review and manage monitors
 hooklistener monitor list
 hooklistener monitor show <monitor-id>
@@ -317,6 +322,37 @@ hooklistener --json monitor list
 
 `endpoint forward-request --json` returns a durable command receipt with `resource_uri`, `poll_url`, and `next_actions` fields so automation can inspect the queued forward without parsing human output.
 Long-running `listen --json` and `tunnel --json` commands stream newline-delimited JSON. Each line is one receipt or event object, so agents can read startup state, connection status, captured request `resource_uri` values, and forwarding outcomes incrementally.
+
+Runtime failures use the same machine-readable envelope:
+
+```json
+{"error":{"causes":[],"code":"command_failed","hint":null,"message":"..."},"ok":false}
+```
+
+`login` and `completions` do not support JSON and reject that combination explicitly. Exit status `0` means success, `1` means a runtime or command failure, and `2` means command-line parsing failed. Destructive commands in automation require `--yes`.
+
+## Terminal Output and Accessibility
+
+Human output uses terminal-aware styling by default. Styling is removed when stdout or stderr is redirected, when `NO_COLOR` is set, or when you pass `--color never`. Use `--color always` only when the destination supports ANSI control sequences.
+
+```bash
+hooklistener --color never endpoint list
+NO_COLOR=1 hooklistener monitor list
+```
+
+The same policy applies to the TUI. In monochrome mode, state remains visible through labels, status tokens, selection carets, and text weight. The TUI is keyboard operated; its status bar shows the shortcuts available in the current view.
+
+Tunnel filters accept free text and field filters:
+
+```text
+method:post
+status:500
+path:/billing
+header:stripe
+pinned:true
+```
+
+Request exports first use the system clipboard. If a clipboard is unavailable, such as in some SSH or headless sessions, the TUI writes the requested cURL or JSON export to the current directory and reports the path.
 
 Generate shell completions for your shell:
 

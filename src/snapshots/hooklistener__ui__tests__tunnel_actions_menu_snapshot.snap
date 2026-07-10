@@ -8,7 +8,7 @@ expression: snapshot
  │ https://snap.hook.events  →  localhost:3000                                                                        │
  └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
   Statistics ──────────────────────────────────────────────────────────────────────────────────────────────────────────
-  Requests 1  2xx 1  4xx 0  5xx 0  E┌ Actions ────────────────────────────────────┐ Live
+  Requests 1  2xx 1  4xx 0  5xx 0  E┌ Actions ────────────────────────────────────┐ 42ms
                                     │  req-sn  POST /webhooks/orders?source=insta │
   Live Requests (1) | Enter expand |│                                             │────────────────────────────────────
    ID       Age    Method   Path    │  Tab    View pinned only                    │ Duration   Size     From

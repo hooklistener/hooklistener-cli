@@ -8,20 +8,20 @@ expression: snapshot
  │ https://plant-07.hook.events  →  localhost:8080                            │
  └────────────────────────────────────────────────────────────────────────────┘
   Statistics ──────────────────────────────────────────────────────────────────
-  Requests 2xx 2  4xx 1  5xx 1  Err 0  Avg 467ms Last 200  View All  Follow Pau
+  Requests 5  2xx 2  4xx 1  5xx 1  Err 0  Follow Paused  View All  Avg 467ms
 
   Live Requests (5) | Enter expand | D details ────────────────────────────────
-   ID     Age    Method Path                 Status   Duration Size    From
+   ID       Age   Method  Path               Status  Duration   From
 
-   req-pe now    PATCH  /replay/pending      200      --       68b     192.0.2.
-   req-50 now    POST   /webhooks/billing/in 502      1420ms   68b     203.0.11
-   req-40 now    GET    /webhooks/users/miss 404      88ms     68b     203.0.11
- ▸ req-20 now    PUT    /deployments/prod    202      318ms    68b     198.51.1
-   req-20 now    POST   /webhooks/orders     200      42ms     68b     198.51.1
-
-
+   req-pe   now   PATCH   /replay/pending    200     --         192.0.2.77
+   req-50   now   POST    /webhooks/billing/ 502     1420ms     203.0.113.91
+   req-40   now   GET     /webhooks/users/mi 404     88ms       203.0.113.24
+ ▸ req-20   now   PUT     /deployments/prod  202     318ms      198.51.100.11
+   req-20   now   POST    /webhooks/orders   200     42ms       198.51.100.10
 
 
 
 
- Tunnel (5)  ↑↓ Select | Enter Expand | Tab Pins | P Pin | A Ac  API connected
+
+
+ Tunnel (5)  ↑↓ | Enter Expand | A Menu | / Filter | Q Quit      API connected
