@@ -6,14 +6,55 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Message, error::Error as WsError, http::StatusCode},
+    connect_async, connect_async_with_config,
+    tungstenite::{Message, error::Error as WsError, http::StatusCode, protocol::WebSocketConfig},
 };
 use tracing::{debug, error, info, warn};
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
+
+// A 256 MiB body expands to about 342 MiB as unpadded base64. The remaining
+// space covers the Phoenix envelope and the advertised response-header limit.
+const TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 402_653_184;
+const LEGACY_MAX_REQUEST_BODY_BYTES: usize = 10_485_760;
+const LEGACY_MAX_RESPONSE_BODY_BYTES: usize = 7_000_000;
+const LEGACY_MAX_RESPONSE_HEADER_BYTES: usize = 1_048_576;
+const MAX_RAW_BODY_BYTES: usize = 1_048_576;
+const UI_BODY_PREVIEW_BYTES: usize = 65_536;
+
+#[derive(Clone, Copy, Debug)]
+struct TunnelLimits {
+    max_request_body_bytes: usize,
+    max_response_body_bytes: usize,
+    max_response_header_bytes: usize,
+}
+
+impl TunnelLimits {
+    fn from_join_response(response: &serde_json::Value) -> Self {
+        let limits = response.get("limits");
+        let advertised_body_limit = json_limit(limits, "max_body_bytes");
+
+        Self {
+            max_request_body_bytes: advertised_body_limit.unwrap_or(LEGACY_MAX_REQUEST_BODY_BYTES),
+            max_response_body_bytes: advertised_body_limit
+                .unwrap_or(LEGACY_MAX_RESPONSE_BODY_BYTES),
+            max_response_header_bytes: json_limit(limits, "max_response_header_bytes")
+                .unwrap_or(LEGACY_MAX_RESPONSE_HEADER_BYTES),
+        }
+    }
+}
+
+fn json_limit(limits: Option<&serde_json::Value>, key: &str) -> Option<usize> {
+    limits?.get(key)?.as_u64()?.try_into().ok()
+}
+
+fn tunnel_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES))
+        .max_frame_size(Some(TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES))
+}
 
 /// Extract the string representation of a JSON value.
 /// Returns the inner string for `Value::String`, otherwise uses `to_string()`.
@@ -55,10 +96,34 @@ fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<Stri
 }
 
 fn encode_response_body(bytes: &[u8]) -> (String, &'static str) {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => (text.to_string(), "raw"),
-        Err(_) => (URL_SAFE_NO_PAD.encode(bytes), "base64"),
+    if bytes.len() <= MAX_RAW_BODY_BYTES
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        return (text.to_string(), "raw");
     }
+
+    (URL_SAFE_NO_PAD.encode(bytes), "base64")
+}
+
+fn response_header_bytes(headers: &reqwest::header::HeaderMap) -> usize {
+    headers.iter().fold(0usize, |total, (name, value)| {
+        total.saturating_add(name.as_str().len() + value.as_bytes().len() + 4)
+    })
+}
+
+fn body_preview(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let preview_length = bytes.len().min(UI_BODY_PREVIEW_BYTES);
+    let mut preview = String::from_utf8_lossy(&bytes[..preview_length]).into_owned();
+
+    if bytes.len() > preview_length {
+        preview.push_str(&format!("\n… [truncated; {} bytes total]", bytes.len()));
+    }
+
+    Some(preview)
 }
 
 fn with_forward_id(mut payload: serde_json::Value, forward_id: Option<&str>) -> serde_json::Value {
@@ -849,7 +914,13 @@ impl TunnelForwarder {
         debug!("Tunnel WebSocket URL: {}", ws_url);
 
         // Connect to WebSocket
-        let (ws_stream, _) = match connect_async(&ws_url).await {
+        let (ws_stream, _) = match connect_async_with_config(
+            &ws_url,
+            Some(tunnel_websocket_config()),
+            false,
+        )
+        .await
+        {
             Ok(stream) => stream,
             Err(e) => {
                 let msg = format!("Failed to connect to tunnel: {}", e);
@@ -895,6 +966,11 @@ impl TunnelForwarder {
         // Wait for join confirmation
         let mut joined = false;
         let mut tunnel_topic = String::new();
+        let mut tunnel_limits = TunnelLimits {
+            max_request_body_bytes: LEGACY_MAX_REQUEST_BODY_BYTES,
+            max_response_body_bytes: LEGACY_MAX_RESPONSE_BODY_BYTES,
+            max_response_header_bytes: LEGACY_MAX_RESPONSE_HEADER_BYTES,
+        };
 
         while !joined {
             match tokio::time::timeout(Duration::from_secs(10), read.next()).await {
@@ -908,6 +984,7 @@ impl TunnelForwarder {
                             if status == "ok" {
                                 // Extract subdomain, tunnel_id, and static flag from response
                                 if let Some(response) = msg.payload.get("response") {
+                                    tunnel_limits = TunnelLimits::from_join_response(response);
                                     let subdomain = response
                                         .get("subdomain")
                                         .and_then(|s| s.as_str())
@@ -929,6 +1006,9 @@ impl TunnelForwarder {
                                         subdomain = %subdomain,
                                         tunnel_id = %tunnel_id,
                                         tunnel_type = %tunnel_type,
+                                        max_request_body_bytes = tunnel_limits.max_request_body_bytes,
+                                        max_response_body_bytes = tunnel_limits.max_response_body_bytes,
+                                        max_response_header_bytes = tunnel_limits.max_response_header_bytes,
                                         "Tunnel established"
                                     );
 
@@ -1004,7 +1084,7 @@ impl TunnelForwarder {
                 Ok(Some(msg)) => match msg {
                     Ok(Message::Text(text)) => {
                         if let Err(e) = self
-                            .handle_tunnel_message(&text, &mut write, &tunnel_topic)
+                            .handle_tunnel_message(&text, &mut write, &tunnel_topic, tunnel_limits)
                             .await
                         {
                             error!("Error handling tunnel message: {}", e);
@@ -1060,6 +1140,7 @@ impl TunnelForwarder {
             Message,
         >,
         tunnel_topic: &str,
+        tunnel_limits: TunnelLimits,
     ) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
 
@@ -1116,18 +1197,30 @@ impl TunnelForwarder {
                         raw_body.as_bytes().to_vec()
                     };
 
+                    if body.len() > tunnel_limits.max_request_body_bytes {
+                        self.report_tunnel_failure(
+                            &request_id,
+                            format!(
+                                "Tunnel request body exceeds advertised limit ({} > {} bytes)",
+                                body.len(),
+                                tunnel_limits.max_request_body_bytes
+                            ),
+                            write,
+                            tunnel_topic,
+                        )
+                        .await?;
+
+                        return Ok(());
+                    }
+
                     // Convert headers Map<String, Value> → HashMap<String, String>
                     let headers_map: HashMap<String, String> = headers
                         .iter()
                         .map(|(k, v)| (k.clone(), json_value_to_string(v)))
                         .collect();
 
-                    // Convert body bytes to Option<String>
-                    let body_string = if body.is_empty() {
-                        None
-                    } else {
-                        Some(String::from_utf8_lossy(&body).into_owned())
-                    };
+                    // Keep the TUI history bounded while forwarding the complete body.
+                    let body_string = body_preview(&body);
 
                     // Notify UI about request
                     let _ = self
@@ -1152,6 +1245,7 @@ impl TunnelForwarder {
                         body,
                         write,
                         tunnel_topic,
+                        tunnel_limits,
                     )
                     .await?;
                 }
@@ -1191,6 +1285,7 @@ impl TunnelForwarder {
             Message,
         >,
         tunnel_topic: &str,
+        tunnel_limits: TunnelLimits,
     ) -> Result<()> {
         let start_time = tokio::time::Instant::now();
 
@@ -1255,26 +1350,84 @@ impl TunnelForwarder {
 
         // Send request and handle response
         match req_builder.send().await {
-            Ok(response) => {
+            Ok(mut response) => {
                 let status = response.status().as_u16();
+
+                let header_bytes = response_header_bytes(response.headers());
+                if header_bytes > tunnel_limits.max_response_header_bytes {
+                    let error_msg = format!(
+                        "Local response headers exceed tunnel limit ({} > {} bytes)",
+                        header_bytes, tunnel_limits.max_response_header_bytes
+                    );
+
+                    return self
+                        .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                        .await;
+                }
+
                 let response_headers: HashMap<String, String> = response
                     .headers()
                     .iter()
                     .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
 
-                // Get response as bytes to handle binary content properly
-                let response_bytes = response.bytes().await.unwrap_or_default();
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > tunnel_limits.max_response_body_bytes as u64)
+                {
+                    let error_msg = format!(
+                        "Local response body exceeds tunnel limit (max {} bytes)",
+                        tunnel_limits.max_response_body_bytes
+                    );
 
-                // Check if the response is valid UTF-8 (text) or binary
-                let (response_body, body_encoding) =
-                    if let Ok(text) = std::str::from_utf8(&response_bytes) {
-                        // Valid UTF-8, send as raw
-                        (text.to_string(), "raw")
-                    } else {
-                        // Binary content, encode as base64
-                        (URL_SAFE_NO_PAD.encode(&response_bytes), "base64")
-                    };
+                    return self
+                        .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                        .await;
+                }
+
+                let initial_capacity = response
+                    .content_length()
+                    .and_then(|length| usize::try_from(length).ok())
+                    .unwrap_or(0)
+                    .min(tunnel_limits.max_response_body_bytes);
+                let mut response_bytes = Vec::with_capacity(initial_capacity);
+
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if response_bytes.len().saturating_add(chunk.len())
+                                > tunnel_limits.max_response_body_bytes
+                            {
+                                let error_msg = format!(
+                                    "Local response body exceeds tunnel limit (max {} bytes)",
+                                    tunnel_limits.max_response_body_bytes
+                                );
+
+                                return self
+                                    .report_tunnel_failure(
+                                        &request_id,
+                                        error_msg,
+                                        write,
+                                        tunnel_topic,
+                                    )
+                                    .await;
+                            }
+
+                            response_bytes.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let error_msg = format!("Failed to read local response: {error}");
+
+                            return self
+                                .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                                .await;
+                        }
+                    }
+                }
+
+                let response_body_preview = body_preview(&response_bytes);
+                let (response_body, body_encoding) = encode_response_body(&response_bytes);
 
                 let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -1294,7 +1447,7 @@ impl TunnelForwarder {
                         status,
                         duration_ms,
                         response_headers: response_headers.clone(),
-                        response_body: Some(response_body.clone()),
+                        response_body: response_body_preview,
                     })
                     .await;
 
@@ -1369,6 +1522,32 @@ impl TunnelForwarder {
         let error_json = serde_json::to_string(&error_message)?;
         write.send(Message::Text(error_json.into())).await?;
         Ok(())
+    }
+
+    async fn report_tunnel_failure(
+        &self,
+        request_id: &str,
+        error: String,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        tunnel_topic: &str,
+    ) -> Result<()> {
+        error!(request_id = %request_id, error = %error, "Tunnel request failed");
+
+        let _ = self
+            .event_tx
+            .send(TunnelEvent::RequestFailed {
+                request_id: request_id.to_string(),
+                error: error.clone(),
+            })
+            .await;
+
+        self.send_tunnel_error(request_id, &error, write, tunnel_topic)
+            .await
     }
 
     /// Connect with automatic reconnection on recoverable errors
@@ -1492,6 +1671,56 @@ mod tests {
         assert!(should_forward_request_header("content-type"));
         assert!(should_forward_request_header("authorization"));
         assert!(should_forward_request_header("x-custom-header"));
+    }
+
+    #[test]
+    fn test_tunnel_websocket_config_accepts_advertised_messages() {
+        let config = tunnel_websocket_config();
+
+        assert_eq!(
+            config.max_message_size,
+            Some(TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES)
+        );
+        assert_eq!(
+            config.max_frame_size,
+            Some(TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES)
+        );
+    }
+
+    #[test]
+    fn test_tunnel_limits_use_join_response_contract() {
+        let response = serde_json::json!({
+            "limits": {
+                "max_body_bytes": 268_435_456,
+                "max_response_header_bytes": 16_777_216
+            }
+        });
+
+        let limits = TunnelLimits::from_join_response(&response);
+
+        assert_eq!(limits.max_request_body_bytes, 268_435_456);
+        assert_eq!(limits.max_response_body_bytes, 268_435_456);
+        assert_eq!(limits.max_response_header_bytes, 16_777_216);
+    }
+
+    #[test]
+    fn test_large_text_response_uses_bounded_base64_encoding() {
+        let body = vec![b'a'; MAX_RAW_BODY_BYTES + 1];
+
+        let (encoded, encoding) = encode_response_body(&body);
+
+        assert_eq!(encoding, "base64");
+        assert_eq!(URL_SAFE_NO_PAD.decode(encoded).unwrap(), body);
+    }
+
+    #[test]
+    fn test_body_preview_is_bounded() {
+        let body = vec![b'a'; UI_BODY_PREVIEW_BYTES * 2];
+        let preview = body_preview(&body).unwrap();
+
+        assert!(preview.len() <= UI_BODY_PREVIEW_BYTES + 64);
+        assert!(preview.contains("truncated"));
+        assert!(preview.contains(&(UI_BODY_PREVIEW_BYTES * 2).to_string()));
     }
 
     // TunnelWebhookRequest tests
