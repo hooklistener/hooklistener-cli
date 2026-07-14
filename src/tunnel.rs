@@ -29,6 +29,7 @@ struct TunnelLimits {
     max_request_body_bytes: usize,
     max_response_body_bytes: usize,
     max_response_header_bytes: usize,
+    ordered_response_headers: bool,
 }
 
 impl TunnelLimits {
@@ -42,6 +43,10 @@ impl TunnelLimits {
                 .unwrap_or(LEGACY_MAX_RESPONSE_BODY_BYTES),
             max_response_header_bytes: json_limit(limits, "max_response_header_bytes")
                 .unwrap_or(LEGACY_MAX_RESPONSE_HEADER_BYTES),
+            ordered_response_headers: limits
+                .and_then(|limits| limits.get("response_headers_format"))
+                .and_then(|format| format.as_str())
+                == Some("ordered_pairs"),
         }
     }
 }
@@ -84,6 +89,20 @@ fn should_forward_request_header(key: &str) -> bool {
 }
 
 fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.as_str().to_string(),
+                value.to_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn response_headers_to_ordered_pairs(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(key, value)| {
@@ -970,6 +989,7 @@ impl TunnelForwarder {
             max_request_body_bytes: LEGACY_MAX_REQUEST_BODY_BYTES,
             max_response_body_bytes: LEGACY_MAX_RESPONSE_BODY_BYTES,
             max_response_header_bytes: LEGACY_MAX_RESPONSE_HEADER_BYTES,
+            ordered_response_headers: false,
         };
 
         while !joined {
@@ -1306,6 +1326,7 @@ impl TunnelForwarder {
         // Create HTTP client with timeout
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         // Build request
@@ -1365,11 +1386,15 @@ impl TunnelForwarder {
                         .await;
                 }
 
-                let response_headers: HashMap<String, String> = response
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                    .collect();
+                let response_header_pairs = response_headers_to_ordered_pairs(response.headers());
+                let response_headers: HashMap<String, String> =
+                    response_header_pairs.iter().cloned().collect();
+
+                let wire_response_headers = if tunnel_limits.ordered_response_headers {
+                    serde_json::json!(response_header_pairs)
+                } else {
+                    serde_json::json!(response_headers)
+                };
 
                 if response
                     .content_length()
@@ -1458,7 +1483,7 @@ impl TunnelForwarder {
                     payload: serde_json::json!({
                         "request_id": request_id,
                         "status": status,
-                        "headers": response_headers,
+                        "headers": wire_response_headers,
                         "body": response_body,
                         "body_encoding": body_encoding,
                     }),
@@ -1692,7 +1717,8 @@ mod tests {
         let response = serde_json::json!({
             "limits": {
                 "max_body_bytes": 268_435_456,
-                "max_response_header_bytes": 16_777_216
+                "max_response_header_bytes": 16_777_216,
+                "response_headers_format": "ordered_pairs"
             }
         });
 
@@ -1701,6 +1727,29 @@ mod tests {
         assert_eq!(limits.max_request_body_bytes, 268_435_456);
         assert_eq!(limits.max_response_body_bytes, 268_435_456);
         assert_eq!(limits.max_response_header_bytes, 16_777_216);
+        assert!(limits.ordered_response_headers);
+    }
+
+    #[test]
+    fn test_tunnel_limits_keep_legacy_response_header_shape_by_default() {
+        let limits = TunnelLimits::from_join_response(&serde_json::json!({}));
+
+        assert!(!limits.ordered_response_headers);
+    }
+
+    #[test]
+    fn test_response_headers_preserve_duplicate_order() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append("set-cookie", "first=1".parse().unwrap());
+        headers.append("set-cookie", "second=2".parse().unwrap());
+
+        assert_eq!(
+            response_headers_to_ordered_pairs(&headers),
+            vec![
+                ("set-cookie".to_string(), "first=1".to_string()),
+                ("set-cookie".to_string(), "second=2".to_string())
+            ]
+        );
     }
 
     #[test]
