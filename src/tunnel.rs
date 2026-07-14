@@ -197,6 +197,7 @@ pub enum TunnelEvent {
         headers: HashMap<String, String>,
         body: Option<String>,
         query_string: String,
+        replay: bool,
     },
     RequestForwarded {
         request_id: String,
@@ -217,6 +218,18 @@ pub enum TunnelEvent {
     ReplayFailed {
         request_id: String,
         error: String,
+    },
+    BufferedSummary {
+        count: u64,
+        oldest_captured_at: Option<String>,
+    },
+    BufferedReplayed {
+        capture_id: String,
+        status: u16,
+    },
+    BufferedReplayFailed {
+        capture_id: String,
+        reason: String,
     },
     WebhookReceived(Box<crate::models::WebhookRequest>),
     ForwardSuccess {
@@ -902,9 +915,11 @@ pub struct TunnelForwarder {
     slug: Option<String>,
     base_url: String,
     event_tx: mpsc::Sender<TunnelEvent>,
+    replay_buffered: bool,
 }
 
 impl TunnelForwarder {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         access_token_rx: watch::Receiver<String>,
         local_host: String,
@@ -912,6 +927,7 @@ impl TunnelForwarder {
         org_id: Option<String>,
         slug: Option<String>,
         event_tx: mpsc::Sender<TunnelEvent>,
+        replay_buffered: bool,
     ) -> Self {
         let base_url = std::env::var("HOOKLISTENER_API_URL")
             .unwrap_or_else(|_| "https://app.hooklistener.com".to_string());
@@ -924,6 +940,7 @@ impl TunnelForwarder {
             slug,
             base_url,
             event_tx,
+            replay_buffered,
         }
     }
 
@@ -1099,6 +1116,10 @@ impl TunnelForwarder {
         });
         let mut in_flight = tokio::task::JoinSet::new();
 
+        // Auto-drain buffered requests at most once per connection so a
+        // persistently failing replay cannot loop forever.
+        let mut auto_drain_requested = false;
+
         // Track last ping time
         let mut last_ping = tokio::time::Instant::now();
         let ping_interval = Duration::from_secs(30);
@@ -1153,6 +1174,7 @@ impl TunnelForwarder {
                                 &tunnel_topic,
                                 tunnel_limits,
                                 &mut in_flight,
+                                &mut auto_drain_requested,
                             )
                             .await
                         {
@@ -1209,6 +1231,7 @@ impl TunnelForwarder {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_tunnel_message(
         &self,
         text: &str,
@@ -1216,6 +1239,7 @@ impl TunnelForwarder {
         tunnel_topic: &str,
         tunnel_limits: TunnelLimits,
         in_flight: &mut tokio::task::JoinSet<Result<()>>,
+        auto_drain_requested: &mut bool,
     ) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
 
@@ -1254,6 +1278,10 @@ impl TunnelForwarder {
                         .and_then(|v| v.as_object())
                         .cloned()
                         .unwrap_or_default();
+                    let replay = payload
+                        .get("replay")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
 
                     // Decode body based on body_encoding field
                     let body_encoding = payload
@@ -1307,6 +1335,7 @@ impl TunnelForwarder {
                             headers: headers_map,
                             body: body_string,
                             query_string: query_string.clone(),
+                            replay,
                         })
                         .await;
 
@@ -1333,9 +1362,114 @@ impl TunnelForwarder {
                     });
                 }
             }
+            "buffered_summary" => {
+                let count = msg
+                    .payload
+                    .get("count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let oldest_captured_at = msg
+                    .payload
+                    .get("oldest_captured_at")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                info!(count = count, "Buffered requests waiting on server");
+
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::BufferedSummary {
+                        count,
+                        oldest_captured_at,
+                    })
+                    .await;
+
+                if self.replay_buffered && count > 0 && !*auto_drain_requested {
+                    *auto_drain_requested = true;
+
+                    let replay_msg = ChannelMessage {
+                        topic: tunnel_topic.to_string(),
+                        event: "buffered:replay".to_string(),
+                        payload: serde_json::json!({}),
+                        reference: Some("buffered-replay".to_string()),
+                    };
+
+                    let json = serde_json::to_string(&replay_msg)?;
+                    outbound_tx
+                        .send(Message::Text(json.into()))
+                        .await
+                        .context("Failed to send buffered replay request")?;
+                }
+            }
+            "buffered_replayed" => {
+                let capture_id = msg
+                    .payload
+                    .get("capture_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let status = msg
+                    .payload
+                    .get("status")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u16::try_from(v).ok())
+                    .unwrap_or(0);
+
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::BufferedReplayed { capture_id, status })
+                    .await;
+            }
+            "buffered_replay_failed" => {
+                let capture_id = msg
+                    .payload
+                    .get("capture_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let reason = msg
+                    .payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::BufferedReplayFailed { capture_id, reason })
+                    .await;
+            }
             "phx_reply" => {
-                // Handle ping replies
-                if let Some(response) = msg.payload.get("response")
+                if msg.reference.as_deref() == Some("buffered-replay") {
+                    // Reply to our buffered:replay drain request
+                    let status = msg
+                        .payload
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if status != "ok" {
+                        let reason = msg
+                            .payload
+                            .get("response")
+                            .and_then(|r| r.get("reason"))
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        // An empty buffer is not an error worth surfacing.
+                        if reason != "buffer_empty" {
+                            warn!(reason = %reason, "Buffered replay request rejected");
+                            let _ = self
+                                .event_tx
+                                .send(TunnelEvent::BufferedReplayFailed {
+                                    capture_id: "unknown".to_string(),
+                                    reason,
+                                })
+                                .await;
+                        }
+                    }
+                } else if let Some(response) = msg.payload.get("response")
                     && response
                         .get("pong")
                         .and_then(|v| v.as_bool())
