@@ -179,6 +179,10 @@ enum Commands {
         /// Static tunnel slug (paid plans only, creates persistent subdomain)
         #[arg(short, long)]
         slug: Option<String>,
+
+        /// Do not automatically replay requests buffered while the tunnel was offline
+        #[arg(long)]
+        no_replay_buffered: bool,
     },
 }
 
@@ -1215,10 +1219,12 @@ fn tunnel_event_receipt(
             headers,
             body,
             query_string,
+            replay,
         } => {
             let request_resource_uri = request_resource_uri(request_id);
             let mut receipt = tunnel_event_base("request_received", "received");
             receipt["request_id"] = serde_json::json!(request_id);
+            receipt["replay"] = serde_json::json!(replay);
             receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
             receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
             receipt["method"] = serde_json::json!(method);
@@ -1298,6 +1304,37 @@ fn tunnel_event_receipt(
             receipt["retryable"] = serde_json::json!(false);
             receipt["next_actions"] = serde_json::json!([
                 "Verify authentication, organization scope, requested slug, and network connectivity."
+            ]);
+            receipt
+        }
+        TunnelEvent::BufferedSummary {
+            count,
+            oldest_captured_at,
+        } => {
+            let mut receipt = tunnel_event_base("buffered_summary", "buffered");
+            receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
+            receipt["count"] = serde_json::json!(count);
+            receipt["oldest_captured_at"] = serde_json::json!(oldest_captured_at);
+            receipt
+        }
+        TunnelEvent::BufferedReplayed { capture_id, status } => {
+            let request_resource_uri = request_resource_uri(capture_id);
+            let mut receipt = tunnel_event_base("buffered_replayed", "succeeded");
+            receipt["capture_id"] = serde_json::json!(capture_id);
+            receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["status_code"] = serde_json::json!(status);
+            receipt
+        }
+        TunnelEvent::BufferedReplayFailed { capture_id, reason } => {
+            let request_resource_uri = request_resource_uri(capture_id);
+            let mut receipt = tunnel_event_base("buffered_replay_failed", "failed");
+            receipt["capture_id"] = serde_json::json!(capture_id);
+            receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
+            receipt["error"] = serde_json::json!(reason);
+            receipt["next_actions"] = serde_json::json!([
+                "The request stays buffered. Check the local target and reconnect to retry."
             ]);
             receipt
         }
@@ -1670,6 +1707,7 @@ async fn run_tunnel_json(
     port: u16,
     organization_id: Option<String>,
     slug: Option<String>,
+    replay_buffered: bool,
 ) -> Result<()> {
     print_json_line(&tunnel_started_receipt(
         &host,
@@ -1686,6 +1724,7 @@ async fn run_tunnel_json(
         organization_id.clone(),
         slug.clone(),
         event_tx,
+        replay_buffered,
     ));
 
     stream_tunnel_json_events(
@@ -2858,6 +2897,7 @@ async fn run(cli: Cli) -> Result<()> {
             host,
             org,
             slug,
+            no_replay_buffered,
         } => {
             // Initialize logging for tunnel
             let log_config = LogConfig {
@@ -2875,8 +2915,18 @@ async fn run(cli: Cli) -> Result<()> {
             let access_token = ensure_valid_token(&mut config).await?;
             let access_token_rx = refreshed_access_token_rx(access_token, config);
 
+            let replay_buffered = !no_replay_buffered;
+
             if json {
-                run_tunnel_json(access_token_rx, host, port, selected_org, slug).await?;
+                run_tunnel_json(
+                    access_token_rx,
+                    host,
+                    port,
+                    selected_org,
+                    slug,
+                    replay_buffered,
+                )
+                .await?;
             } else {
                 // Setup TUI for tunnel command
                 let mut terminal = setup_terminal()?;
@@ -2902,6 +2952,7 @@ async fn run(cli: Cli) -> Result<()> {
                     selected_org,
                     slug,
                     event_tx.clone(),
+                    replay_buffered,
                 );
 
                 let res = run_app(
@@ -4110,6 +4161,7 @@ fn spawn_tunnel_forwarder_manager(
     org: Option<String>,
     slug: Option<String>,
     event_tx: mpsc::Sender<TunnelEvent>,
+    replay_buffered: bool,
 ) -> mpsc::UnboundedSender<()> {
     let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel::<()>();
 
@@ -4121,6 +4173,7 @@ fn spawn_tunnel_forwarder_manager(
             org.clone(),
             slug.clone(),
             event_tx.clone(),
+            replay_buffered,
         ));
 
         while reconnect_rx.recv().await.is_some() {
@@ -4137,6 +4190,7 @@ fn spawn_tunnel_forwarder_manager(
                 org.clone(),
                 slug.clone(),
                 event_tx.clone(),
+                replay_buffered,
             ));
         }
 
@@ -4154,9 +4208,17 @@ async fn run_tunnel_forwarder_connection(
     org: Option<String>,
     slug: Option<String>,
     event_tx: mpsc::Sender<TunnelEvent>,
+    replay_buffered: bool,
 ) {
-    let tunnel_forwarder =
-        tunnel::TunnelForwarder::new(access_token_rx, host, port, org, slug, event_tx);
+    let tunnel_forwarder = tunnel::TunnelForwarder::new(
+        access_token_rx,
+        host,
+        port,
+        org,
+        slug,
+        event_tx,
+        replay_buffered,
+    );
 
     if let Err(e) = tunnel_forwarder
         .connect_with_reconnect(tunnel::ReconnectConfig::default())
@@ -4263,6 +4325,7 @@ where
                     headers,
                     body,
                     query_string,
+                    replay: _,
                 } => {
                     use std::time::Instant;
                     let tunnel_request = app::TunnelRequest {
@@ -4329,6 +4392,32 @@ where
                     app.set_tunnel_feedback(
                         FeedbackKind::Error,
                         format!("Replay {request_id} failed: {error}"),
+                    );
+                }
+                TunnelEvent::BufferedSummary {
+                    count,
+                    oldest_captured_at: _,
+                } => {
+                    if count > 0 {
+                        app.set_tunnel_feedback(
+                            FeedbackKind::Info,
+                            format!(
+                                "{count} request{} buffered while offline",
+                                if count == 1 { "" } else { "s" }
+                            ),
+                        );
+                    }
+                }
+                TunnelEvent::BufferedReplayed { capture_id, status } => {
+                    app.set_tunnel_feedback(
+                        FeedbackKind::Success,
+                        format!("Replayed buffered {capture_id} → {status}"),
+                    );
+                }
+                TunnelEvent::BufferedReplayFailed { capture_id, reason } => {
+                    app.set_tunnel_feedback(
+                        FeedbackKind::Error,
+                        format!("Buffered replay {capture_id} failed: {reason}"),
                     );
                 }
                 TunnelEvent::ForwardSuccess { .. } => {
@@ -5355,6 +5444,7 @@ mod tests {
             headers,
             body: Some("{\"ok\":true}".to_string()),
             query_string: "delivery=abc".to_string(),
+            replay: false,
         };
         let receipt = tunnel_event_receipt(&event, "127.0.0.1", 8080, None, Some("dev"));
 
@@ -5386,6 +5476,7 @@ mod tests {
             headers,
             body: None,
             query_string: String::new(),
+            replay: false,
         };
 
         let receipt = tunnel_event_receipt(&event, "127.0.0.1", 8080, None, None);
@@ -5427,6 +5518,67 @@ mod tests {
         let output = receipt.to_string();
         assert!(!output.contains("response-secret"));
         assert!(!output.contains("response-token"));
+    }
+
+    #[test]
+    fn buffered_summary_event_receipt_includes_count_and_oldest() {
+        let event = TunnelEvent::BufferedSummary {
+            count: 3,
+            oldest_captured_at: Some("2026-07-14T09:00:00Z".to_string()),
+        };
+
+        let receipt = tunnel_event_receipt(&event, "localhost", 3000, None, None);
+
+        assert_eq!(receipt["event"], "buffered_summary");
+        assert_eq!(receipt["count"], 3);
+        assert_eq!(receipt["oldest_captured_at"], "2026-07-14T09:00:00Z");
+    }
+
+    #[test]
+    fn buffered_replayed_event_receipt_includes_status() {
+        let event = TunnelEvent::BufferedReplayed {
+            capture_id: "cap_123".to_string(),
+            status: 204,
+        };
+
+        let receipt = tunnel_event_receipt(&event, "localhost", 3000, None, None);
+
+        assert_eq!(receipt["event"], "buffered_replayed");
+        assert_eq!(receipt["capture_id"], "cap_123");
+        assert_eq!(receipt["status_code"], 204);
+        assert_eq!(receipt["resource_uri"], "hooklistener://requests/cap_123");
+    }
+
+    #[test]
+    fn buffered_replay_failed_event_receipt_includes_reason() {
+        let event = TunnelEvent::BufferedReplayFailed {
+            capture_id: "cap_123".to_string(),
+            reason: "local_unreachable".to_string(),
+        };
+
+        let receipt = tunnel_event_receipt(&event, "localhost", 3000, None, None);
+
+        assert_eq!(receipt["event"], "buffered_replay_failed");
+        assert_eq!(receipt["capture_id"], "cap_123");
+        assert_eq!(receipt["error"], "local_unreachable");
+    }
+
+    #[test]
+    fn tunnel_request_event_marks_replay() {
+        let event = TunnelEvent::RequestReceived {
+            request_id: "cap_456".to_string(),
+            method: "POST".to_string(),
+            path: "/webhook".to_string(),
+            headers: std::collections::HashMap::new(),
+            body: None,
+            query_string: String::new(),
+            replay: true,
+        };
+
+        let receipt = tunnel_event_receipt(&event, "localhost", 3000, None, None);
+
+        assert_eq!(receipt["event"], "request_received");
+        assert_eq!(receipt["replay"], true);
     }
 
     #[test]
