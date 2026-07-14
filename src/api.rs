@@ -32,12 +32,35 @@ pub struct Organization {
     pub name: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RelayTicket {
     pub ticket: String,
     pub scope: String,
     pub plan_fingerprint: String,
     pub expires_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AnonymousTunnelRouteCreated {
+    pub id: String,
+    pub slug: String,
+    pub url: String,
+    pub stable_name: bool,
+    pub expires_at: String,
+    pub route_token: String,
+    pub claim_token: String,
+    pub relay_ticket: RelayTicket,
+    pub limits: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimedAnonymousTunnelRoute {
+    pub id: String,
+    pub slug: String,
+    pub kind: String,
+    pub status: String,
+    pub claimed_at: String,
+    pub privacy: Value,
 }
 
 #[derive(Deserialize)]
@@ -742,9 +765,17 @@ impl ApiClient {
 
     /// Create a client with no authentication (for anonymous endpoints).
     pub fn unauthenticated() -> Result<Self> {
+        Self::unauthenticated_at(default_base_url())
+    }
+
+    pub fn unauthenticated_at(base_url: String) -> Result<Self> {
         Ok(Self {
             client: Client::new(),
-            base_url: Some(default_base_url()),
+            base_url: Some(
+                base_url
+                    .replacen("wss://", "https://", 1)
+                    .replacen("ws://", "http://", 1),
+            ),
         })
     }
 
@@ -785,6 +816,14 @@ impl ApiClient {
             client,
             base_url: Some(base_url),
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_unauthenticated_base_url(base_url: String) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: Some(base_url),
+        }
     }
 
     fn api_url(&self, path: &str) -> Result<String> {
@@ -1188,6 +1227,71 @@ impl ApiClient {
         Ok(response.data)
     }
 
+    pub async fn detach_tunnel_session(
+        &self,
+        id: &str,
+        reason: Option<&str>,
+    ) -> Result<TunnelSessionResource> {
+        let response: DataResponse<TunnelSessionResource> = self
+            .post_tunnel_json(
+                &format!("/api/v1/tunnel/sessions/{id}/detach"),
+                &serde_json::json!({"reason": reason}),
+                "detach tunnel session",
+            )
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn create_anonymous_tunnel_route(
+        &self,
+        target: &Value,
+        name: Option<&str>,
+        ttl_seconds: u64,
+    ) -> Result<AnonymousTunnelRouteCreated> {
+        let response: DataResponse<AnonymousTunnelRouteCreated> = self
+            .post_tunnel_json(
+                "/api/v1/tunnel/anonymous-routes",
+                &serde_json::json!({
+                    "target": target,
+                    "name": name,
+                    "ttl_seconds": ttl_seconds,
+                }),
+                "create anonymous tunnel route",
+            )
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn issue_anonymous_tunnel_ticket(
+        &self,
+        id: &str,
+        route_token: &str,
+    ) -> Result<RelayTicket> {
+        let response: DataResponse<RelayTicket> = self
+            .post_tunnel_json(
+                &format!("/api/v1/tunnel/anonymous-routes/{id}/relay-tickets"),
+                &serde_json::json!({"route_token": route_token}),
+                "rotate anonymous tunnel relay ticket",
+            )
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn claim_anonymous_tunnel_route(
+        &self,
+        id: &str,
+        claim_token: &str,
+    ) -> Result<ClaimedAnonymousTunnelRoute> {
+        let response: DataResponse<ClaimedAnonymousTunnelRoute> = self
+            .post_tunnel_json(
+                &format!("/api/v1/tunnel/anonymous-routes/{id}/claim"),
+                &serde_json::json!({"claim_token": claim_token}),
+                "claim anonymous tunnel route",
+            )
+            .await?;
+        Ok(response.data)
+    }
+
     pub async fn reconnect_tunnel_session(&self, id: &str) -> Result<TunnelReconnectDescriptor> {
         let response: DataResponse<TunnelReconnectDescriptor> = self
             .post_tunnel_json(
@@ -1555,6 +1659,122 @@ mod tests {
 
         assert!(error.to_string().contains("Relay handshake rejected"));
         assert!(error.to_string().contains("HTTP 401 Unauthorized"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn anonymous_tunnel_api_bootstraps_rotates_and_claims_without_mixing_credentials() {
+        let mut server = mockito::Server::new_async().await;
+        let create_mock = server
+            .mock("POST", "/api/v1/tunnel/anonymous-routes")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "name": "stable-demo",
+                "ttl_seconds": 900,
+                "target": {"host": "localhost", "port": 3000}
+            })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"anon-123","slug":"stable-demo","url":"https://stable-demo.hook.events","stable_name":true,"expires_at":"2026-07-14T20:15:00Z","route_token":"hkar_route-secret","claim_token":"hkac_claim-secret","relay_ticket":{"ticket":"hktr_first","scope":"relay:tunnel","plan_fingerprint":"first-fingerprint","expires_at":"2026-07-14T20:01:00Z"},"limits":{"body_bytes":1048576}}}"#,
+            )
+            .create_async()
+            .await;
+        let rotate_mock = server
+            .mock(
+                "POST",
+                "/api/v1/tunnel/anonymous-routes/anon-123/relay-tickets",
+            )
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "route_token": "hkar_route-secret"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"ticket":"hktr_second","scope":"relay:tunnel","plan_fingerprint":"second-fingerprint","expires_at":"2026-07-14T20:02:00Z"}}"#,
+            )
+            .create_async()
+            .await;
+        let claim_mock = server
+            .mock("POST", "/api/v1/tunnel/anonymous-routes/anon-123/claim")
+            .match_header("authorization", "Bearer access-secret")
+            .match_header("x-organization-id", "org-123")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "claim_token": "hkac_claim-secret"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"route-claimed","slug":"stable-demo","kind":"static","status":"active","claimed_at":"2026-07-14T20:03:00Z","privacy":{"pre_claim_captures_discarded":true,"captures_transferred":0}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let public = ApiClient::with_unauthenticated_base_url(server.url());
+        let created = public
+            .create_anonymous_tunnel_route(
+                &serde_json::json!({"host": "localhost", "port": 3000}),
+                Some("stable-demo"),
+                900,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.route_token, "hkar_route-secret");
+        assert_eq!(created.claim_token, "hkac_claim-secret");
+
+        let rotated = public
+            .issue_anonymous_tunnel_ticket(&created.id, &created.route_token)
+            .await
+            .unwrap();
+        assert_eq!(rotated.ticket, "hktr_second");
+
+        let authenticated = ApiClient::with_base_url(
+            "access-secret".to_string(),
+            server.url(),
+            Some("org-123".to_string()),
+        )
+        .unwrap();
+        let claimed = authenticated
+            .claim_anonymous_tunnel_route(&created.id, &created.claim_token)
+            .await
+            .unwrap();
+        assert_eq!(claimed.kind, "static");
+        assert_eq!(claimed.privacy["captures_transferred"], 0);
+
+        create_mock.assert_async().await;
+        rotate_mock.assert_async().await;
+        claim_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn detach_tunnel_session_posts_reason_and_returns_preserved_route() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v1/tunnel/sessions/session-123/detach")
+            .match_header("authorization", "Bearer test-token")
+            .match_header("x-organization-id", "org-123")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "reason": "switching machines"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"session-123","organization_id":"org-123","status":"active","fence":2,"created_at":"2026-07-14T20:00:00Z","updated_at":"2026-07-14T20:00:01Z","route":{"id":"route-123","slug":"stable-demo","kind":"static","mode":"direct_response","status":"active","expires_at":null}}}"#,
+            )
+            .create_async()
+            .await;
+        let client = ApiClient::with_base_url(
+            "test-token".to_string(),
+            server.url(),
+            Some("org-123".to_string()),
+        )
+        .unwrap();
+
+        let session = client
+            .detach_tunnel_session("session-123", Some("switching machines"))
+            .await
+            .unwrap();
+        assert_eq!(session.fence, 2);
+        assert_eq!(session.route.unwrap().status, "active");
         mock.assert_async().await;
     }
 

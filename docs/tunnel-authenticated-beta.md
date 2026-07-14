@@ -25,6 +25,7 @@ hooklistener tunnel status <session-id>
 hooklistener tunnel events --cursor <cursor> --follow
 hooklistener tunnel capture <capture-id>
 hooklistener tunnel attempt <attempt-id>
+hooklistener tunnel detach <session-id> --reason "switching machines"
 hooklistener tunnel stop <session-id> --reason "deployment complete"
 ```
 
@@ -55,8 +56,9 @@ per-frame acknowledgement, bounded work and response queues, advertised body
 and header limits, and one end-to-end deadline. Capture-forward reads only an
 already durable capture through a scoped, audited grant.
 
-The beta does not promise anonymous tunnels, WebSocket upgrades, HTTP trailers,
-public sharing, stable public API compatibility, MCP exposure, or unattended
-agent autonomy. A server rollback can reject activation or stop dispatch to an
-existing client; retain the safe typed error and retry only after the cohort is
-restored. There is no legacy relay fallback.
+Anonymous tunnels use the separate bounded workflow documented in
+`docs/tunnel-anonymous-routes.md`. The beta does not promise WebSocket upgrades,
+HTTP trailers, public sharing, stable public API compatibility, MCP exposure,
+or unattended agent autonomy. A server rollback can reject activation or stop
+dispatch to an existing authenticated client; retain the safe typed error and
+retry only after the cohort is restored. There is no legacy relay fallback.

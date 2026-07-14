@@ -51,7 +51,21 @@ remote target. HTTPS certificate verification can be disabled only with the visi
 
 ### Try it without logging in
 
-Create a temporary anonymous endpoint:
+Expose localhost directly with a bounded 15-minute anonymous route:
+
+```bash
+hooklistener anon tunnel --port 3000 --name stable-demo
+```
+
+Save the route and claim tokens printed before the live view starts. After
+signing in, move the stable name into your organization without transferring
+any pre-claim captures:
+
+```bash
+hooklistener anon claim <route-id> --token <claim-token> --org <organization-id>
+```
+
+To create a capture-only temporary endpoint instead:
 
 ```bash
 hooklistener anon create --ttl 3600
@@ -65,6 +79,7 @@ The result includes the endpoint URL, endpoint ID, and viewer token needed to in
 | --- | --- | --- |
 | Forward an existing Hooklistener endpoint | `hooklistener listen` | Events already arrive at Hooklistener and should be forwarded to your local app |
 | Expose a local server | `hooklistener tunnel` | A provider needs a public URL that points directly to localhost |
+| Expose localhost without signing in | `hooklistener anon tunnel` | You need a bounded temporary relay and can accept reduced limits |
 | Inspect and replay captured requests | `hooklistener endpoint` | You need stored payloads, headers, and forwarding history |
 | Run saved endpoint cases | `hooklistener cases` | You want to replay a repeatable test suite against a URL or saved target |
 | Create a temporary endpoint | `hooklistener anon` | You need a short-lived capture URL without an account |
@@ -93,12 +108,13 @@ hooklistener tunnel status <session-id>
 hooklistener tunnel events --cursor <cursor> --follow
 hooklistener tunnel capture <capture-id>
 hooklistener tunnel attempt <attempt-id>
+hooklistener tunnel detach <session-id> --reason "switching machines"
 hooklistener tunnel stop <session-id> --reason "deployment complete"
 ```
 
 `hooklistener tunnel --port 3000` remains an alias for `tunnel start`. Every lifecycle command negotiates the authenticated tunnel contract first; an incompatible schema major fails before relay activation.
 
-`tunnel` and `listen` are authenticated beta relay modes and require an organization enabled by Hooklistener. Every connection exchanges the account credential for a short-lived, single-use ticket scoped to its mode, route, organization, and pinned target. Anonymous endpoints are a separate capture workflow and cannot activate either relay mode. See [the authenticated beta guide](docs/tunnel-authenticated-beta.md) for limits, safe diagnostics, and support guidance.
+`tunnel` and `listen` are authenticated beta relay modes and require an organization enabled by Hooklistener. Every connection exchanges the account credential for a short-lived, single-use ticket scoped to its mode, route, organization, and pinned target. `anon tunnel` uses a separate public bootstrap with a 1 MiB body limit, per-route request limits, short expiry, and no authenticated capture access. See [the authenticated beta guide](docs/tunnel-authenticated-beta.md) and [the anonymous route guide](docs/tunnel-anonymous-routes.md).
 
 ## Work with captured requests
 
@@ -162,6 +178,7 @@ Long-running `listen --json` and `tunnel --json` commands emit newline-delimited
 ```bash
 hooklistener --json listen <endpoint-slug>
 hooklistener --json tunnel --port 3000
+hooklistener --json anon tunnel --port 3000 --ttl 900
 hooklistener --json tunnel events --cursor <cursor> --follow
 ```
 

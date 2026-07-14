@@ -302,6 +302,14 @@ enum TunnelAction {
         #[arg(long)]
         org: Option<String>,
     },
+    /// Detach the current owner while preserving the route for recovery
+    Detach {
+        session_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        org: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -553,6 +561,32 @@ enum AnonAction {
         /// Viewer token (returned when the endpoint was created)
         #[arg(long)]
         token: String,
+    },
+    /// Expose a local HTTP server without signing in
+    Tunnel {
+        /// Local port to forward requests to
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+        /// Local host to forward to
+        #[arg(long, default_value = "localhost")]
+        host: String,
+        /// Optional stable public route name
+        #[arg(long)]
+        name: Option<String>,
+        /// Route lifetime in seconds
+        #[arg(long, default_value = "900", value_parser = clap::value_parser!(u64).range(60..=1800))]
+        ttl: u64,
+        /// Allow forwarding to a host that resolves outside loopback
+        #[arg(long)]
+        allow_non_loopback: bool,
+    },
+    /// Claim an anonymous route into an authenticated organization
+    Claim {
+        route_id: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        org: Option<String>,
     },
 }
 
@@ -1869,6 +1903,7 @@ async fn stream_tunnel_json_events(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tunnel_json(
     access_token_rx: watch::Receiver<String>,
     host: String,
@@ -1877,6 +1912,7 @@ async fn run_tunnel_json(
     slug: Option<String>,
     target: target_policy::TargetPolicy,
     replay_buffered: bool,
+    anonymous_route: Option<(String, String, Option<api::RelayTicket>)>,
 ) -> Result<()> {
     print_json_line(&tunnel_started_receipt(
         &host,
@@ -1895,6 +1931,7 @@ async fn run_tunnel_json(
         target,
         event_tx,
         replay_buffered,
+        anonymous_route,
     ));
 
     stream_tunnel_json_events(
@@ -2729,6 +2766,53 @@ async fn run(cli: Cli) -> Result<()> {
                     print_anon_event_detail(&event);
                 }
             }
+            AnonAction::Tunnel {
+                port,
+                host,
+                name,
+                ttl,
+                allow_non_loopback,
+            } => {
+                run_anonymous_tunnel_activation(host, port, name, ttl, allow_non_loopback, json)
+                    .await?;
+            }
+            AnonAction::Claim {
+                route_id,
+                token,
+                org,
+            } => {
+                let mut config = config::Config::load()?;
+                let organization_id = require_organization(org, &config)?;
+                let access_token = ensure_valid_token(&mut config).await?;
+                let client =
+                    ApiClient::with_organization(access_token, Some(organization_id.clone()))?;
+                let claimed = client
+                    .claim_anonymous_tunnel_route(&route_id, &token)
+                    .await?;
+
+                if json {
+                    print_json(&serde_json::json!({
+                        "operation": "claim_anonymous_tunnel",
+                        "status": "succeeded",
+                        "organization_id": organization_id,
+                        "route": claimed,
+                    }))?;
+                } else {
+                    print_status(OutputStatus::Ok, "ANONYMOUS ROUTE CLAIMED");
+                    println!();
+                    print_field("ROUTE", claimed.id);
+                    print_field(
+                        "PUBLIC URL",
+                        format!("https://{}.hook.events", claimed.slug),
+                    );
+                    print_field("ORGANIZATION", organization_id.dim());
+                    print_field("CAPTURES TRANSFERRED", "0");
+                    print_field(
+                        "PRIVACY",
+                        "Pre-claim captures were permanently discarded.".dim(),
+                    );
+                }
+            }
         },
         Commands::Share { action } => match action {
             ShareAction::Create {
@@ -3349,6 +3433,25 @@ async fn run_tunnel_lifecycle_command(
                 &session,
             )
         }
+        Some(TunnelAction::Detach {
+            session_id,
+            reason,
+            org,
+        }) => {
+            let context = tunnel_lifecycle_context(org).await?;
+            let session = context
+                .client
+                .detach_tunnel_session(&session_id, reason.as_deref())
+                .await?;
+            print_tunnel_lifecycle_resource(
+                json,
+                "detach",
+                "hooklistener://tunnel/sessions",
+                &session.id,
+                &context.organization_id,
+                &session,
+            )
+        }
         Some(TunnelAction::Events {
             cursor,
             limit,
@@ -3396,6 +3499,7 @@ async fn run_tunnel_activation(target: TunnelTarget, json: bool) -> Result<()> {
             target.slug,
             target_policy,
             replay_buffered,
+            None,
         )
         .await
     } else {
@@ -3418,6 +3522,128 @@ async fn run_tunnel_activation(target: TunnelTarget, json: bool) -> Result<()> {
             target_policy,
             event_tx.clone(),
             replay_buffered,
+            None,
+        );
+        let result = run_app(
+            &mut terminal,
+            &mut app,
+            event_rx,
+            Some(reconnect_tx),
+            Some(event_tx),
+            Some(logo::spawn_logo_animation()),
+        )
+        .await;
+        restore_terminal(&mut terminal)?;
+        result
+    }
+}
+
+async fn run_anonymous_tunnel_activation(
+    host: String,
+    port: u16,
+    name: Option<String>,
+    ttl: u64,
+    allow_non_loopback: bool,
+    json: bool,
+) -> Result<()> {
+    let target = TunnelTarget {
+        port,
+        host: host.clone(),
+        org: None,
+        slug: name.clone(),
+        allow_non_loopback,
+        no_replay_buffered: true,
+    };
+    validate_tunnel_target(&target)?;
+    let local_target_url = local_tunnel_target_url(&host, port);
+    let target_policy =
+        target_policy::TargetPolicy::resolve(&local_target_url, allow_non_loopback, false).await?;
+    let client = ApiClient::unauthenticated()?;
+    let target_plan = serde_json::to_value(target_policy.plan())?;
+    let created = client
+        .create_anonymous_tunnel_route(&target_plan, name.as_deref(), ttl)
+        .await?;
+
+    if json {
+        print_json_line(&serde_json::json!({
+            "schema": "hooklistener.tunnel.anonymous-route/1",
+            "operation": "create_anonymous_tunnel",
+            "status": "created",
+            "route": {
+                "id": created.id,
+                "slug": created.slug,
+                "url": created.url,
+                "stable_name": created.stable_name,
+                "expires_at": created.expires_at,
+                "limits": created.limits,
+            },
+            "credentials": {
+                "route_token": created.route_token,
+                "claim_token": created.claim_token,
+            },
+            "privacy": {
+                "claim_transfers_captures": false,
+            }
+        }))?;
+    } else {
+        print_status(OutputStatus::Ok, "ANONYMOUS TUNNEL CREATED");
+        println!();
+        print_field("ROUTE", &created.id);
+        print_field("PUBLIC URL", created.url.as_str().underlined());
+        print_field("EXPIRES AT", created.expires_at.as_str().dim());
+        println!();
+        print_field("ROUTE TOKEN", created.route_token.as_str().yellow());
+        print_field("CLAIM TOKEN", created.claim_token.as_str().yellow());
+        print_field(
+            "ACTION",
+            format!(
+                "Save both tokens. Claim later with `hooklistener anon claim {} --token <claim-token>`.",
+                created.id
+            )
+            .dim(),
+        );
+    }
+
+    let anonymous_route = Some((
+        created.id.clone(),
+        created.route_token.clone(),
+        Some(created.relay_ticket.clone()),
+    ));
+    let (_token_tx, token_rx) = watch::channel(String::new());
+
+    if json {
+        run_tunnel_json(
+            token_rx,
+            host,
+            port,
+            None,
+            Some(created.slug),
+            target_policy,
+            false,
+            anonymous_route,
+        )
+        .await
+    } else {
+        let mut terminal = setup_terminal()?;
+        let mut app = App::new()?;
+        app.monochrome = !output::styles_enabled();
+        app.state = AppState::Tunneling;
+        app.tunnel_local_host = host.clone();
+        app.tunnel_local_port = port;
+        app.tunnel_org_id = None;
+        app.tunnel_requested_slug = Some(created.slug.clone());
+
+        let (event_tx, event_rx) = mpsc::channel(tunnel::PRESENTATION_QUEUE_CAPACITY);
+        let reconnect_tx = spawn_tunnel_forwarder_manager(
+            token_rx,
+            host,
+            port,
+            None,
+            Some(created.slug),
+            target_policy,
+            event_tx.clone(),
+            false,
+            anonymous_route,
         );
         let result = run_app(
             &mut terminal,
@@ -4758,10 +4984,14 @@ fn spawn_tunnel_forwarder_manager(
     target: target_policy::TargetPolicy,
     event_tx: mpsc::Sender<TunnelEvent>,
     replay_buffered: bool,
+    anonymous_route: Option<(String, String, Option<api::RelayTicket>)>,
 ) -> mpsc::UnboundedSender<()> {
     let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel::<()>();
 
     tokio::spawn(async move {
+        let reconnect_anonymous_route = anonymous_route
+            .as_ref()
+            .map(|(id, token, _ticket)| (id.clone(), token.clone(), None));
         let mut worker = tokio::spawn(run_tunnel_forwarder_connection(
             access_token_rx.clone(),
             host.clone(),
@@ -4771,6 +5001,7 @@ fn spawn_tunnel_forwarder_manager(
             target.clone(),
             event_tx.clone(),
             replay_buffered,
+            anonymous_route.clone(),
         ));
 
         while reconnect_rx.recv().await.is_some() {
@@ -4789,6 +5020,7 @@ fn spawn_tunnel_forwarder_manager(
                 target.clone(),
                 event_tx.clone(),
                 replay_buffered,
+                reconnect_anonymous_route.clone(),
             ));
         }
 
@@ -4809,8 +5041,9 @@ async fn run_tunnel_forwarder_connection(
     target: target_policy::TargetPolicy,
     event_tx: mpsc::Sender<TunnelEvent>,
     replay_buffered: bool,
+    anonymous_route: Option<(String, String, Option<api::RelayTicket>)>,
 ) {
-    let tunnel_forwarder = tunnel::TunnelForwarder::new(
+    let mut tunnel_forwarder = tunnel::TunnelForwarder::new(
         access_token_rx,
         host,
         port,
@@ -4820,6 +5053,11 @@ async fn run_tunnel_forwarder_connection(
         event_tx,
         replay_buffered,
     );
+
+    if let Some((route_id, route_token, initial_ticket)) = anonymous_route {
+        tunnel_forwarder =
+            tunnel_forwarder.with_anonymous_route(route_id, route_token, initial_ticket);
+    }
 
     if let Err(e) = tunnel_forwarder
         .connect_with_reconnect(tunnel::ReconnectConfig::default())
@@ -5480,6 +5718,78 @@ mod tests {
                 ..
             }) if cursor == "opaque"
         ));
+    }
+
+    #[test]
+    fn anonymous_tunnel_claim_and_detach_commands_parse_explicit_credentials() {
+        let anonymous = Cli::try_parse_from([
+            "hooklistener",
+            "anon",
+            "tunnel",
+            "--port",
+            "4000",
+            "--name",
+            "stable-demo",
+            "--ttl",
+            "1200",
+        ])
+        .expect("anonymous tunnel command");
+        assert!(matches!(
+            anonymous.command,
+            Some(Commands::Anon {
+                action: AnonAction::Tunnel {
+                    port: 4000,
+                    name: Some(name),
+                    ttl: 1200,
+                    ..
+                }
+            }) if name == "stable-demo"
+        ));
+
+        let claim = Cli::try_parse_from([
+            "hooklistener",
+            "anon",
+            "claim",
+            "route-123",
+            "--token",
+            "hkac_secret",
+            "--org",
+            "org-123",
+        ])
+        .expect("anonymous claim command");
+        assert!(matches!(
+            claim.command,
+            Some(Commands::Anon {
+                action: AnonAction::Claim {
+                    route_id,
+                    token,
+                    org: Some(org),
+                }
+            }) if route_id == "route-123" && token == "hkac_secret" && org == "org-123"
+        ));
+
+        let detach = Cli::try_parse_from([
+            "hooklistener",
+            "tunnel",
+            "detach",
+            "session-123",
+            "--reason",
+            "switching-machines",
+        ])
+        .expect("tunnel detach command");
+        assert!(matches!(
+            detach.command,
+            Some(Commands::Tunnel {
+                action: Some(TunnelAction::Detach {
+                    session_id,
+                    reason: Some(reason),
+                    ..
+                }),
+                ..
+            }) if session_id == "session-123" && reason == "switching-machines"
+        ));
+
+        assert!(Cli::try_parse_from(["hooklistener", "anon", "tunnel", "--ttl", "59"]).is_err());
     }
 
     #[test]
