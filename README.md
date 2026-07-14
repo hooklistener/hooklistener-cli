@@ -98,6 +98,8 @@ hooklistener tunnel stop <session-id> --reason "deployment complete"
 
 `hooklistener tunnel --port 3000` remains an alias for `tunnel start`. Every lifecycle command negotiates the authenticated tunnel contract first; an incompatible schema major fails before relay activation.
 
+`tunnel` and `listen` are authenticated beta relay modes and require an organization enabled by Hooklistener. Every connection exchanges the account credential for a short-lived, single-use ticket scoped to its mode, route, organization, and pinned target. Anonymous endpoints are a separate capture workflow and cannot activate either relay mode. See [the authenticated beta guide](docs/tunnel-authenticated-beta.md) for limits, safe diagnostics, and support guidance.
+
 ## Work with captured requests
 
 Select an organization once for account-backed commands:
