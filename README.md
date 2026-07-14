@@ -72,6 +72,9 @@ requests. If the WebSocket disconnects, in-flight work is cancelled and never re
 tunnels reacquire their slug on reconnect, while requests already dispatched to localhost are
 reported by the service as having an unknown outcome.
 
+Machine-readable tunnel receipts redact authorization, cookies, API keys, tokens, and secret
+header values. Debug logs omit the access-token query parameter from WebSocket endpoints.
+
 ## Work with captured requests
 
 Select an organization once for account-backed commands:

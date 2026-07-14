@@ -870,6 +870,35 @@ fn tunnel_event_base(event: &str, status: &str) -> serde_json::Value {
     command_event_receipt("tunnel", "start_local_tunnel", event, status)
 }
 
+fn redact_tunnel_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = if sensitive_header_name(name) {
+                "[REDACTED]".to_string()
+            } else {
+                value.clone()
+            };
+
+            (name.clone(), value)
+        })
+        .collect()
+}
+
+fn sensitive_header_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+
+    matches!(
+        normalized.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+    ) || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("api-key")
+        || normalized.ends_with("-key")
+}
+
 fn reconnect_failure_reason(event: &TunnelEvent) -> Option<&str> {
     match event {
         TunnelEvent::ReconnectFailed { reason } => Some(reason),
@@ -1197,7 +1226,7 @@ fn tunnel_event_receipt(
             receipt["query_string"] = serde_json::json!(query_string);
             receipt["local_target_url"] =
                 serde_json::json!(local_tunnel_request_target(host, port, path, query_string));
-            receipt["headers"] = serde_json::json!(headers);
+            receipt["headers"] = serde_json::json!(redact_tunnel_headers(headers));
             receipt["body_size"] = serde_json::json!(body.as_ref().map(String::len).unwrap_or(0));
             receipt
         }
@@ -1215,7 +1244,8 @@ fn tunnel_event_receipt(
             receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
             receipt["status_code"] = serde_json::json!(status);
             receipt["duration_ms"] = serde_json::json!(duration_ms);
-            receipt["response_headers"] = serde_json::json!(response_headers);
+            receipt["response_headers"] =
+                serde_json::json!(redact_tunnel_headers(response_headers));
             receipt["response_body_size"] =
                 serde_json::json!(response_body.as_ref().map(String::len).unwrap_or(0));
             receipt
@@ -5336,6 +5366,67 @@ mod tests {
         );
         assert_eq!(receipt["body_size"], 11);
         assert_eq!(receipt["headers"]["content-type"], "application/json");
+    }
+
+    #[test]
+    fn tunnel_request_event_redacts_sensitive_headers() {
+        let headers = std::collections::HashMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer request-secret".to_string(),
+            ),
+            ("cookie".to_string(), "session=request-secret".to_string()),
+            ("x-api-key".to_string(), "request-api-key".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ]);
+        let event = TunnelEvent::RequestReceived {
+            request_id: "req_secure".to_string(),
+            method: "POST".to_string(),
+            path: "/webhook".to_string(),
+            headers,
+            body: None,
+            query_string: String::new(),
+        };
+
+        let receipt = tunnel_event_receipt(&event, "127.0.0.1", 8080, None, None);
+
+        assert_eq!(receipt["headers"]["authorization"], "[REDACTED]");
+        assert_eq!(receipt["headers"]["cookie"], "[REDACTED]");
+        assert_eq!(receipt["headers"]["x-api-key"], "[REDACTED]");
+        assert_eq!(receipt["headers"]["content-type"], "application/json");
+        let output = receipt.to_string();
+        assert!(!output.contains("request-secret"));
+        assert!(!output.contains("request-api-key"));
+    }
+
+    #[test]
+    fn tunnel_response_event_redacts_sensitive_headers() {
+        let event = TunnelEvent::RequestForwarded {
+            request_id: "req_secure".to_string(),
+            status: 200,
+            duration_ms: 10,
+            response_headers: std::collections::HashMap::from([
+                (
+                    "set-cookie".to_string(),
+                    "session=response-secret".to_string(),
+                ),
+                ("x-auth-token".to_string(), "response-token".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ]),
+            response_body: None,
+        };
+
+        let receipt = tunnel_event_receipt(&event, "127.0.0.1", 8080, None, None);
+
+        assert_eq!(receipt["response_headers"]["set-cookie"], "[REDACTED]");
+        assert_eq!(receipt["response_headers"]["x-auth-token"], "[REDACTED]");
+        assert_eq!(
+            receipt["response_headers"]["content-type"],
+            "application/json"
+        );
+        let output = receipt.to_string();
+        assert!(!output.contains("response-secret"));
+        assert!(!output.contains("response-token"));
     }
 
     #[test]

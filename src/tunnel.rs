@@ -23,6 +23,7 @@ const LEGACY_MAX_RESPONSE_BODY_BYTES: usize = 7_000_000;
 const LEGACY_MAX_RESPONSE_HEADER_BYTES: usize = 1_048_576;
 const MAX_RAW_BODY_BYTES: usize = 1_048_576;
 const UI_BODY_PREVIEW_BYTES: usize = 65_536;
+const REDACTED_SECRET: &str = "[REDACTED]";
 
 #[derive(Clone, Copy, Debug)]
 struct TunnelLimits {
@@ -259,17 +260,27 @@ impl Default for ReconnectConfig {
     }
 }
 
-/// Build a WebSocket URL from a base HTTP(S) URL
-#[cfg(test)]
-pub fn build_ws_url(base_url: &str, token: &str, path: &str) -> String {
+fn websocket_endpoint(base_url: &str, path: &str) -> String {
     format!(
-        "{}/{}?token={}",
+        "{}/{}",
         base_url
             .replace("https://", "wss://")
             .replace("http://", "ws://"),
-        path.trim_start_matches('/'),
-        token
+        path.trim_start_matches('/')
     )
+}
+
+/// Build a WebSocket URL from a base HTTP(S) URL.
+pub fn build_ws_url(base_url: &str, token: &str, path: &str) -> String {
+    format!("{}?token={token}", websocket_endpoint(base_url, path))
+}
+
+fn redact_access_token(message: &str, access_token: &str) -> String {
+    if access_token.is_empty() {
+        message.to_string()
+    } else {
+        message.replace(access_token, REDACTED_SECRET)
+    }
 }
 
 /// Build a target URL for forwarding, appending path and optional query params
@@ -376,15 +387,12 @@ impl TunnelClient {
 
         // Build WebSocket URL with auth token
         let access_token = self.access_token_rx.borrow().clone();
-        let ws_url = format!(
-            "{}/socket/websocket?token={}",
-            self.base_url
-                .replace("https://", "wss://")
-                .replace("http://", "ws://"),
-            access_token
-        );
+        let ws_url = build_ws_url(&self.base_url, &access_token, "socket/websocket");
 
-        debug!("WebSocket URL: {}", ws_url);
+        debug!(
+            endpoint = %websocket_endpoint(&self.base_url, "socket/websocket"),
+            "Connecting to WebSocket"
+        );
 
         // Connect to WebSocket
         let (ws_stream, _) = match connect_async(&ws_url).await {
@@ -425,7 +433,8 @@ impl TunnelClient {
                     return Err(anyhow!(msg));
                 }
                 _ => {
-                    let msg = format!("Failed to connect to WebSocket: {}", e);
+                    let detail = redact_access_token(&e.to_string(), &access_token);
+                    let msg = format!("Failed to connect to WebSocket: {detail}");
                     let _ = self
                         .event_tx
                         .send(TunnelEvent::ConnectionError(msg.clone()))
@@ -929,15 +938,12 @@ impl TunnelForwarder {
 
         // Build WebSocket URL - connect to /tunnel/websocket endpoint (Phoenix default)
         let access_token = self.access_token_rx.borrow().clone();
-        let ws_url = format!(
-            "{}/tunnel/websocket?token={}",
-            self.base_url
-                .replace("https://", "wss://")
-                .replace("http://", "ws://"),
-            access_token
-        );
+        let ws_url = build_ws_url(&self.base_url, &access_token, "tunnel/websocket");
 
-        debug!("Tunnel WebSocket URL: {}", ws_url);
+        debug!(
+            endpoint = %websocket_endpoint(&self.base_url, "tunnel/websocket"),
+            "Connecting tunnel WebSocket"
+        );
 
         // Connect to WebSocket
         let (ws_stream, _) = match connect_async_with_config(
@@ -949,7 +955,8 @@ impl TunnelForwarder {
         {
             Ok(stream) => stream,
             Err(e) => {
-                let msg = format!("Failed to connect to tunnel: {}", e);
+                let detail = redact_access_token(&e.to_string(), &access_token);
+                let msg = format!("Failed to connect to tunnel: {detail}");
                 let _ = self
                     .event_tx
                     .send(TunnelEvent::ConnectionError(msg.clone()))
@@ -1866,6 +1873,24 @@ mod tests {
     fn test_build_ws_url_http_to_ws() {
         let url = build_ws_url("http://localhost:4000", "tok", "tunnel/websocket");
         assert_eq!(url, "ws://localhost:4000/tunnel/websocket?token=tok");
+    }
+
+    #[test]
+    fn test_websocket_endpoint_omits_access_token() {
+        let endpoint = websocket_endpoint("https://api.example.com", "tunnel/websocket");
+
+        assert_eq!(endpoint, "wss://api.example.com/tunnel/websocket");
+        assert!(!endpoint.contains("token="));
+    }
+
+    #[test]
+    fn test_redact_access_token_from_connection_errors() {
+        let token = "public-cli-secret-token";
+        let error = format!("request failed for wss://api.example.com/tunnel?token={token}");
+        let redacted = redact_access_token(&error, token);
+
+        assert!(!redacted.contains(token));
+        assert!(redacted.contains(REDACTED_SECRET));
     }
 
     // build_forward_target tests
