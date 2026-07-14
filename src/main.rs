@@ -16,7 +16,7 @@ mod updater;
 
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
-use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
 use crossterm::{
     cursor::{MoveToColumn, Show},
@@ -173,29 +173,134 @@ enum Commands {
     Update,
     /// Expose a local HTTP server on a public Hooklistener URL
     Tunnel {
-        /// Local port to forward requests to
-        #[arg(short, long, default_value = "3000")]
-        port: u16,
+        #[command(subcommand)]
+        action: Option<TunnelAction>,
 
-        /// Local host to forward to
-        #[arg(long, default_value = "localhost")]
-        host: String,
+        #[command(flatten)]
+        target: TunnelTargetArgs,
+    },
+}
 
-        /// Organization ID (optional, uses default)
-        #[arg(short, long)]
+#[derive(Args, Clone, Default)]
+struct TunnelTargetArgs {
+    /// Local port to forward requests to (default: 3000)
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Local host to forward to (default: localhost)
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Organization ID override (falls back to configured default)
+    #[arg(short, long)]
+    org: Option<String>,
+
+    /// Static tunnel slug (paid plans only, creates persistent subdomain)
+    #[arg(short, long)]
+    slug: Option<String>,
+
+    /// Allow forwarding to a host that resolves outside loopback
+    #[arg(long)]
+    allow_non_loopback: bool,
+
+    /// Do not automatically replay requests buffered while the tunnel was offline
+    #[arg(long)]
+    no_replay_buffered: bool,
+}
+
+impl TunnelTargetArgs {
+    fn merge(self, action_target: Self) -> Self {
+        Self {
+            port: action_target.port.or(self.port),
+            host: action_target.host.or(self.host),
+            org: action_target.org.or(self.org),
+            slug: action_target.slug.or(self.slug),
+            allow_non_loopback: self.allow_non_loopback || action_target.allow_non_loopback,
+            no_replay_buffered: self.no_replay_buffered || action_target.no_replay_buffered,
+        }
+    }
+
+    fn resolve(self) -> TunnelTarget {
+        TunnelTarget {
+            port: self.port.unwrap_or(3000),
+            host: self.host.unwrap_or_else(|| "localhost".to_string()),
+            org: self.org,
+            slug: self.slug,
+            allow_non_loopback: self.allow_non_loopback,
+            no_replay_buffered: self.no_replay_buffered,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TunnelTarget {
+    port: u16,
+    host: String,
+    org: Option<String>,
+    slug: Option<String>,
+    allow_non_loopback: bool,
+    no_replay_buffered: bool,
+}
+
+#[derive(Subcommand)]
+enum TunnelAction {
+    /// Validate authentication, schema compatibility, and the activation plan
+    Prepare(TunnelTargetArgs),
+    /// Activate a relay and keep it attached to the local target
+    Activate(TunnelTargetArgs),
+    /// Prepare and activate a relay (the default tunnel behavior)
+    Start(TunnelTargetArgs),
+    /// List cloud-authoritative tunnel sessions
+    List {
+        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
         org: Option<String>,
-
-        /// Static tunnel slug (paid plans only, creates persistent subdomain)
-        #[arg(short, long)]
-        slug: Option<String>,
-
-        /// Allow forwarding to a host that resolves outside loopback
+    },
+    /// Read a tunnel session by canonical ID
+    Status {
+        session_id: String,
         #[arg(long)]
-        allow_non_loopback: bool,
-
-        /// Do not automatically replay requests buffered while the tunnel was offline
+        org: Option<String>,
+    },
+    /// Read ordered lifecycle events, optionally following from a cursor
+    Events {
         #[arg(long)]
-        no_replay_buffered: bool,
+        cursor: Option<String>,
+        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        #[arg(long)]
+        capture_id: Option<String>,
+        #[arg(long)]
+        attempt_id: Option<String>,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value = "1000")]
+        interval_ms: u64,
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Read a redacted capture projection by canonical ID
+    Capture {
+        capture_id: String,
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Read a delivery attempt by canonical ID
+    Attempt {
+        attempt_id: String,
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Stop a tunnel session even when its original CLI process is gone
+    Stop {
+        session_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        org: Option<String>,
     },
 }
 
@@ -855,13 +960,18 @@ fn effective_listen_ws_url(ws_url: Option<&str>) -> String {
 }
 
 fn command_event_receipt(
+    schema: &str,
     command: &str,
     operation: &str,
     event: &str,
     status: &str,
 ) -> serde_json::Value {
     serde_json::json!({
+        "$schema": schema,
+        "schema_version": 1,
         "type": "event",
+        "event_id": uuid::Uuid::new_v4(),
+        "sequence": 0,
         "event": event,
         "status": status,
         "command": command,
@@ -876,7 +986,13 @@ fn listen_event_base(
     endpoint_slug: &str,
     target_url: &str,
 ) -> serde_json::Value {
-    let mut receipt = command_event_receipt("listen", "listen_endpoint", event, status);
+    let mut receipt = command_event_receipt(
+        LISTEN_EVENT_SCHEMA,
+        "listen",
+        "listen_endpoint",
+        event,
+        status,
+    );
     receipt["endpoint_slug"] = serde_json::json!(endpoint_slug);
     receipt["target_url"] = serde_json::json!(target_url);
     receipt["resource_uri"] = serde_json::json!(listen_session_resource_uri(endpoint_slug));
@@ -884,7 +1000,13 @@ fn listen_event_base(
 }
 
 fn tunnel_event_base(event: &str, status: &str) -> serde_json::Value {
-    command_event_receipt("tunnel", "start_local_tunnel", event, status)
+    command_event_receipt(
+        TUNNEL_EVENT_SCHEMA,
+        "tunnel",
+        "start_local_tunnel",
+        event,
+        status,
+    )
 }
 
 fn redact_tunnel_headers(
@@ -1160,7 +1282,11 @@ fn tunnel_started_receipt(
     let local_target_url = local_tunnel_target_url(host, port);
 
     serde_json::json!({
+        "$schema": TUNNEL_RECEIPT_SCHEMA,
+        "schema_version": 1,
         "type": "receipt",
+        "event_id": uuid::Uuid::new_v4(),
+        "sequence": 0,
         "event": "tunnel_started",
         "status": "starting",
         "command": "tunnel",
@@ -1608,6 +1734,7 @@ async fn stream_listen_json_events(
     target_url: &str,
     endpoint: Option<&api::DebugEndpointSummary>,
 ) -> Result<()> {
+    let mut sequence = 1_u64;
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
@@ -1616,7 +1743,11 @@ async fn stream_listen_json_events(
                 };
                 let failure_reason = reconnect_failure_reason(&event);
 
-                print_json_line(&listen_event_receipt(&event, endpoint_slug, target_url, endpoint))?;
+                let mut receipt =
+                    listen_event_receipt(&event, endpoint_slug, target_url, endpoint);
+                receipt["sequence"] = serde_json::json!(sequence);
+                sequence = sequence.saturating_add(1);
+                print_json_line(&receipt)?;
 
                 if let Some(reason) = failure_reason {
                     return Err(anyhow!("Connection lost: {reason}"));
@@ -1624,17 +1755,19 @@ async fn stream_listen_json_events(
             }
             signal = tokio::signal::ctrl_c() => {
                 signal?;
-                print_json_line(&serde_json::json!({
-                    "type": "event",
-                    "event": "stopped",
-                    "status": "stopped",
-                    "command": "listen",
-                    "operation": "listen_endpoint",
-                    "emitted_at": emitted_at(),
-                    "endpoint_slug": endpoint_slug,
-                    "target_url": target_url,
-                    "resource_uri": listen_session_resource_uri(endpoint_slug)
-                }))?;
+                let mut receipt = command_event_receipt(
+                    LISTEN_EVENT_SCHEMA,
+                    "listen",
+                    "listen_endpoint",
+                    "stopped",
+                    "stopped",
+                );
+                receipt["sequence"] = serde_json::json!(sequence);
+                receipt["endpoint_slug"] = serde_json::json!(endpoint_slug);
+                receipt["target_url"] = serde_json::json!(target_url);
+                receipt["resource_uri"] =
+                    serde_json::json!(listen_session_resource_uri(endpoint_slug));
+                print_json_line(&receipt)?;
                 return Ok(());
             }
         }
@@ -1691,6 +1824,7 @@ async fn stream_tunnel_json_events(
     organization_id: Option<&str>,
     requested_slug: Option<&str>,
 ) -> Result<()> {
+    let mut sequence = 1_u64;
     loop {
         tokio::select! {
             maybe_event = event_rx.recv() => {
@@ -1699,13 +1833,16 @@ async fn stream_tunnel_json_events(
                 };
                 let failure_reason = reconnect_failure_reason(&event);
 
-                print_json_line(&tunnel_event_receipt(
+                let mut receipt = tunnel_event_receipt(
                     &event,
                     host,
                     port,
                     organization_id,
                     requested_slug,
-                ))?;
+                );
+                receipt["sequence"] = serde_json::json!(sequence);
+                sequence = sequence.saturating_add(1);
+                print_json_line(&receipt)?;
 
                 if let Some(reason) = failure_reason {
                     return Err(anyhow!("Connection lost: {reason}"));
@@ -1713,16 +1850,19 @@ async fn stream_tunnel_json_events(
             }
             signal = tokio::signal::ctrl_c() => {
                 signal?;
-                print_json_line(&serde_json::json!({
-                    "type": "event",
-                    "event": "stopped",
-                    "status": "stopped",
-                    "command": "tunnel",
-                    "operation": "start_local_tunnel",
-                    "emitted_at": emitted_at(),
-                    "resource_uri": tunnel_session_resource_uri(host, port),
-                    "local_target_url": local_tunnel_target_url(host, port)
-                }))?;
+                let mut receipt = command_event_receipt(
+                    TUNNEL_EVENT_SCHEMA,
+                    "tunnel",
+                    "start_local_tunnel",
+                    "stopped",
+                    "stopped",
+                );
+                receipt["sequence"] = serde_json::json!(sequence);
+                receipt["resource_uri"] =
+                    serde_json::json!(tunnel_session_resource_uri(host, port));
+                receipt["local_target_url"] =
+                    serde_json::json!(local_tunnel_target_url(host, port));
+                print_json_line(&receipt)?;
                 return Ok(());
             }
         }
@@ -1777,7 +1917,7 @@ async fn main() {
 
     if let Err(err) = run(cli).await {
         display_error(&err, json);
-        std::process::exit(1);
+        std::process::exit(command_exit_code(&err));
     }
 }
 
@@ -2926,14 +3066,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Update => {
             updater::run_self_update(json).await?;
         }
-        Commands::Tunnel {
-            port,
-            host,
-            org,
-            slug,
-            allow_non_loopback,
-            no_replay_buffered,
-        } => {
+        Commands::Tunnel { action, target } => {
             // Initialize logging for tunnel
             let log_config = LogConfig {
                 level: log_level.clone(),
@@ -2944,77 +3077,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ..Default::default()
             };
             let _logger = Logger::new(log_config)?;
-
-            let mut config = config::Config::load()?;
-            let selected_org = resolve_tunnel_org(org, &config);
-            let access_token = ensure_valid_token(&mut config).await?;
-            let access_token_rx = refreshed_access_token_rx(access_token, config);
-            let target = target_policy::TargetPolicy::resolve(
-                &local_tunnel_target_url(&host, port),
-                allow_non_loopback,
-                false,
-            )
-            .await?;
-
-            let replay_buffered = !no_replay_buffered;
-
-            if json {
-                run_tunnel_json(
-                    access_token_rx,
-                    host,
-                    port,
-                    selected_org,
-                    slug,
-                    target,
-                    replay_buffered,
-                )
-                .await?;
-            } else {
-                // Setup TUI for tunnel command
-                let mut terminal = setup_terminal()?;
-                let mut app = App::new()?;
-                app.monochrome = !output::styles_enabled();
-
-                // Set app state to tunneling
-                app.state = AppState::Tunneling;
-                app.tunnel_local_host = host.clone();
-                app.tunnel_local_port = port;
-                // Prefer explicit CLI org, then fall back to configured organization.
-                app.tunnel_org_id = selected_org.clone();
-                app.tunnel_requested_slug = slug.clone();
-
-                // Create channel for tunnel events
-                let (event_tx, event_rx) = mpsc::channel(tunnel::PRESENTATION_QUEUE_CAPACITY);
-
-                // Create and spawn tunnel forwarder manager
-                let reconnect_tx = spawn_tunnel_forwarder_manager(
-                    access_token_rx,
-                    host,
-                    port,
-                    selected_org,
-                    slug,
-                    target,
-                    event_tx.clone(),
-                    replay_buffered,
-                );
-
-                let res = run_app(
-                    &mut terminal,
-                    &mut app,
-                    event_rx,
-                    Some(reconnect_tx),
-                    Some(event_tx),
-                    Some(logo::spawn_logo_animation()),
-                )
-                .await;
-
-                restore_terminal(&mut terminal)?;
-
-                if let Err(err) = res {
-                    error!(error = %err, "Application terminated with error");
-                    return Err(err);
-                }
-            }
+            run_tunnel_lifecycle_command(action, target, json).await?;
         }
     }
 
@@ -3028,6 +3091,494 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+const SUPPORTED_TUNNEL_SCHEMA_MAJOR: u64 = 1;
+const TUNNEL_RECEIPT_SCHEMA: &str = "hooklistener.tunnel.receipt/1";
+const TUNNEL_EVENT_SCHEMA: &str = "hooklistener.tunnel.event/1";
+const LISTEN_EVENT_SCHEMA: &str = "hooklistener.listen.event/1";
+const COMMAND_ERROR_SCHEMA: &str = "hooklistener.cli.error/1";
+
+struct TunnelLifecycleContext {
+    config: config::Config,
+    access_token: String,
+    organization_id: String,
+    client: ApiClient,
+    contract: api::TunnelLifecycleContract,
+}
+
+struct TunnelEventOptions {
+    cursor: Option<String>,
+    limit: u16,
+    capture_id: Option<String>,
+    attempt_id: Option<String>,
+    follow: bool,
+    interval_ms: u64,
+}
+
+async fn tunnel_lifecycle_context(org: Option<String>) -> Result<TunnelLifecycleContext> {
+    let mut config = config::Config::load()?;
+    let organization_id = require_organization(org, &config)?;
+    let access_token = ensure_valid_token(&mut config).await?;
+    let client = ApiClient::with_organization(access_token.clone(), Some(organization_id.clone()))?;
+    let contract = client.tunnel_lifecycle_contract().await?;
+    validate_tunnel_schema(&contract)?;
+
+    Ok(TunnelLifecycleContext {
+        config,
+        access_token,
+        organization_id,
+        client,
+        contract,
+    })
+}
+
+fn validate_tunnel_schema(contract: &api::TunnelLifecycleContract) -> Result<()> {
+    if contract.schema.major == SUPPORTED_TUNNEL_SCHEMA_MAJOR {
+        return Ok(());
+    }
+
+    Err(errors::TunnelLifecycleError::IncompatibleSchema {
+        supported: SUPPORTED_TUNNEL_SCHEMA_MAJOR,
+        actual: contract.schema.major,
+    }
+    .into())
+}
+
+fn tunnel_lifecycle_receipt(
+    operation: &str,
+    status: &str,
+    organization_id: &str,
+    resource_uri: Option<&str>,
+    data: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": TUNNEL_RECEIPT_SCHEMA,
+        "schema_version": 1,
+        "type": "receipt",
+        "event_id": uuid::Uuid::new_v4(),
+        "sequence": 0,
+        "command": "tunnel",
+        "operation": operation,
+        "status": status,
+        "emitted_at": emitted_at(),
+        "organization_id": organization_id,
+        "resource_uri": resource_uri,
+        "data": data,
+    })
+}
+
+fn tunnel_lifecycle_event_envelope(event: &api::TunnelLifecycleEvent) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": TUNNEL_EVENT_SCHEMA,
+        "schema_version": 1,
+        "type": "event",
+        "event": event.event_type,
+        "event_id": event.id,
+        "position": event.position,
+        "sequence": event.sequence,
+        "cursor": event.cursor,
+        "emitted_at": event.created_at,
+        "organization_id": event.organization_id,
+        "capture_id": event.capture_id,
+        "attempt_id": event.delivery_id,
+        "fence": event.fence,
+        "metadata": safe_tunnel_event_metadata(&event.metadata),
+        "resources": {
+            "capture": format!("hooklistener://tunnel/captures/{}", event.capture_id),
+            "attempt": event.delivery_id.as_ref().map(|id| format!("hooklistener://tunnel/attempts/{id}")),
+            "event": format!("hooklistener://tunnel/events/{}", event.id),
+        }
+    })
+}
+
+fn safe_tunnel_event_metadata(metadata: &serde_json::Value) -> serde_json::Value {
+    let Some(metadata) = metadata.as_object() else {
+        return serde_json::json!({});
+    };
+    let mut safe = serde_json::Map::new();
+
+    for key in [
+        "source",
+        "source_delivery_id",
+        "session_id",
+        "route_id",
+        "delivery_id",
+        "error_code",
+    ] {
+        if let Some(value) = metadata.get(key).filter(|value| value.is_string()) {
+            safe.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in ["status_code", "duration_ms"] {
+        if let Some(value) = metadata.get(key).filter(|value| value.is_number()) {
+            safe.insert(key.to_string(), value.clone());
+        }
+    }
+
+    serde_json::Value::Object(safe)
+}
+
+async fn run_tunnel_lifecycle_command(
+    action: Option<TunnelAction>,
+    default_target: TunnelTargetArgs,
+    json: bool,
+) -> Result<()> {
+    match action {
+        None => run_tunnel_activation(default_target.resolve(), json).await,
+        Some(TunnelAction::Start(target)) | Some(TunnelAction::Activate(target)) => {
+            run_tunnel_activation(default_target.merge(target).resolve(), json).await
+        }
+        Some(TunnelAction::Prepare(target)) => {
+            let target = default_target.merge(target).resolve();
+            validate_tunnel_target(&target)?;
+            let local_target_url = local_tunnel_target_url(&target.host, target.port);
+            let target_policy = target_policy::TargetPolicy::resolve(
+                &local_target_url,
+                target.allow_non_loopback,
+                false,
+            )
+            .await?;
+            let replay_buffered = !target.no_replay_buffered;
+            let context = tunnel_lifecycle_context(target.org.clone()).await?;
+            let receipt = tunnel_lifecycle_receipt(
+                "prepare",
+                "prepared",
+                &context.organization_id,
+                None,
+                serde_json::json!({
+                    "contract": {
+                        "id": context.contract.id,
+                        "version": context.contract.version,
+                        "schema": context.contract.schema,
+                    },
+                    "activation": {
+                        "local_target_url": local_target_url,
+                        "requested_slug": target.slug,
+                        "target": target_policy.plan(),
+                        "replay_buffered": replay_buffered,
+                    }
+                }),
+            );
+            if json {
+                print_json_line(&receipt)
+            } else {
+                print_status(OutputStatus::Ok, "TUNNEL PREPARED");
+                println!();
+                print_field("TARGET", local_target_url);
+                print_field("ORGANIZATION", context.organization_id);
+                print_field("CONTRACT", context.contract.version);
+                if let Some(slug) = target.slug {
+                    print_field("SLUG", slug);
+                }
+                Ok(())
+            }
+        }
+        Some(TunnelAction::List { limit, status, org }) => {
+            let context = tunnel_lifecycle_context(org).await?;
+            let sessions = context
+                .client
+                .list_tunnel_sessions(limit, status.as_deref())
+                .await?;
+            let receipt = tunnel_lifecycle_receipt(
+                "list",
+                "succeeded",
+                &context.organization_id,
+                Some("hooklistener://tunnel/sessions"),
+                serde_json::to_value(&sessions)?,
+            );
+            if json {
+                print_json_line(&receipt)
+            } else {
+                print_tunnel_sessions(&sessions.data, &context.organization_id);
+                Ok(())
+            }
+        }
+        Some(TunnelAction::Status { session_id, org }) => {
+            let context = tunnel_lifecycle_context(org).await?;
+            let session = context.client.get_tunnel_session(&session_id).await?;
+            print_tunnel_lifecycle_resource(
+                json,
+                "status",
+                "hooklistener://tunnel/sessions",
+                &session.id,
+                &context.organization_id,
+                &session,
+            )
+        }
+        Some(TunnelAction::Capture { capture_id, org }) => {
+            let context = tunnel_lifecycle_context(org).await?;
+            let capture = context.client.get_tunnel_capture(&capture_id).await?;
+            print_tunnel_lifecycle_resource(
+                json,
+                "capture",
+                "hooklistener://tunnel/captures",
+                &capture.id,
+                &context.organization_id,
+                &capture,
+            )
+        }
+        Some(TunnelAction::Attempt { attempt_id, org }) => {
+            let context = tunnel_lifecycle_context(org).await?;
+            let attempt = context.client.get_tunnel_attempt(&attempt_id).await?;
+            print_tunnel_lifecycle_resource(
+                json,
+                "attempt",
+                "hooklistener://tunnel/attempts",
+                &attempt.id,
+                &context.organization_id,
+                &attempt,
+            )
+        }
+        Some(TunnelAction::Stop {
+            session_id,
+            reason,
+            org,
+        }) => {
+            let context = tunnel_lifecycle_context(org).await?;
+            let session = context
+                .client
+                .stop_tunnel_session(&session_id, reason.as_deref())
+                .await?;
+            print_tunnel_lifecycle_resource(
+                json,
+                "stop",
+                "hooklistener://tunnel/sessions",
+                &session.id,
+                &context.organization_id,
+                &session,
+            )
+        }
+        Some(TunnelAction::Events {
+            cursor,
+            limit,
+            capture_id,
+            attempt_id,
+            follow,
+            interval_ms,
+            org,
+        }) => {
+            let context = tunnel_lifecycle_context(org).await?;
+            run_tunnel_lifecycle_events(
+                &context,
+                TunnelEventOptions {
+                    cursor,
+                    limit,
+                    capture_id,
+                    attempt_id,
+                    follow,
+                    interval_ms,
+                },
+                json,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_tunnel_activation(target: TunnelTarget, json: bool) -> Result<()> {
+    validate_tunnel_target(&target)?;
+    let local_target_url = local_tunnel_target_url(&target.host, target.port);
+    let target_policy =
+        target_policy::TargetPolicy::resolve(&local_target_url, target.allow_non_loopback, false)
+            .await?;
+    let replay_buffered = !target.no_replay_buffered;
+    let context = tunnel_lifecycle_context(target.org.clone()).await?;
+    let access_token_rx = refreshed_access_token_rx(context.access_token, context.config);
+    let selected_org = Some(context.organization_id);
+
+    if json {
+        run_tunnel_json(
+            access_token_rx,
+            target.host,
+            target.port,
+            selected_org,
+            target.slug,
+            target_policy,
+            replay_buffered,
+        )
+        .await
+    } else {
+        let mut terminal = setup_terminal()?;
+        let mut app = App::new()?;
+        app.monochrome = !output::styles_enabled();
+        app.state = AppState::Tunneling;
+        app.tunnel_local_host = target.host.clone();
+        app.tunnel_local_port = target.port;
+        app.tunnel_org_id = selected_org.clone();
+        app.tunnel_requested_slug = target.slug.clone();
+
+        let (event_tx, event_rx) = mpsc::channel(tunnel::PRESENTATION_QUEUE_CAPACITY);
+        let reconnect_tx = spawn_tunnel_forwarder_manager(
+            access_token_rx,
+            target.host,
+            target.port,
+            selected_org,
+            target.slug,
+            target_policy,
+            event_tx.clone(),
+            replay_buffered,
+        );
+        let result = run_app(
+            &mut terminal,
+            &mut app,
+            event_rx,
+            Some(reconnect_tx),
+            Some(event_tx),
+            Some(logo::spawn_logo_animation()),
+        )
+        .await;
+        restore_terminal(&mut terminal)?;
+        result
+    }
+}
+
+fn validate_tunnel_target(target: &TunnelTarget) -> Result<()> {
+    if target.port == 0 {
+        return Err(anyhow!("Tunnel target port must be between 1 and 65535"));
+    }
+    if target.host.trim().is_empty() {
+        return Err(anyhow!("Tunnel target host cannot be empty"));
+    }
+    Ok(())
+}
+
+fn print_tunnel_lifecycle_resource<T: serde::Serialize>(
+    json: bool,
+    operation: &str,
+    collection_uri: &str,
+    id: &str,
+    organization_id: &str,
+    resource: &T,
+) -> Result<()> {
+    let resource_uri = format!("{collection_uri}/{id}");
+    let receipt = tunnel_lifecycle_receipt(
+        operation,
+        "succeeded",
+        organization_id,
+        Some(&resource_uri),
+        serde_json::to_value(resource)?,
+    );
+    if json {
+        print_json_line(&receipt)
+    } else {
+        print_status(
+            OutputStatus::Ok,
+            &format!("TUNNEL {}", operation.to_uppercase()),
+        );
+        println!();
+        print_field("RESOURCE", &resource_uri);
+        print_field("ORGANIZATION", organization_id);
+        print_json(resource)
+    }
+}
+
+fn print_tunnel_sessions(sessions: &[api::TunnelSessionResource], organization_id: &str) {
+    print_context("Organization:", organization_id);
+    if sessions.is_empty() {
+        print_empty_state(
+            "NO TUNNEL SESSIONS",
+            "Run `hooklistener tunnel start --port 3000` to activate one.",
+        );
+        return;
+    }
+
+    let mut table = new_table(&["ID", "Status", "Slug", "Mode", "Updated"]);
+    for session in sessions {
+        table.add_row(vec![
+            session.id.clone(),
+            session.status.clone(),
+            session
+                .route
+                .as_ref()
+                .map(|route| route.slug.clone())
+                .unwrap_or_else(|| "-".to_string()),
+            session
+                .route
+                .as_ref()
+                .map(|route| route.mode.clone())
+                .unwrap_or_else(|| "-".to_string()),
+            session.updated_at.clone(),
+        ]);
+    }
+    println!("{table}");
+}
+
+async fn run_tunnel_lifecycle_events(
+    context: &TunnelLifecycleContext,
+    mut options: TunnelEventOptions,
+    json: bool,
+) -> Result<()> {
+    loop {
+        let page = context
+            .client
+            .list_tunnel_events(
+                options.cursor.as_deref(),
+                options.limit,
+                options.capture_id.as_deref(),
+                options.attempt_id.as_deref(),
+            )
+            .await?;
+
+        for event in &page.data {
+            if json {
+                print_json_line(&tunnel_lifecycle_event_envelope(event))?;
+            } else {
+                println!(
+                    "{}  {}  capture={}  attempt={}",
+                    event.position,
+                    event.event_type,
+                    event.capture_id,
+                    event.delivery_id.as_deref().unwrap_or("-")
+                );
+            }
+        }
+
+        options.cursor = Some(page.meta.cursor.clone());
+        if json {
+            print_json_line(&tunnel_lifecycle_receipt(
+                "events",
+                if options.follow {
+                    "following"
+                } else {
+                    "succeeded"
+                },
+                &context.organization_id,
+                Some("hooklistener://tunnel/events"),
+                serde_json::json!({
+                    "cursor": page.meta.cursor,
+                    "has_more": page.meta.has_more,
+                    "retention_days": page.meta.retention_days,
+                    "resync": page.meta.resync,
+                    "event_count": page.data.len(),
+                }),
+            ))?;
+        }
+
+        if !options.follow {
+            return Ok(());
+        }
+        if page.meta.has_more {
+            continue;
+        }
+
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                if json {
+                    print_json_line(&tunnel_lifecycle_receipt(
+                        "events",
+                        "stopped",
+                        &context.organization_id,
+                        Some("hooklistener://tunnel/events"),
+                        serde_json::json!({"cursor": options.cursor}),
+                    ))?;
+                }
+                return Ok(());
+            }
+            _ = sleep(Duration::from_millis(options.interval_ms.max(100))) => {}
+        }
+    }
 }
 
 async fn run_login_flow(force_reauth: bool) -> Result<()> {
@@ -4567,6 +5118,9 @@ fn error_hint(err: &anyhow::Error) -> Option<&str> {
     if let Some(e) = err.downcast_ref::<errors::TunnelError>() {
         return e.hint();
     }
+    if let Some(e) = err.downcast_ref::<errors::TunnelLifecycleError>() {
+        return e.hint();
+    }
     if let Some(e) = err.downcast_ref::<errors::ConfigError>() {
         return e.hint();
     }
@@ -4587,30 +5141,40 @@ fn error_hint(err: &anyhow::Error) -> Option<&str> {
     None
 }
 
-fn error_code(err: &anyhow::Error) -> &'static str {
+fn error_code(err: &anyhow::Error) -> String {
     if err.downcast_ref::<errors::ApiError>().is_some() {
-        "api_error"
+        "api_error".to_string()
     } else if err.downcast_ref::<errors::TunnelError>().is_some() {
-        "tunnel_error"
+        "tunnel_error".to_string()
+    } else if let Some(error) = err.downcast_ref::<errors::TunnelLifecycleError>() {
+        error.code().to_string()
     } else if err.downcast_ref::<errors::ConfigError>().is_some() {
-        "config_error"
+        "config_error".to_string()
     } else if err.downcast_ref::<errors::UpdateError>().is_some() {
-        "update_error"
+        "update_error".to_string()
     } else {
         let message = err.to_string();
         if message.contains("Confirmation required") {
-            "confirmation_required"
+            "confirmation_required".to_string()
         } else if message.contains("does not support --json") {
-            "unsupported_output_mode"
+            "unsupported_output_mode".to_string()
         } else if message.contains("Session expired") || message.contains("No access token") {
-            "authentication_required"
+            "authentication_required".to_string()
         } else if message.contains("No organization selected") {
-            "organization_required"
+            "organization_required".to_string()
         } else if message.contains("Unknown config key") {
-            "invalid_config_key"
+            "invalid_config_key".to_string()
         } else {
-            "command_failed"
+            "command_failed".to_string()
         }
+    }
+}
+
+fn command_exit_code(err: &anyhow::Error) -> i32 {
+    match err.downcast_ref::<errors::TunnelLifecycleError>() {
+        Some(errors::TunnelLifecycleError::IncompatibleSchema { .. }) => 3,
+        Some(errors::TunnelLifecycleError::CursorExpired { .. }) => 4,
+        _ => 1,
     }
 }
 
@@ -4621,13 +5185,31 @@ fn json_error_receipt(err: &anyhow::Error) -> serde_json::Value {
         .map(ToString::to_string)
         .collect::<Vec<_>>();
 
+    let details = match err.downcast_ref::<errors::TunnelLifecycleError>() {
+        Some(errors::TunnelLifecycleError::CursorExpired {
+            earliest_cursor,
+            resync,
+        }) => serde_json::json!({
+            "earliest_cursor": earliest_cursor,
+            "resync": resync,
+        }),
+        Some(errors::TunnelLifecycleError::IncompatibleSchema { supported, actual }) => {
+            serde_json::json!({"supported_major": supported, "actual_major": actual})
+        }
+        _ => serde_json::Value::Null,
+    };
+
     serde_json::json!({
+        "$schema": COMMAND_ERROR_SCHEMA,
+        "schema_version": 1,
+        "type": "error",
         "ok": false,
         "error": {
             "code": error_code(err),
             "message": err.to_string(),
             "hint": error_hint(err),
             "causes": causes,
+            "details": details,
         }
     })
 }
@@ -4635,9 +5217,9 @@ fn json_error_receipt(err: &anyhow::Error) -> serde_json::Value {
 fn display_error(err: &anyhow::Error, json: bool) {
     if json {
         match serde_json::to_string(&json_error_receipt(err)) {
-            Ok(receipt) => eprintln!("{receipt}"),
-            Err(_) => eprintln!(
-                r#"{{"ok":false,"error":{{"code":"serialization_error","message":"Failed to serialize the command error."}}}}"#
+            Ok(receipt) => println!("{receipt}"),
+            Err(_) => println!(
+                r#"{{"$schema":"hooklistener.cli.error/1","schema_version":1,"type":"error","ok":false,"error":{{"code":"serialization_error","message":"Failed to serialize the command error."}}}}"#
             ),
         }
         return;
@@ -4755,14 +5337,256 @@ mod tests {
         }
     }
 
+    fn parsed_tunnel_target(args: &[&str]) -> TunnelTarget {
+        let cli = Cli::try_parse_from(args).expect("tunnel command");
+        match cli.command.expect("parsed command") {
+            Commands::Tunnel {
+                action: None,
+                target,
+            } => target.resolve(),
+            Commands::Tunnel {
+                action:
+                    Some(
+                        TunnelAction::Start(action_target)
+                        | TunnelAction::Activate(action_target)
+                        | TunnelAction::Prepare(action_target),
+                    ),
+                target,
+            } => target.merge(action_target).resolve(),
+            _ => panic!("expected a tunnel target command"),
+        }
+    }
+
     #[test]
     fn json_error_receipt_has_stable_machine_readable_shape() {
         let receipt = json_error_receipt(&anyhow!("Something failed"));
 
+        assert_eq!(receipt["$schema"], COMMAND_ERROR_SCHEMA);
+        assert_eq!(receipt["type"], "error");
         assert_eq!(receipt["ok"], false);
         assert_eq!(receipt["error"]["code"], "command_failed");
         assert_eq!(receipt["error"]["message"], "Something failed");
         assert!(receipt["error"]["causes"].is_array());
+    }
+
+    #[test]
+    fn command_events_declare_document_specific_schemas() {
+        let listen = listen_event_base(
+            "connected",
+            "connected",
+            "endpoint-123",
+            "http://localhost:3000",
+        );
+        let tunnel = tunnel_event_base("connected", "connected");
+
+        assert_eq!(listen["$schema"], LISTEN_EVENT_SCHEMA);
+        assert_eq!(listen["type"], "event");
+        assert_eq!(tunnel["$schema"], TUNNEL_EVENT_SCHEMA);
+        assert_eq!(tunnel["type"], "event");
+    }
+
+    fn lifecycle_contract(major: u64) -> api::TunnelLifecycleContract {
+        api::TunnelLifecycleContract {
+            id: "hooklistener.tunnel.lifecycle".to_string(),
+            version: format!("{major}.0.0"),
+            schema: api::TunnelSchemaVersion { major, minor: 0 },
+            receipts: serde_json::json!({}),
+            events: serde_json::json!({}),
+            resources: serde_json::json!({}),
+            lifecycle: serde_json::json!({}),
+            exit_codes: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn tunnel_lifecycle_subcommands_preserve_default_start_syntax() {
+        let default = Cli::try_parse_from(["hooklistener", "tunnel", "--port", "4000"])
+            .expect("legacy tunnel syntax");
+        assert!(matches!(
+            default.command,
+            Some(Commands::Tunnel {
+                action: None,
+                target: TunnelTargetArgs {
+                    port: Some(4000),
+                    ..
+                }
+            })
+        ));
+
+        let before_start = parsed_tunnel_target(&[
+            "hooklistener",
+            "tunnel",
+            "--port",
+            "4000",
+            "--host",
+            "127.0.0.1",
+            "--org",
+            "org_123",
+            "--slug",
+            "billing",
+            "--allow-non-loopback",
+            "--no-replay-buffered",
+            "start",
+        ]);
+        let after_start = parsed_tunnel_target(&[
+            "hooklistener",
+            "tunnel",
+            "start",
+            "--port",
+            "4000",
+            "--host",
+            "127.0.0.1",
+            "--org",
+            "org_123",
+            "--slug",
+            "billing",
+            "--allow-non-loopback",
+            "--no-replay-buffered",
+        ]);
+        assert_eq!(before_start, after_start);
+        assert_eq!(before_start.port, 4000);
+        assert_eq!(before_start.host, "127.0.0.1");
+        assert_eq!(before_start.org.as_deref(), Some("org_123"));
+        assert_eq!(before_start.slug.as_deref(), Some("billing"));
+        assert!(before_start.allow_non_loopback);
+        assert!(before_start.no_replay_buffered);
+
+        for action in ["prepare", "activate"] {
+            let before =
+                parsed_tunnel_target(&["hooklistener", "tunnel", "--port", "4001", action]);
+            let after = parsed_tunnel_target(&["hooklistener", "tunnel", action, "--port", "4001"]);
+            assert_eq!(before, after);
+        }
+
+        let events = Cli::try_parse_from([
+            "hooklistener",
+            "tunnel",
+            "events",
+            "--cursor",
+            "opaque",
+            "--follow",
+            "--json",
+        ])
+        .expect("events command");
+        assert!(events.json);
+        assert!(matches!(
+            events.command,
+            Some(Commands::Tunnel {
+                action: Some(TunnelAction::Events {
+                    cursor: Some(cursor),
+                    follow: true,
+                    ..
+                }),
+                ..
+            }) if cursor == "opaque"
+        ));
+    }
+
+    #[test]
+    fn tunnel_schema_mismatch_is_typed_before_activation() {
+        let error = validate_tunnel_schema(&lifecycle_contract(2)).unwrap_err();
+
+        assert_eq!(error_code(&error), "incompatible_schema");
+        assert_eq!(command_exit_code(&error), 3);
+        assert_eq!(
+            json_error_receipt(&error)["error"]["details"]["actual_major"],
+            2
+        );
+    }
+
+    #[test]
+    fn expired_tunnel_cursor_has_stable_exit_code_and_resync_details() {
+        let error = anyhow::Error::new(errors::TunnelLifecycleError::CursorExpired {
+            earliest_cursor: Some("earliest".to_string()),
+            resync: serde_json::json!({"sessions": "/api/v1/tunnel/sessions"}),
+        });
+        let receipt = json_error_receipt(&error);
+
+        assert_eq!(error_code(&error), "cursor_expired");
+        assert_eq!(command_exit_code(&error), 4);
+        assert_eq!(receipt["error"]["details"]["earliest_cursor"], "earliest");
+        assert_eq!(
+            receipt["error"]["details"]["resync"]["sessions"],
+            "/api/v1/tunnel/sessions"
+        );
+
+        let without_cursor = anyhow::Error::new(errors::TunnelLifecycleError::CursorExpired {
+            earliest_cursor: None,
+            resync: serde_json::json!({}),
+        });
+        assert_eq!(
+            error_hint(&without_cursor),
+            Some(
+                "Resync sessions, captures, attempts, and outcomes, then request a fresh event cursor."
+            )
+        );
+    }
+
+    #[test]
+    fn tunnel_receipts_are_versioned_and_do_not_expose_credentials() {
+        let receipt = tunnel_lifecycle_receipt(
+            "prepare",
+            "prepared",
+            "org_123",
+            None,
+            serde_json::json!({
+                "local_target_url": "http://localhost:3000",
+                "requested_slug": "billing"
+            }),
+        );
+        let serialized = serde_json::to_string(&receipt).unwrap();
+
+        assert_eq!(receipt["$schema"], TUNNEL_RECEIPT_SCHEMA);
+        assert_eq!(receipt["schema_version"], 1);
+        assert!(receipt["event_id"].is_string());
+        assert_eq!(receipt["sequence"], 0);
+        assert!(!serialized.contains("access_token"));
+        assert!(!serialized.contains("resume_token"));
+    }
+
+    #[test]
+    fn tunnel_event_envelope_carries_cursor_identity_sequence_and_resources() {
+        let event = api::TunnelLifecycleEvent {
+            id: "event_123".to_string(),
+            position: 42,
+            cursor: "opaque-cursor".to_string(),
+            organization_id: "org_123".to_string(),
+            capture_id: "capture_123".to_string(),
+            delivery_id: Some("attempt_123".to_string()),
+            sequence: 3,
+            fence: Some(2),
+            event_type: "forward_started".to_string(),
+            metadata: serde_json::json!({
+                "source": "tunnel",
+                "status_code": 202,
+                "headers": {"authorization": "Bearer secret-header"},
+                "body": "secret-body",
+                "access_token": "secret-access-token",
+                "credentials": {"password": "secret-password"},
+                "error_code": {"token": "secret-nested-token"}
+            }),
+            created_at: "2026-07-14T20:00:00Z".to_string(),
+        };
+
+        let envelope = tunnel_lifecycle_event_envelope(&event);
+
+        assert_eq!(envelope["$schema"], TUNNEL_EVENT_SCHEMA);
+        assert_eq!(envelope["event_id"], "event_123");
+        assert_eq!(envelope["sequence"], 3);
+        assert_eq!(envelope["cursor"], "opaque-cursor");
+        assert_eq!(envelope["metadata"]["source"], "tunnel");
+        assert_eq!(envelope["metadata"]["status_code"], 202);
+        assert!(envelope["metadata"].get("headers").is_none());
+        assert!(envelope["metadata"].get("body").is_none());
+        assert!(envelope["metadata"].get("access_token").is_none());
+        assert!(envelope["metadata"].get("credentials").is_none());
+        assert!(envelope["metadata"].get("error_code").is_none());
+        let serialized = serde_json::to_string(&envelope).unwrap();
+        assert!(!serialized.contains("secret"));
+        assert_eq!(
+            envelope["resources"]["attempt"],
+            "hooklistener://tunnel/attempts/attempt_123"
+        );
     }
 
     #[test]
