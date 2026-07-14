@@ -43,10 +43,10 @@ const MAX_RAW_BODY_BYTES: usize = 1_048_576;
 const UI_BODY_PREVIEW_BYTES: usize = 65_536;
 const REDACTED_SECRET: &str = "[REDACTED]";
 const LOCAL_WORK_MAX_COUNT: usize = 8;
-const LOCAL_WORK_MAX_BYTES: usize = 64 * 1024 * 1024;
+const LOCAL_WORK_MAX_BYTES: usize = 256 * 1024 * 1024;
 const INBOUND_STREAM_MAX_COUNT: usize = 16;
-const INBOUND_STREAM_MAX_BYTES: usize = 64 * 1024 * 1024;
-const RESPONSE_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
+const INBOUND_STREAM_MAX_BYTES: usize = TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES;
+const RESPONSE_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
 const OUTBOUND_CONTROL_MAX_COUNT: usize = 256;
 const OUTBOUND_RESPONSE_MAX_COUNT: usize = 256;
 const OUTBOUND_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -3717,19 +3717,28 @@ mod tests {
     fn test_local_work_budget_bounds_concurrent_ten_megabyte_deliveries() {
         let budget = LocalWorkBudget::new();
         let ten_mib = 10 * 1024 * 1024;
-        let mut permits = Vec::new();
+        let permits = (0..LOCAL_WORK_MAX_COUNT)
+            .map(|_| budget.try_acquire(ten_mib).unwrap())
+            .collect::<Vec<_>>();
 
-        for _ in 0..6 {
-            permits.push(budget.try_acquire(ten_mib).unwrap());
-        }
-
-        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 6);
-        assert_eq!(budget.available_bytes(), 4 * 1024 * 1024);
+        assert_eq!(budget.available_count(), 0);
         assert!(budget.try_acquire(ten_mib).is_none());
-        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 6);
 
-        permits.pop();
-        assert!(budget.try_acquire(ten_mib).is_some());
+        drop(permits);
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT);
+        assert_eq!(budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_local_work_budget_allows_one_advertised_limit_body() {
+        let budget = LocalWorkBudget::new();
+        let permit = budget.try_acquire(LOCAL_WORK_MAX_BYTES).unwrap();
+
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_acquire(1).is_none());
+
+        drop(permit);
+        assert_eq!(budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
     }
 
     #[test]
@@ -3765,14 +3774,28 @@ mod tests {
     fn test_response_buffer_budget_bounds_concurrent_ten_megabyte_responses() {
         let budget = ResponseBufferBudget::new();
         let ten_mib = 10 * 1024 * 1024;
-        let permits = (0..6)
+        let permits = (0..25)
             .map(|_| budget.try_reserve(Some(ten_mib)).unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(budget.available_bytes(), 4 * 1024 * 1024);
+        assert_eq!(budget.available_bytes(), 6 * 1024 * 1024);
         assert!(budget.try_reserve(Some(ten_mib)).is_none());
 
         drop(permits);
+        assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_response_buffer_allows_one_advertised_limit_body() {
+        let budget = ResponseBufferBudget::new();
+        let permit = budget
+            .try_reserve(Some(RESPONSE_BUFFER_MAX_BYTES))
+            .unwrap();
+
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_reserve(Some(1)).is_none());
+
+        drop(permit);
         assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
     }
 
