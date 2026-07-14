@@ -1881,6 +1881,7 @@ impl TunnelClient {
                 }
                 Err(ref e) => {
                     let err_msg = e.to_string();
+                    warn!(error = %err_msg, "Tunnel connection attempt failed");
                     if is_fatal_error(&err_msg) {
                         let _ = self
                             .event_tx
@@ -3159,6 +3160,7 @@ impl TunnelForwarder {
                 }
                 Err(ref e) => {
                     let err_msg = e.to_string();
+                    warn!(error = %err_msg, "Tunnel connection attempt failed");
                     if is_fatal_error(&err_msg) {
                         let _ = self
                             .event_tx
