@@ -385,6 +385,9 @@ enum StaticTunnelAction {
         /// Optional display name
         #[arg(long)]
         name: Option<String>,
+        /// Buffer incoming requests while no CLI is connected and replay them on reconnect
+        #[arg(long)]
+        offline_buffer: bool,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
         org: Option<String>,
@@ -2410,13 +2413,18 @@ async fn run(cli: Cli) -> Result<()> {
                     print_static_tunnels(&tunnels);
                 }
             }
-            StaticTunnelAction::Create { slug, name, org } => {
+            StaticTunnelAction::Create {
+                slug,
+                name,
+                offline_buffer,
+                org,
+            } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let created = client
-                    .create_static_tunnel(&organization_id, &slug, name.as_deref())
+                    .create_static_tunnel(&organization_id, &slug, name.as_deref(), offline_buffer)
                     .await?;
                 if json {
                     print_json(&serde_json::json!({
@@ -2430,6 +2438,9 @@ async fn run(cli: Cli) -> Result<()> {
                     print_field("SLUG", created.static_tunnel.slug.as_str().bold());
                     if let Some(name) = created.static_tunnel.name.as_deref() {
                         print_field("NAME", name);
+                    }
+                    if created.static_tunnel.offline_behavior.as_deref() == Some("buffer") {
+                        print_field("OFFLINE", "buffer (requests replay on reconnect)");
                     }
                     print_field("ORGANIZATION", organization_id.dim());
                     if let Some(message) = created.message {
@@ -3836,10 +3847,11 @@ fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
             "Run `hooklistener static-tunnel create <slug>` to reserve one.",
         );
     } else {
-        let mut table = new_table(&["ID", "Slug", "Name"]);
+        let mut table = new_table(&["ID", "Slug", "Name", "Offline"]);
         for tunnel in &response.static_tunnels {
             let name = tunnel.name.as_deref().unwrap_or("");
-            table.add_row(vec![tunnel.id.as_str(), &tunnel.slug, name]);
+            let offline = tunnel.offline_behavior.as_deref().unwrap_or("reject");
+            table.add_row(vec![tunnel.id.as_str(), &tunnel.slug, name, offline]);
         }
         println!("{table}");
     }

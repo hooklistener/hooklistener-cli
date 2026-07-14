@@ -306,6 +306,8 @@ pub struct StaticTunnelSummary {
     pub slug: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub offline_behavior: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -834,12 +836,19 @@ impl ApiClient {
         organization_id: &str,
         slug: &str,
         name: Option<&str>,
+        offline_buffer: bool,
     ) -> Result<StaticTunnelCreateResponse> {
         let path = format!("/api/v1/organizations/{}/static-tunnels", organization_id);
         let mut body = serde_json::Map::new();
         body.insert("slug".to_string(), Value::String(slug.to_string()));
         if let Some(name_value) = name {
             body.insert("name".to_string(), Value::String(name_value.to_string()));
+        }
+        if offline_buffer {
+            body.insert(
+                "offline_behavior".to_string(),
+                Value::String("buffer".to_string()),
+            );
         }
         self.post_json(&path, &Value::Object(body), "create static tunnel")
             .await
