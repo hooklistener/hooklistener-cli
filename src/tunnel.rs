@@ -22,6 +22,9 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, warn};
 
+use crate::api;
+use crate::target_policy::TargetPolicy;
+
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
@@ -518,6 +521,7 @@ fn response_header_bytes(headers: &reqwest::header::HeaderMap) -> usize {
     })
 }
 
+#[cfg(test)]
 fn tunnel_http_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
@@ -1266,9 +1270,9 @@ fn websocket_endpoint(base_url: &str, path: &str) -> String {
     )
 }
 
-/// Build a WebSocket URL from a base HTTP(S) URL.
-pub fn build_ws_url(base_url: &str, token: &str, path: &str) -> String {
-    format!("{}?token={token}", websocket_endpoint(base_url, path))
+/// Build a one-time ticket-authenticated WebSocket URL from a base HTTP(S) URL.
+pub fn build_ws_url(base_url: &str, ticket: &str, path: &str) -> String {
+    format!("{}?ticket={ticket}", websocket_endpoint(base_url, path))
 }
 
 fn redact_access_token(message: &str, access_token: &str) -> String {
@@ -1314,6 +1318,7 @@ pub fn is_fatal_error(error_msg: &str) -> bool {
         || lower.contains("forbidden")
         || lower.contains("401")
         || lower.contains("403")
+        || lower.contains("relay handshake rejected")
         || lower.contains("endpoint not found")
         || lower.contains("channel join failed")
         || lower.contains("static tunnel slug not found")
@@ -1346,7 +1351,7 @@ pub fn calculate_backoff(attempt: u32, config: &ReconnectConfig) -> Duration {
 pub struct TunnelClient {
     access_token_rx: watch::Receiver<String>,
     endpoint_slug: String,
-    target_url: String,
+    target: TargetPolicy,
     base_url: String,
     event_tx: mpsc::Sender<TunnelEvent>,
 }
@@ -1355,7 +1360,7 @@ impl TunnelClient {
     pub fn new(
         access_token_rx: watch::Receiver<String>,
         endpoint_slug: String,
-        target_url: String,
+        target: TargetPolicy,
         base_url: Option<String>,
         event_tx: mpsc::Sender<TunnelEvent>,
     ) -> Self {
@@ -1367,7 +1372,7 @@ impl TunnelClient {
         Self {
             access_token_rx,
             endpoint_slug,
-            target_url,
+            target,
             base_url,
             event_tx,
         }
@@ -1377,16 +1382,33 @@ impl TunnelClient {
     pub async fn connect_and_listen(&self) -> Result<()> {
         info!(
             endpoint = %self.endpoint_slug,
-            target = %self.target_url,
+            target = %self.target.display_url(),
             "Connecting to WebSocket tunnel"
         );
 
-        // Build WebSocket URL with auth token
+        // Exchange the long-lived HTTP credential for a one-time, scoped handshake ticket.
         let access_token = self.access_token_rx.borrow().clone();
-        let ws_url = build_ws_url(&self.base_url, &access_token, "socket/websocket");
+        let plan = serde_json::json!({
+            "mode": CAPTURE_FORWARD_MODE,
+            "route": {"endpoint_slug": &self.endpoint_slug},
+            "target": self.target.plan(),
+        });
+        let relay_ticket = api::issue_relay_ticket(&access_token, &self.base_url, &plan).await?;
+        if relay_ticket.scope != "relay:listen" {
+            return Err(anyhow!(
+                "Relay handshake rejected: ticket returned an incompatible scope"
+            ));
+        }
+        if relay_ticket.plan_fingerprint.is_empty() || relay_ticket.expires_at.is_empty() {
+            return Err(anyhow!(
+                "Relay handshake rejected: ticket receipt was incomplete"
+            ));
+        }
+
+        let ws_url = build_ws_url(&self.base_url, &relay_ticket.ticket, "cli-tunnel/websocket");
 
         debug!(
-            endpoint = %websocket_endpoint(&self.base_url, "socket/websocket"),
+            endpoint = %websocket_endpoint(&self.base_url, "cli-tunnel/websocket"),
             "Connecting to WebSocket"
         );
 
@@ -1429,7 +1451,8 @@ impl TunnelClient {
                     return Err(anyhow!(msg));
                 }
                 _ => {
-                    let detail = redact_access_token(&e.to_string(), &access_token);
+                    let detail = redact_access_token(&e.to_string(), &relay_ticket.ticket);
+                    let detail = redact_access_token(&detail, &access_token);
                     let msg = format!("Failed to connect to WebSocket: {detail}");
                     let _ = self
                         .event_tx
@@ -1696,32 +1719,25 @@ impl TunnelClient {
             "Forwarding webhook to local server"
         );
 
-        // Build target URL
-        let target = format!("{}{}", self.target_url, request.path);
+        let mut target_with_query = self.target.request_url(&request.path, None)?;
+        if !request.query_params.is_empty() {
+            let mut query = target_with_query.query_pairs_mut();
+            for (key, value) in &request.query_params {
+                query.append_pair(key, &json_value_to_string(value));
+            }
+        }
 
-        // Add query params if present
-        let target_with_query = if !request.query_params.is_empty() {
-            let query_string: Vec<String> = request
-                .query_params
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, json_value_to_string(v)))
-                .collect();
-            format!("{}?{}", target, query_string.join("&"))
-        } else {
-            target
-        };
-
-        // Create HTTP client
-        let client = reqwest::Client::new();
+        // The client is pinned to the addresses resolved during activation and ignores proxies.
+        let client = self.target.http_client()?;
 
         // Build request with method
         let mut req_builder = match request.method.as_str() {
-            "GET" => client.get(&target_with_query),
-            "POST" => client.post(&target_with_query),
-            "PUT" => client.put(&target_with_query),
-            "DELETE" => client.delete(&target_with_query),
-            "PATCH" => client.patch(&target_with_query),
-            "HEAD" => client.head(&target_with_query),
+            "GET" => client.get(target_with_query.clone()),
+            "POST" => client.post(target_with_query.clone()),
+            "PUT" => client.put(target_with_query.clone()),
+            "DELETE" => client.delete(target_with_query.clone()),
+            "PATCH" => client.patch(target_with_query.clone()),
+            "HEAD" => client.head(target_with_query.clone()),
             _ => {
                 warn!("Unsupported HTTP method: {}", request.method);
                 return Ok(());
@@ -1761,7 +1777,7 @@ impl TunnelClient {
                     .event_tx
                     .send(TunnelEvent::ForwardSuccess {
                         request_id: request.id.clone(),
-                        target_url: target_with_query.clone(),
+                        target_url: target_with_query.to_string(),
                         status: status_code,
                         duration_ms,
                     })
@@ -1772,7 +1788,7 @@ impl TunnelClient {
                     serde_json::json!({
                         "request_id": &request.id,
                         "status": "proxied",
-                        "proxied_to": &target_with_query,
+                        "proxied_to": target_with_query.as_str(),
                         "status_code": status_code,
                         "response_headers": response_headers,
                         "response_body": response_body,
@@ -1799,7 +1815,7 @@ impl TunnelClient {
                     .event_tx
                     .send(TunnelEvent::ForwardError {
                         request_id: request.id.clone(),
-                        target_url: target_with_query.clone(),
+                        target_url: target_with_query.to_string(),
                         error: error_message.clone(),
                         duration_ms,
                     })
@@ -1810,7 +1826,7 @@ impl TunnelClient {
                     serde_json::json!({
                         "request_id": &request.id,
                         "status": "error",
-                        "proxied_to": &target_with_query,
+                        "proxied_to": target_with_query.as_str(),
                         "error": error_message,
                         "duration_ms": duration_ms,
                     }),
@@ -1914,6 +1930,7 @@ pub struct TunnelForwarder {
     access_token_rx: watch::Receiver<String>,
     local_host: String,
     local_port: u16,
+    target: TargetPolicy,
     org_id: Option<String>,
     slug: Option<String>,
     base_url: String,
@@ -1928,6 +1945,7 @@ impl TunnelForwarder {
         access_token_rx: watch::Receiver<String>,
         local_host: String,
         local_port: u16,
+        target: TargetPolicy,
         org_id: Option<String>,
         slug: Option<String>,
         event_tx: mpsc::Sender<TunnelEvent>,
@@ -1940,6 +1958,7 @@ impl TunnelForwarder {
             access_token_rx,
             local_host,
             local_port,
+            target,
             org_id,
             slug,
             base_url,
@@ -1976,9 +1995,26 @@ impl TunnelForwarder {
 
         let _ = self.event_tx.send(TunnelEvent::Connecting).await;
 
-        // Build WebSocket URL - connect to /tunnel/websocket endpoint (Phoenix default)
+        // Exchange the long-lived HTTP credential for a one-time, scoped handshake ticket.
         let access_token = self.access_token_rx.borrow().clone();
-        let ws_url = build_ws_url(&self.base_url, &access_token, "tunnel/websocket");
+        let plan = serde_json::json!({
+            "mode": DIRECT_RESPONSE_MODE,
+            "route": {"organization_id": &self.org_id, "slug": &self.slug},
+            "target": self.target.plan(),
+        });
+        let relay_ticket = api::issue_relay_ticket(&access_token, &self.base_url, &plan).await?;
+        if relay_ticket.scope != "relay:tunnel" {
+            return Err(anyhow!(
+                "Relay handshake rejected: ticket returned an incompatible scope"
+            ));
+        }
+        if relay_ticket.plan_fingerprint.is_empty() || relay_ticket.expires_at.is_empty() {
+            return Err(anyhow!(
+                "Relay handshake rejected: ticket receipt was incomplete"
+            ));
+        }
+
+        let ws_url = build_ws_url(&self.base_url, &relay_ticket.ticket, "tunnel/websocket");
 
         debug!(
             endpoint = %websocket_endpoint(&self.base_url, "tunnel/websocket"),
@@ -1995,7 +2031,8 @@ impl TunnelForwarder {
         {
             Ok(stream) => stream,
             Err(e) => {
-                let detail = redact_access_token(&e.to_string(), &access_token);
+                let detail = redact_access_token(&e.to_string(), &relay_ticket.ticket);
+                let detail = redact_access_token(&detail, &access_token);
                 let msg = format!("Failed to connect to tunnel: {detail}");
                 let _ = self
                     .event_tx
@@ -2700,11 +2737,23 @@ impl TunnelForwarder {
             "Forwarding tunnel request to local server"
         );
 
-        let mut target = format!("http://{}:{}{}", self.local_host, self.local_port, path);
-        if !query_string.is_empty() {
-            target.push('?');
-            target.push_str(&query_string);
-        }
+        let target = match self.target.request_url(
+            &path,
+            (!query_string.is_empty()).then_some(query_string.as_str()),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                return self
+                    .report_tunnel_failure(
+                        &request_id,
+                        DeliveryFailure::known(error.code(), error.to_string()),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
 
         let remaining_ms = deadline_unix_ms.saturating_sub(unix_time_ms());
         if remaining_ms == 0 {
@@ -2722,8 +2771,12 @@ impl TunnelForwarder {
                 .await;
         }
 
-        // One end-to-end deadline covers local connection and response streaming.
-        let client = match tunnel_http_client(Duration::from_millis(remaining_ms)) {
+        // One end-to-end deadline covers a proxy-free, address-pinned local request
+        // and its response stream.
+        let client = match self
+            .target
+            .http_client_with_timeout(Duration::from_millis(remaining_ms))
+        {
             Ok(client) => client,
             Err(error) => {
                 return self
@@ -2758,7 +2811,7 @@ impl TunnelForwarder {
                     .await;
             }
         };
-        let mut req_builder = client.request(request_method, &target);
+        let mut req_builder = client.request(request_method, target);
 
         // reqwest sets request framing headers from the body actually sent.
         for (key, value) in headers {
@@ -3703,14 +3756,18 @@ mod tests {
         assert_eq!(cancellation_classification(DELIVERY_TERMINAL), None);
     }
 
-    #[test]
-    fn test_saturated_presentation_emits_stream_gap_after_recovery() {
+    #[tokio::test]
+    async fn test_saturated_presentation_emits_stream_gap_after_recovery() {
         let (_token_tx, token_rx) = watch::channel("token".to_string());
         let (event_tx, mut event_rx) = mpsc::channel(2);
+        let target = TargetPolicy::resolve("http://127.0.0.1:3000", false, false)
+            .await
+            .unwrap();
         let forwarder = TunnelForwarder::new(
             token_rx,
             "127.0.0.1".to_string(),
             3000,
+            target,
             None,
             None,
             event_tx,
@@ -3733,15 +3790,19 @@ mod tests {
         assert!(matches!(event_rx.try_recv(), Ok(TunnelEvent::Disconnected)));
     }
 
-    #[test]
-    fn test_closed_presentation_consumer_does_not_block_delivery_path() {
+    #[tokio::test]
+    async fn test_closed_presentation_consumer_does_not_block_delivery_path() {
         let (_token_tx, token_rx) = watch::channel("token".to_string());
         let (event_tx, event_rx) = mpsc::channel(1);
         drop(event_rx);
+        let target = TargetPolicy::resolve("http://127.0.0.1:3000", false, false)
+            .await
+            .unwrap();
         let forwarder = TunnelForwarder::new(
             token_rx,
             "127.0.0.1".to_string(),
             3000,
+            target,
             None,
             None,
             event_tx,
@@ -3880,10 +3941,18 @@ mod tests {
 
         let (_token_tx, token_rx) = watch::channel("token".to_string());
         let (event_tx, mut event_rx) = mpsc::channel(PRESENTATION_QUEUE_CAPACITY);
+        let target = TargetPolicy::resolve(
+            &format!("http://127.0.0.1:{}", local_address.port()),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         let forwarder = TunnelForwarder::new(
             token_rx,
             "127.0.0.1".to_string(),
             local_address.port(),
+            target,
             None,
             None,
             event_tx,
@@ -3997,13 +4066,13 @@ mod tests {
     #[test]
     fn test_build_ws_url_https_to_wss() {
         let url = build_ws_url("https://api.example.com", "tok123", "socket/websocket");
-        assert_eq!(url, "wss://api.example.com/socket/websocket?token=tok123");
+        assert_eq!(url, "wss://api.example.com/socket/websocket?ticket=tok123");
     }
 
     #[test]
     fn test_build_ws_url_http_to_ws() {
         let url = build_ws_url("http://localhost:4000", "tok", "tunnel/websocket");
-        assert_eq!(url, "ws://localhost:4000/tunnel/websocket?token=tok");
+        assert_eq!(url, "ws://localhost:4000/tunnel/websocket?ticket=tok");
     }
 
     #[test]
@@ -4059,6 +4128,19 @@ mod tests {
     #[test]
     fn test_is_fatal_error_join_failed() {
         assert!(is_fatal_error("Channel join failed: unknown"));
+    }
+
+    #[test]
+    fn test_relay_handshake_rejections_are_fatal() {
+        assert!(is_fatal_error(
+            "Relay handshake rejected (HTTP 401 Unauthorized): expired"
+        ));
+        assert!(is_fatal_error(
+            "Relay handshake rejected: ticket receipt was incomplete"
+        ));
+        assert!(!is_fatal_error(
+            "Relay handshake ticket request failed (HTTP 503 Service Unavailable)"
+        ));
     }
 
     #[test]

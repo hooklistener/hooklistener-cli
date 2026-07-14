@@ -27,6 +27,12 @@ impl Config {
 
     pub fn load_from(path: &Path) -> Result<Self> {
         if path.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            }
+
             let content = fs::read_to_string(path)?;
             let config: Config = serde_json::from_str(&content)?;
             Ok(config)
@@ -46,7 +52,29 @@ impl Config {
         }
 
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(path, content)?;
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+
+            // OpenOptions::mode applies only when creating a file. Tighten an
+            // existing file before writing the new credentials as well.
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            file.write_all(content.as_bytes())?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::write(path, content)?;
+        }
 
         Ok(())
     }
@@ -224,6 +252,15 @@ mod tests {
         assert_eq!(loaded.access_token.as_deref(), Some("roundtrip_token"));
         assert_eq!(loaded.selected_organization_id.as_deref(), Some("org-rt"));
         assert!(loaded.is_token_valid());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
