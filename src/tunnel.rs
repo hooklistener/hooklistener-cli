@@ -310,15 +310,11 @@ struct LocalDelivery {
 
 impl LocalDelivery {
     fn retained_bytes(&self) -> usize {
+        // This semaphore is the retained body budget. Request count is bounded
+        // separately, while request metadata has protocol and HTTP ingress
+        // limits of its own. Including metadata here would reject a body that
+        // is exactly at the server-advertised limit.
         self.body.len()
-            + self.method.len()
-            + self.path.len()
-            + self.query_string.len()
-            + self
-                .headers
-                .iter()
-                .map(|(name, value)| name.len() + value.len())
-                .sum::<usize>()
     }
 
     fn received_event(&self) -> TunnelEvent {
@@ -3734,6 +3730,21 @@ mod tests {
     #[test]
     fn test_local_work_budget_allows_one_advertised_limit_body() {
         let budget = LocalWorkBudget::new();
+        let delivery = LocalDelivery {
+            request_id: "request-at-limit".to_string(),
+            method: "POST".to_string(),
+            path: "/metadata-does-not-reduce-the-body-budget".to_string(),
+            query_string: "source=conformance".to_string(),
+            headers: vec![(
+                "content-type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body: Vec::new(),
+            deadline_unix_ms: unix_time_ms() + 1_000,
+            replay: false,
+        };
+        assert_eq!(delivery.retained_bytes(), 0);
+
         let permit = budget.try_acquire(LOCAL_WORK_MAX_BYTES).unwrap();
 
         assert_eq!(budget.available_bytes(), 0);
@@ -3790,9 +3801,7 @@ mod tests {
     #[test]
     fn test_response_buffer_allows_one_advertised_limit_body() {
         let budget = ResponseBufferBudget::new();
-        let permit = budget
-            .try_reserve(Some(RESPONSE_BUFFER_MAX_BYTES))
-            .unwrap();
+        let permit = budget.try_reserve(Some(RESPONSE_BUFFER_MAX_BYTES)).unwrap();
 
         assert_eq!(budget.available_bytes(), 0);
         assert!(budget.try_reserve(Some(1)).is_none());
