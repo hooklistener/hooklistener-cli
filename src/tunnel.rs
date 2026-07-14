@@ -3,11 +3,18 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio_tungstenite::{
     connect_async, connect_async_with_config,
-    tungstenite::{Message, error::Error as WsError, http::StatusCode, protocol::WebSocketConfig},
+    tungstenite::{
+        Bytes, Message, error::Error as WsError, http::StatusCode, protocol::WebSocketConfig,
+    },
 };
 use tracing::{debug, error, info, warn};
 
@@ -26,6 +33,300 @@ const LEGACY_MAX_RESPONSE_BODY_BYTES: usize = 7_000_000;
 const LEGACY_MAX_RESPONSE_HEADER_BYTES: usize = 1_048_576;
 const MAX_RAW_BODY_BYTES: usize = 1_048_576;
 const UI_BODY_PREVIEW_BYTES: usize = 65_536;
+const LOCAL_WORK_MAX_COUNT: usize = 8;
+const LOCAL_WORK_MAX_BYTES: usize = 64 * 1024 * 1024;
+const INBOUND_STREAM_MAX_COUNT: usize = 16;
+const INBOUND_STREAM_MAX_BYTES: usize = 64 * 1024 * 1024;
+const RESPONSE_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
+const OUTBOUND_CONTROL_MAX_COUNT: usize = 256;
+const OUTBOUND_RESPONSE_MAX_COUNT: usize = 256;
+const OUTBOUND_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const PRESENTATION_QUEUE_CAPACITY: usize = 100;
+const PRESENTATION_MAX_EVENT_BYTES: usize = 256 * 1024;
+
+const DELIVERY_QUEUED: u8 = 0;
+const DELIVERY_STARTED: u8 = 1;
+const DELIVERY_TERMINAL: u8 = 2;
+
+struct OutboundItem {
+    message: Message,
+    _bytes: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct PriorityWriter {
+    control_tx: mpsc::Sender<OutboundItem>,
+    response_tx: mpsc::Sender<OutboundItem>,
+    bytes: Arc<Semaphore>,
+}
+
+impl PriorityWriter {
+    fn spawn(write: WsWrite) -> (Self, tokio::task::JoinHandle<Result<()>>) {
+        let (control_tx, control_rx) = mpsc::channel(OUTBOUND_CONTROL_MAX_COUNT);
+        let (response_tx, response_rx) = mpsc::channel(OUTBOUND_RESPONSE_MAX_COUNT);
+        let writer = Self {
+            control_tx,
+            response_tx,
+            bytes: Arc::new(Semaphore::new(OUTBOUND_MAX_BYTES)),
+        };
+        let task = tokio::spawn(run_priority_writer(write, control_rx, response_rx));
+        (writer, task)
+    }
+
+    async fn control(&self, message: ChannelMessage) -> Result<()> {
+        self.enqueue_channel(message, true).await
+    }
+
+    async fn response(&self, message: ChannelMessage) -> Result<()> {
+        self.enqueue_channel(message, false).await
+    }
+
+    async fn pong(&self, data: Bytes) -> Result<()> {
+        self.enqueue(Message::Pong(data), true).await
+    }
+
+    async fn enqueue_channel(&self, message: ChannelMessage, control: bool) -> Result<()> {
+        let json = serde_json::to_vec(&message)?;
+        if json.len() > TUNNEL_MAX_FRAME_BYTES {
+            return Err(anyhow!("Tunnel channel message exceeds 64 KiB"));
+        }
+        self.enqueue(Message::Text(String::from_utf8(json)?.into()), control)
+            .await
+    }
+
+    async fn enqueue(&self, message: Message, control: bool) -> Result<()> {
+        let size = message.len().max(1);
+        let permits: u32 = size
+            .try_into()
+            .map_err(|_| anyhow!("Outbound message byte count is invalid"))?;
+        let bytes = self.bytes.clone().acquire_many_owned(permits).await?;
+        let item = OutboundItem {
+            message,
+            _bytes: bytes,
+        };
+        let sender = if control {
+            &self.control_tx
+        } else {
+            &self.response_tx
+        };
+        sender
+            .send(item)
+            .await
+            .map_err(|_| anyhow!("Tunnel writer stopped"))
+    }
+
+    #[cfg(test)]
+    fn available_bytes(&self) -> usize {
+        self.bytes.available_permits()
+    }
+}
+
+async fn run_priority_writer(
+    mut write: WsWrite,
+    mut control_rx: mpsc::Receiver<OutboundItem>,
+    mut response_rx: mpsc::Receiver<OutboundItem>,
+) -> Result<()> {
+    loop {
+        let item = tokio::select! {
+            biased;
+            item = control_rx.recv() => item,
+            item = response_rx.recv() => item,
+            else => None,
+        };
+
+        match item {
+            Some(item) => write.send(item.message).await?,
+            None => return Ok(()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LocalWorkBudget {
+    count: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+}
+
+struct LocalWorkPermit {
+    _count: OwnedSemaphorePermit,
+    _bytes: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct ResponseBufferBudget {
+    bytes: Arc<Semaphore>,
+}
+
+impl ResponseBufferBudget {
+    fn new() -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(RESPONSE_BUFFER_MAX_BYTES)),
+        }
+    }
+
+    fn try_acquire(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let bytes: u32 = bytes.max(1).try_into().ok()?;
+        self.bytes.clone().try_acquire_many_owned(bytes).ok()
+    }
+
+    #[cfg(test)]
+    fn available_bytes(&self) -> usize {
+        self.bytes.available_permits()
+    }
+}
+
+impl LocalWorkBudget {
+    fn new() -> Self {
+        Self {
+            count: Arc::new(Semaphore::new(LOCAL_WORK_MAX_COUNT)),
+            bytes: Arc::new(Semaphore::new(LOCAL_WORK_MAX_BYTES)),
+        }
+    }
+
+    fn try_acquire(&self, bytes: usize) -> Option<LocalWorkPermit> {
+        let bytes: u32 = bytes.max(1).try_into().ok()?;
+        let count = self.count.clone().try_acquire_owned().ok()?;
+        let bytes = self.bytes.clone().try_acquire_many_owned(bytes).ok()?;
+        Some(LocalWorkPermit {
+            _count: count,
+            _bytes: bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn available_count(&self) -> usize {
+        self.count.available_permits()
+    }
+
+    #[cfg(test)]
+    fn available_bytes(&self) -> usize {
+        self.bytes.available_permits()
+    }
+}
+
+struct ActiveDelivery {
+    abort: AbortHandle,
+    phase: Arc<AtomicU8>,
+}
+
+struct RelayRuntime {
+    inbound_streams: HashMap<String, TunnelStreamAssembler>,
+    inbound_reserved_bytes: usize,
+    work_budget: LocalWorkBudget,
+    response_budget: ResponseBufferBudget,
+    workers: JoinSet<(String, Result<()>)>,
+    active_deliveries: HashMap<String, ActiveDelivery>,
+}
+
+impl RelayRuntime {
+    fn new() -> Self {
+        Self {
+            inbound_streams: HashMap::new(),
+            inbound_reserved_bytes: 0,
+            work_budget: LocalWorkBudget::new(),
+            response_budget: ResponseBufferBudget::new(),
+            workers: JoinSet::new(),
+            active_deliveries: HashMap::new(),
+        }
+    }
+}
+
+struct LocalDelivery {
+    request_id: String,
+    method: String,
+    path: String,
+    query_string: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    deadline_unix_ms: u64,
+}
+
+impl LocalDelivery {
+    fn retained_bytes(&self) -> usize {
+        self.body.len()
+            + self.method.len()
+            + self.path.len()
+            + self.query_string.len()
+            + self
+                .headers
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>()
+    }
+
+    fn received_event(&self) -> TunnelEvent {
+        TunnelEvent::RequestReceived {
+            request_id: self.request_id.clone(),
+            method: self.method.clone(),
+            path: bounded_presentation_text(&self.path),
+            headers: bounded_presentation_headers(self.headers.iter().cloned()),
+            body: body_preview(&self.body),
+            query_string: bounded_presentation_text(&self.query_string),
+        }
+    }
+}
+
+fn stream_error_message(topic: &str, stream_id: &str, code: &str) -> ChannelMessage {
+    ChannelMessage {
+        topic: topic.to_string(),
+        event: "tunnel_stream_error".to_string(),
+        payload: serde_json::json!({"stream_id": stream_id, "code": code}),
+        reference: None,
+    }
+}
+
+fn delivery_error_message(
+    topic: &str,
+    request_id: &str,
+    code: &str,
+    outcome: &str,
+    error: &str,
+) -> ChannelMessage {
+    ChannelMessage {
+        topic: topic.to_string(),
+        event: "tunnel_error".to_string(),
+        payload: serde_json::json!({
+            "request_id": request_id,
+            "code": code,
+            "outcome": outcome,
+            "error": error,
+        }),
+        reference: None,
+    }
+}
+
+fn cancellation_classification(phase: u8) -> Option<(&'static str, &'static str)> {
+    match phase {
+        DELIVERY_QUEUED => Some(("cancelled_before_forward", "known_not_executed")),
+        DELIVERY_STARTED => Some(("cancelled_after_forward_started", "outcome_unknown")),
+        DELIVERY_TERMINAL => None,
+        _ => Some(("cancelled_after_forward_started", "outcome_unknown")),
+    }
+}
+
+struct DeliveryFailure {
+    code: &'static str,
+    outcome: &'static str,
+    error: String,
+}
+
+impl DeliveryFailure {
+    fn known(code: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            code,
+            outcome: "known_not_executed",
+            error: error.into(),
+        }
+    }
+
+    fn unknown(code: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            code,
+            outcome: "outcome_unknown",
+            error: error.into(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct TunnelLimits {
@@ -149,6 +450,39 @@ fn body_preview(bytes: &[u8]) -> Option<String> {
     }
 
     Some(preview)
+}
+
+fn bounded_presentation_headers<I>(headers: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut retained = HashMap::new();
+    let mut bytes = 0usize;
+
+    for (name, value) in headers {
+        let pair_bytes = name.len().saturating_add(value.len());
+        if bytes.saturating_add(pair_bytes) > PRESENTATION_MAX_EVENT_BYTES / 2 {
+            break;
+        }
+        bytes += pair_bytes;
+        retained.insert(name, value);
+    }
+
+    retained
+}
+
+fn bounded_presentation_text(value: &str) -> String {
+    const MAX_TEXT_BYTES: usize = PRESENTATION_MAX_EVENT_BYTES / 8;
+
+    if value.len() <= MAX_TEXT_BYTES {
+        return value.to_string();
+    }
+
+    let mut end = MAX_TEXT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated]", &value[..end])
 }
 
 fn with_forward_id(mut payload: serde_json::Value, forward_id: Option<&str>) -> serde_json::Value {
@@ -433,18 +767,6 @@ fn ordered_header_pairs(value: Option<&serde_json::Value>) -> Result<Vec<(String
     }
 }
 
-async fn send_channel_message(write: &mut WsWrite, message: ChannelMessage) -> Result<()> {
-    let json = serde_json::to_vec(&message)?;
-    if json.len() > TUNNEL_MAX_FRAME_BYTES {
-        return Err(anyhow!("Tunnel channel message exceeds 64 KiB"));
-    }
-
-    write
-        .send(Message::Text(String::from_utf8(json)?.into()))
-        .await?;
-    Ok(())
-}
-
 fn validate_framing_contract(response: &serde_json::Value) -> Result<()> {
     let framing = response
         .get("framing")
@@ -550,6 +872,9 @@ pub enum TunnelEvent {
     RequestFailed {
         request_id: String,
         error: String,
+    },
+    StreamGap {
+        dropped_events: usize,
     },
     ReplayCompleted {
         request_id: String,
@@ -1237,6 +1562,7 @@ impl TunnelClient {
 }
 
 /// HTTP Tunnel forwarder - connects to /tunnel endpoint and forwards HTTP requests
+#[derive(Clone)]
 pub struct TunnelForwarder {
     access_token_rx: watch::Receiver<String>,
     local_host: String,
@@ -1245,6 +1571,7 @@ pub struct TunnelForwarder {
     slug: Option<String>,
     base_url: String,
     event_tx: mpsc::Sender<TunnelEvent>,
+    presentation_drops: Arc<AtomicUsize>,
 }
 
 impl TunnelForwarder {
@@ -1267,6 +1594,25 @@ impl TunnelForwarder {
             slug,
             base_url,
             event_tx,
+            presentation_drops: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn emit_presentation(&self, event: TunnelEvent) {
+        let dropped = self.presentation_drops.swap(0, Ordering::AcqRel);
+        if dropped > 0
+            && self
+                .event_tx
+                .try_send(TunnelEvent::StreamGap {
+                    dropped_events: dropped,
+                })
+                .is_err()
+        {
+            self.presentation_drops.fetch_add(dropped, Ordering::AcqRel);
+        }
+
+        if self.event_tx.try_send(event).is_err() {
+            self.presentation_drops.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -1448,44 +1794,43 @@ impl TunnelForwarder {
             }
         }
 
-        // Track last ping time
-        let mut last_ping = tokio::time::Instant::now();
-        let ping_interval = Duration::from_secs(30);
+        let (writer, mut writer_task) = PriorityWriter::spawn(write);
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_interval.tick().await;
         let mut ping_counter = 2;
-        let mut inbound_streams = HashMap::new();
+        let mut runtime = RelayRuntime::new();
 
         // Listen for tunnel_request events
         loop {
-            // Check if we need to send a ping
-            if last_ping.elapsed() >= ping_interval {
-                let ping_msg = ChannelMessage {
-                    topic: tunnel_topic.clone(),
-                    event: "ping".to_string(),
-                    payload: serde_json::json!({}),
-                    reference: Some(ping_counter.to_string()),
-                };
-                ping_counter += 1;
-
-                if let Ok(json) = serde_json::to_string(&ping_msg)
-                    && let Err(e) = write.send(Message::Text(json.into())).await
-                {
-                    error!("Failed to send ping: {}", e);
-                    break;
+            tokio::select! {
+                biased;
+                writer_result = &mut writer_task => {
+                    match writer_result {
+                        Ok(Ok(())) => return Err(anyhow!("Tunnel writer stopped")),
+                        Ok(Err(error)) => return Err(error.context("Tunnel writer failed")),
+                        Err(error) => return Err(anyhow!("Tunnel writer task failed: {error}")),
+                    }
                 }
-                last_ping = tokio::time::Instant::now();
-            }
-
-            // Use timeout to allow ping checks
-            match tokio::time::timeout(Duration::from_millis(100), read.next()).await {
-                Ok(Some(msg)) => match msg {
+                _ = ping_interval.tick() => {
+                    writer.control(ChannelMessage {
+                        topic: tunnel_topic.clone(),
+                        event: "ping".to_string(),
+                        payload: serde_json::json!({}),
+                        reference: Some(ping_counter.to_string()),
+                    }).await?;
+                    ping_counter += 1;
+                },
+                maybe_msg = read.next() => match maybe_msg {
+                    Some(msg) => match msg {
                     Ok(Message::Text(text)) => {
                         if let Err(e) = self
                             .handle_tunnel_message(
                                 &text,
-                                &mut write,
+                                &writer,
                                 &tunnel_topic,
                                 tunnel_limits,
-                                &mut inbound_streams,
+                                &mut runtime,
                             )
                             .await
                         {
@@ -1494,12 +1839,11 @@ impl TunnelForwarder {
                     }
                     Ok(Message::Close(frame)) => {
                         info!("Tunnel WebSocket closed: {:?}", frame);
-                        let _ = self.event_tx.send(TunnelEvent::Disconnected).await;
+                        self.emit_presentation(TunnelEvent::Disconnected);
                         break;
                     }
                     Ok(Message::Ping(data)) => {
-                        debug!("Received ping, sending pong");
-                        if let Err(e) = write.send(Message::Pong(data)).await {
+                        if let Err(e) = writer.pong(data).await {
                             error!("Failed to send pong: {}", e);
                             break;
                         }
@@ -1516,34 +1860,44 @@ impl TunnelForwarder {
                             .await;
                         break;
                     }
-                },
-                Ok(None) => {
+                    },
+                    None => {
                     warn!("Tunnel WebSocket stream ended");
-                    let _ = self.event_tx.send(TunnelEvent::Disconnected).await;
+                    self.emit_presentation(TunnelEvent::Disconnected);
                     break;
-                }
-                Err(_) => {
-                    // Timeout - continue to check ping
-                    continue;
-                }
+                    }
+                },
+                completed = runtime.workers.join_next(), if !runtime.workers.is_empty() => {
+                    if let Some(result) = completed {
+                        match result {
+                            Ok((request_id, Ok(()))) => {
+                                runtime.active_deliveries.remove(&request_id);
+                            }
+                            Ok((request_id, Err(error))) => {
+                                runtime.active_deliveries.remove(&request_id);
+                                error!(request_id = %request_id, error = %error, "Local delivery task failed");
+                            }
+                            Err(error) if error.is_cancelled() => {}
+                            Err(error) => error!(error = %error, "Local delivery task panicked"),
+                        }
+                    }
+                },
             }
         }
 
+        runtime.workers.abort_all();
+        while runtime.workers.join_next().await.is_some() {}
+        writer_task.abort();
         Ok(())
     }
 
     async fn handle_tunnel_message(
         &self,
         text: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        writer: &PriorityWriter,
         tunnel_topic: &str,
         tunnel_limits: TunnelLimits,
-        inbound_streams: &mut HashMap<String, TunnelStreamAssembler>,
+        runtime: &mut RelayRuntime,
     ) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
 
@@ -1556,14 +1910,36 @@ impl TunnelForwarder {
         match msg.event.as_str() {
             "tunnel_stream_start" => {
                 let assembler = TunnelStreamAssembler::from_start(&msg.payload, "request")?;
-                if inbound_streams.len() >= 128 {
-                    return Err(anyhow!("Too many concurrent tunnel streams"));
+                if runtime.inbound_streams.len() >= INBOUND_STREAM_MAX_COUNT
+                    || runtime
+                        .inbound_reserved_bytes
+                        .saturating_add(assembler.total_bytes)
+                        > INBOUND_STREAM_MAX_BYTES
+                {
+                    writer
+                        .control(stream_error_message(
+                            tunnel_topic,
+                            &assembler.stream_id,
+                            "relay_inbound_overloaded",
+                        ))
+                        .await?;
+                    return Ok(());
                 }
-                if inbound_streams.contains_key(&assembler.stream_id) {
-                    return Err(anyhow!("Duplicate tunnel stream id"));
+                if runtime.inbound_streams.contains_key(&assembler.stream_id) {
+                    writer
+                        .control(stream_error_message(
+                            tunnel_topic,
+                            &assembler.stream_id,
+                            "duplicate_stream",
+                        ))
+                        .await?;
+                    return Ok(());
                 }
 
-                inbound_streams.insert(assembler.stream_id.clone(), assembler);
+                runtime.inbound_reserved_bytes += assembler.total_bytes;
+                runtime
+                    .inbound_streams
+                    .insert(assembler.stream_id.clone(), assembler);
             }
             "tunnel_stream_frame" => {
                 let stream_id = msg
@@ -1574,14 +1950,42 @@ impl TunnelForwarder {
                     .to_string();
                 let sequence = json_usize(&msg.payload, "sequence")?;
 
-                let completed = inbound_streams
-                    .get_mut(&stream_id)
-                    .ok_or_else(|| anyhow!("Tunnel frame references an unknown stream"))?
-                    .append(&msg.payload)?;
+                let completed = match runtime.inbound_streams.get_mut(&stream_id) {
+                    Some(assembler) => match assembler.append(&msg.payload) {
+                        Ok(completed) => completed,
+                        Err(error) => {
+                            let assembler = runtime
+                                .inbound_streams
+                                .remove(&stream_id)
+                                .expect("invalid stream must still be reserved");
+                            runtime.inbound_reserved_bytes = runtime
+                                .inbound_reserved_bytes
+                                .saturating_sub(assembler.total_bytes);
+                            writer
+                                .control(stream_error_message(
+                                    tunnel_topic,
+                                    &stream_id,
+                                    "invalid_stream_frame",
+                                ))
+                                .await?;
+                            warn!(stream_id, error = %error, "Rejected invalid tunnel frame");
+                            return Ok(());
+                        }
+                    },
+                    None => {
+                        writer
+                            .control(stream_error_message(
+                                tunnel_topic,
+                                &stream_id,
+                                "unknown_stream",
+                            ))
+                            .await?;
+                        return Ok(());
+                    }
+                };
 
-                send_channel_message(
-                    write,
-                    ChannelMessage {
+                writer
+                    .control(ChannelMessage {
                         topic: tunnel_topic.to_string(),
                         event: "tunnel_stream_ack".to_string(),
                         payload: serde_json::json!({
@@ -1589,31 +1993,140 @@ impl TunnelForwarder {
                             "sequence": sequence,
                         }),
                         reference: None,
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
 
                 if let Some(payload) = completed {
-                    let assembler = inbound_streams
+                    let assembler = runtime
+                        .inbound_streams
                         .remove(&stream_id)
                         .ok_or_else(|| anyhow!("Completed tunnel stream disappeared"))?;
-                    self.handle_framed_tunnel_request(
+                    runtime.inbound_reserved_bytes = runtime
+                        .inbound_reserved_bytes
+                        .saturating_sub(assembler.total_bytes);
+
+                    let delivery = match self.parse_local_delivery(
                         &payload,
                         assembler.deadline_unix_ms,
-                        write,
-                        tunnel_topic,
                         tunnel_limits,
-                    )
-                    .await?;
+                    ) {
+                        Ok(delivery) => delivery,
+                        Err(error) => {
+                            let request_id = payload
+                                .get("request_id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or(&stream_id);
+                            writer
+                                .control(delivery_error_message(
+                                    tunnel_topic,
+                                    request_id,
+                                    "invalid_relay_request",
+                                    "known_not_executed",
+                                    &error.to_string(),
+                                ))
+                                .await?;
+                            return Ok(());
+                        }
+                    };
+
+                    if runtime.active_deliveries.contains_key(&delivery.request_id) {
+                        writer
+                            .control(delivery_error_message(
+                                tunnel_topic,
+                                &delivery.request_id,
+                                "duplicate_delivery",
+                                "known_not_executed",
+                                "Delivery is already active",
+                            ))
+                            .await?;
+                        return Ok(());
+                    }
+
+                    let Some(permit) = runtime.work_budget.try_acquire(delivery.retained_bytes())
+                    else {
+                        writer
+                            .control(delivery_error_message(
+                                tunnel_topic,
+                                &delivery.request_id,
+                                "relay_overloaded_before_forward",
+                                "known_not_executed",
+                                "Local relay capacity is full",
+                            ))
+                            .await?;
+                        self.emit_presentation(TunnelEvent::RequestFailed {
+                            request_id: delivery.request_id,
+                            error: "Local relay capacity is full".to_string(),
+                        });
+                        return Ok(());
+                    };
+
+                    self.emit_presentation(delivery.received_event());
+                    let request_id = delivery.request_id.clone();
+                    let task_request_id = request_id.clone();
+                    let phase = Arc::new(AtomicU8::new(DELIVERY_QUEUED));
+                    let task_phase = phase.clone();
+                    let worker = self.clone();
+                    let task_writer = writer.clone();
+                    let task_response_budget = runtime.response_budget.clone();
+                    let topic = tunnel_topic.to_string();
+                    let abort = runtime.workers.spawn(async move {
+                        let _permit = permit;
+                        let result = worker
+                            .forward_tunnel_request(
+                                delivery,
+                                task_phase,
+                                task_writer,
+                                topic,
+                                tunnel_limits,
+                                task_response_budget,
+                            )
+                            .await;
+                        (task_request_id, result)
+                    });
+                    runtime
+                        .active_deliveries
+                        .insert(request_id, ActiveDelivery { abort, phase });
+                }
+            }
+            "tunnel_cancel" => {
+                let request_id = required_string(&msg.payload, "request_id")?;
+                if let Some(active) = runtime.active_deliveries.remove(&request_id) {
+                    let phase = active.phase.load(Ordering::Acquire);
+                    if let Some((code, outcome)) = cancellation_classification(phase) {
+                        active.abort.abort();
+                        writer
+                            .control(delivery_error_message(
+                                tunnel_topic,
+                                &request_id,
+                                code,
+                                outcome,
+                                "Delivery was cancelled",
+                            ))
+                            .await?;
+                        self.emit_presentation(TunnelEvent::RequestFailed {
+                            request_id,
+                            error: outcome.to_string(),
+                        });
+                    }
                 }
             }
             "tunnel_stream_error" => {
+                if let Some(stream_id) = msg
+                    .payload
+                    .get("stream_id")
+                    .and_then(serde_json::Value::as_str)
+                    && let Some(assembler) = runtime.inbound_streams.remove(stream_id)
+                {
+                    runtime.inbound_reserved_bytes = runtime
+                        .inbound_reserved_bytes
+                        .saturating_sub(assembler.total_bytes);
+                }
                 let code = msg
                     .payload
                     .get("code")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("stream_error");
-                return Err(anyhow!("Tunnel stream failed: {code}"));
+                warn!(code, "Tunnel stream failed");
             }
             "phx_reply" => {
                 // Handle ping replies
@@ -1634,14 +2147,12 @@ impl TunnelForwarder {
         Ok(())
     }
 
-    async fn handle_framed_tunnel_request(
+    fn parse_local_delivery(
         &self,
         payload: &serde_json::Value,
         deadline_unix_ms: u64,
-        write: &mut WsWrite,
-        tunnel_topic: &str,
         tunnel_limits: TunnelLimits,
-    ) -> Result<()> {
+    ) -> Result<LocalDelivery> {
         let request_id = required_string(payload, "request_id")?;
         let method = required_string(payload, "method")?;
         let path = required_string(payload, "path")?;
@@ -1668,34 +2179,14 @@ impl TunnelForwarder {
         };
 
         if body.len() > tunnel_limits.max_request_body_bytes {
-            return self
-                .report_tunnel_failure(
-                    &request_id,
-                    format!(
-                        "Tunnel request body exceeds advertised limit ({} > {} bytes)",
-                        body.len(),
-                        tunnel_limits.max_request_body_bytes
-                    ),
-                    write,
-                    tunnel_topic,
-                )
-                .await;
+            return Err(anyhow!(
+                "Tunnel request body exceeds advertised limit ({} > {} bytes)",
+                body.len(),
+                tunnel_limits.max_request_body_bytes
+            ));
         }
 
-        let headers_map = headers.iter().cloned().collect();
-        let _ = self
-            .event_tx
-            .send(TunnelEvent::RequestReceived {
-                request_id: request_id.clone(),
-                method: method.clone(),
-                path: path.clone(),
-                headers: headers_map,
-                body: body_preview(&body),
-                query_string: query_string.clone(),
-            })
-            .await;
-
-        self.forward_tunnel_request(
+        Ok(LocalDelivery {
             request_id,
             method,
             path,
@@ -1703,27 +2194,27 @@ impl TunnelForwarder {
             headers,
             body,
             deadline_unix_ms,
-            write,
-            tunnel_topic,
-            tunnel_limits,
-        )
-        .await
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn forward_tunnel_request(
         &self,
-        request_id: String,
-        method: String,
-        path: String,
-        query_string: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-        deadline_unix_ms: u64,
-        write: &mut WsWrite,
-        tunnel_topic: &str,
+        delivery: LocalDelivery,
+        phase: Arc<AtomicU8>,
+        writer: PriorityWriter,
+        tunnel_topic: String,
         tunnel_limits: TunnelLimits,
+        response_budget: ResponseBufferBudget,
     ) -> Result<()> {
+        let LocalDelivery {
+            request_id,
+            method,
+            path,
+            query_string,
+            headers,
+            body,
+            deadline_unix_ms,
+        } = delivery;
         let start_time = tokio::time::Instant::now();
 
         info!(
@@ -1745,18 +2236,53 @@ impl TunnelForwarder {
             return self
                 .report_tunnel_failure(
                     &request_id,
-                    "deadline_exceeded".to_string(),
-                    write,
-                    tunnel_topic,
+                    DeliveryFailure::known(
+                        "deadline_exceeded_before_forward",
+                        "Delivery deadline elapsed before local forwarding",
+                    ),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
                 )
                 .await;
         }
 
         // One end-to-end deadline covers local connection and response streaming.
-        let client = tunnel_http_client(Duration::from_millis(remaining_ms))?;
+        let client = match tunnel_http_client(Duration::from_millis(remaining_ms)) {
+            Ok(client) => client,
+            Err(error) => {
+                return self
+                    .report_tunnel_failure(
+                        &request_id,
+                        DeliveryFailure::known(
+                            "local_client_error_before_forward",
+                            error.to_string(),
+                        ),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
 
-        let request_method = reqwest::Method::from_bytes(method.as_bytes())
-            .with_context(|| format!("Unsupported HTTP method: {method}"))?;
+        let request_method = match reqwest::Method::from_bytes(method.as_bytes()) {
+            Ok(method) => method,
+            Err(error) => {
+                return self
+                    .report_tunnel_failure(
+                        &request_id,
+                        DeliveryFailure::known(
+                            "invalid_method_before_forward",
+                            format!("Unsupported HTTP method {method}: {error}"),
+                        ),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
         let mut req_builder = client.request(request_method, &target);
 
         // Add headers. reqwest sets request framing headers from the body we actually send.
@@ -1774,6 +2300,10 @@ impl TunnelForwarder {
             req_builder = req_builder.body(body);
         }
 
+        // After this point the local server may have observed the request. Every
+        // failure must therefore report an unknown outcome.
+        phase.store(DELIVERY_STARTED, Ordering::Release);
+
         // Send request and handle response
         match req_builder.send().await {
             Ok(mut response) => {
@@ -1787,12 +2317,17 @@ impl TunnelForwarder {
                     );
 
                     return self
-                        .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                        .report_tunnel_failure(
+                            &request_id,
+                            DeliveryFailure::unknown("response_headers_too_large", error_msg),
+                            &writer,
+                            &tunnel_topic,
+                            &phase,
+                        )
                         .await;
                 }
 
                 let response_header_pairs = response_headers_to_pairs(response.headers());
-                let response_headers = response_headers_to_map(response.headers());
 
                 if response
                     .content_length()
@@ -1804,7 +2339,13 @@ impl TunnelForwarder {
                     );
 
                     return self
-                        .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                        .report_tunnel_failure(
+                            &request_id,
+                            DeliveryFailure::unknown("response_body_too_large", error_msg),
+                            &writer,
+                            &tunnel_topic,
+                            &phase,
+                        )
                         .await;
                 }
 
@@ -1814,6 +2355,7 @@ impl TunnelForwarder {
                     .unwrap_or(0)
                     .min(tunnel_limits.max_response_body_bytes);
                 let mut response_bytes = Vec::with_capacity(initial_capacity);
+                let mut response_permits = Vec::new();
 
                 loop {
                     match response.chunk().await {
@@ -1829,12 +2371,32 @@ impl TunnelForwarder {
                                 return self
                                     .report_tunnel_failure(
                                         &request_id,
-                                        error_msg,
-                                        write,
-                                        tunnel_topic,
+                                        DeliveryFailure::unknown(
+                                            "response_body_too_large",
+                                            error_msg,
+                                        ),
+                                        &writer,
+                                        &tunnel_topic,
+                                        &phase,
                                     )
                                     .await;
                             }
+
+                            let Some(permit) = response_budget.try_acquire(chunk.len()) else {
+                                return self
+                                    .report_tunnel_failure(
+                                        &request_id,
+                                        DeliveryFailure::unknown(
+                                            "relay_response_overloaded",
+                                            "Concurrent local responses exceed the relay buffer budget",
+                                        ),
+                                        &writer,
+                                        &tunnel_topic,
+                                        &phase,
+                                    )
+                                    .await;
+                            };
+                            response_permits.push(permit);
 
                             response_bytes.extend_from_slice(&chunk);
                         }
@@ -1843,7 +2405,13 @@ impl TunnelForwarder {
                             let error_msg = format!("Failed to read local response: {error}");
 
                             return self
-                                .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                                .report_tunnel_failure(
+                                    &request_id,
+                                    DeliveryFailure::unknown("response_read_failed", error_msg),
+                                    &writer,
+                                    &tunnel_topic,
+                                    &phase,
+                                )
                                 .await;
                         }
                     }
@@ -1862,32 +2430,41 @@ impl TunnelForwarder {
                     "Request forwarded successfully"
                 );
 
-                // Notify UI
-                let _ = self
-                    .event_tx
-                    .send(TunnelEvent::RequestForwarded {
-                        request_id: request_id.clone(),
-                        status,
-                        duration_ms,
-                        response_headers: response_headers.clone(),
-                        response_body: response_body_preview,
-                    })
-                    .await;
+                if let Err(error) = self
+                    .send_framed_tunnel_response(
+                        &writer,
+                        &tunnel_topic,
+                        &request_id,
+                        deadline_unix_ms,
+                        serde_json::json!({
+                            "request_id": request_id.clone(),
+                            "status": status,
+                            "headers": response_header_pairs,
+                            "body": response_body,
+                            "body_encoding": body_encoding,
+                        }),
+                    )
+                    .await
+                {
+                    return self
+                        .report_tunnel_failure(
+                            &request_id,
+                            DeliveryFailure::unknown("response_delivery_failed", error.to_string()),
+                            &writer,
+                            &tunnel_topic,
+                            &phase,
+                        )
+                        .await;
+                }
 
-                self.send_framed_tunnel_response(
-                    write,
-                    tunnel_topic,
-                    &request_id,
-                    deadline_unix_ms,
-                    serde_json::json!({
-                        "request_id": request_id,
-                        "status": status,
-                        "headers": response_header_pairs,
-                        "body": response_body,
-                        "body_encoding": body_encoding,
-                    }),
-                )
-                .await?;
+                phase.store(DELIVERY_TERMINAL, Ordering::Release);
+                self.emit_presentation(TunnelEvent::RequestForwarded {
+                    request_id,
+                    status,
+                    duration_ms,
+                    response_headers: bounded_presentation_headers(response_header_pairs),
+                    response_body: response_body_preview,
+                });
             }
             Err(e) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1900,18 +2477,15 @@ impl TunnelForwarder {
                     "Request forwarding failed"
                 );
 
-                // Notify UI
-                let _ = self
-                    .event_tx
-                    .send(TunnelEvent::RequestFailed {
-                        request_id: request_id.clone(),
-                        error: error_msg.clone(),
-                    })
+                return self
+                    .report_tunnel_failure(
+                        &request_id,
+                        DeliveryFailure::unknown("local_forward_failed", error_msg),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
                     .await;
-
-                // Send tunnel_error back to server
-                self.send_tunnel_error(&request_id, &error_msg, write, tunnel_topic)
-                    .await?;
             }
         }
 
@@ -1920,7 +2494,7 @@ impl TunnelForwarder {
 
     async fn send_framed_tunnel_response(
         &self,
-        write: &mut WsWrite,
+        writer: &PriorityWriter,
         tunnel_topic: &str,
         request_id: &str,
         deadline_unix_ms: u64,
@@ -1929,71 +2503,48 @@ impl TunnelForwarder {
         let mut stream =
             OutboundTunnelStream::new(request_id, "response", deadline_unix_ms, &payload)?;
 
-        send_channel_message(write, stream.start_message(tunnel_topic)).await?;
+        writer.response(stream.start_message(tunnel_topic)).await?;
 
         while let Some(frame) = stream.next_frame(tunnel_topic)? {
             if unix_time_ms() >= deadline_unix_ms {
                 return Err(anyhow!("deadline_exceeded"));
             }
 
-            // SinkExt::send waits for sink readiness, keeping the transport queue
-            // to one frame even when the service consumes slowly.
-            send_channel_message(write, frame).await?;
+            writer.response(frame).await?;
         }
 
-        Ok(())
-    }
-
-    async fn send_tunnel_error(
-        &self,
-        request_id: &str,
-        error: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
-        tunnel_topic: &str,
-    ) -> Result<()> {
-        let error_message = ChannelMessage {
-            topic: tunnel_topic.to_string(),
-            event: "tunnel_error".to_string(),
-            payload: serde_json::json!({
-                "request_id": request_id,
-                "error": error,
-            }),
-            reference: None,
-        };
-
-        let error_json = serde_json::to_string(&error_message)?;
-        write.send(Message::Text(error_json.into())).await?;
         Ok(())
     }
 
     async fn report_tunnel_failure(
         &self,
         request_id: &str,
-        error: String,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        failure: DeliveryFailure,
+        writer: &PriorityWriter,
         tunnel_topic: &str,
+        phase: &AtomicU8,
     ) -> Result<()> {
-        error!(request_id = %request_id, error = %error, "Tunnel request failed");
+        let DeliveryFailure {
+            code,
+            outcome,
+            error,
+        } = failure;
+        phase.store(DELIVERY_TERMINAL, Ordering::Release);
+        error!(request_id = %request_id, code, outcome, error = %error, "Tunnel request failed");
 
-        let _ = self
-            .event_tx
-            .send(TunnelEvent::RequestFailed {
-                request_id: request_id.to_string(),
-                error: error.clone(),
-            })
-            .await;
+        self.emit_presentation(TunnelEvent::RequestFailed {
+            request_id: request_id.to_string(),
+            error: error.clone(),
+        });
 
-        self.send_tunnel_error(request_id, &error, write, tunnel_topic)
+        writer
+            .control(delivery_error_message(
+                tunnel_topic,
+                request_id,
+                code,
+                outcome,
+                &error,
+            ))
             .await
     }
 
@@ -2327,6 +2878,322 @@ mod tests {
         assert!(preview.len() <= UI_BODY_PREVIEW_BYTES + 64);
         assert!(preview.contains("truncated"));
         assert!(preview.contains(&(UI_BODY_PREVIEW_BYTES * 2).to_string()));
+    }
+
+    #[test]
+    fn test_local_work_budget_bounds_concurrent_ten_megabyte_deliveries() {
+        let budget = LocalWorkBudget::new();
+        let ten_mib = 10 * 1024 * 1024;
+        let mut permits = Vec::new();
+
+        for _ in 0..6 {
+            permits.push(budget.try_acquire(ten_mib).unwrap());
+        }
+
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 6);
+        assert_eq!(budget.available_bytes(), 4 * 1024 * 1024);
+        assert!(budget.try_acquire(ten_mib).is_none());
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 6);
+
+        permits.pop();
+        assert!(budget.try_acquire(ten_mib).is_some());
+    }
+
+    #[test]
+    fn test_local_work_budget_enforces_count_independently_of_bytes() {
+        let budget = LocalWorkBudget::new();
+        let permits = (0..LOCAL_WORK_MAX_COUNT)
+            .map(|_| budget.try_acquire(1).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(budget.available_count(), 0);
+        assert!(budget.try_acquire(1).is_none());
+        assert!(budget.available_bytes() > LOCAL_WORK_MAX_BYTES - 1024);
+
+        drop(permits);
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT);
+    }
+
+    #[test]
+    fn test_response_buffer_budget_bounds_concurrent_ten_megabyte_responses() {
+        let budget = ResponseBufferBudget::new();
+        let ten_mib = 10 * 1024 * 1024;
+        let permits = (0..6)
+            .map(|_| budget.try_acquire(ten_mib).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(budget.available_bytes(), 4 * 1024 * 1024);
+        assert!(budget.try_acquire(ten_mib).is_none());
+
+        drop(permits);
+        assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_cancellation_classifies_execution_boundary() {
+        assert_eq!(
+            cancellation_classification(DELIVERY_QUEUED),
+            Some(("cancelled_before_forward", "known_not_executed"))
+        );
+        assert_eq!(
+            cancellation_classification(DELIVERY_STARTED),
+            Some(("cancelled_after_forward_started", "outcome_unknown"))
+        );
+        assert_eq!(cancellation_classification(DELIVERY_TERMINAL), None);
+    }
+
+    #[test]
+    fn test_saturated_presentation_emits_stream_gap_after_recovery() {
+        let (_token_tx, token_rx) = watch::channel("token".to_string());
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let forwarder = TunnelForwarder::new(
+            token_rx,
+            "127.0.0.1".to_string(),
+            3000,
+            None,
+            None,
+            event_tx,
+        );
+
+        forwarder.emit_presentation(TunnelEvent::Connecting);
+        forwarder.emit_presentation(TunnelEvent::Connected);
+        forwarder.emit_presentation(TunnelEvent::Disconnected);
+
+        assert!(matches!(event_rx.try_recv(), Ok(TunnelEvent::Connecting)));
+        assert!(matches!(event_rx.try_recv(), Ok(TunnelEvent::Connected)));
+
+        forwarder.emit_presentation(TunnelEvent::Disconnected);
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TunnelEvent::StreamGap { dropped_events: 1 })
+        ));
+        assert!(matches!(event_rx.try_recv(), Ok(TunnelEvent::Disconnected)));
+    }
+
+    #[test]
+    fn test_closed_presentation_consumer_does_not_block_delivery_path() {
+        let (_token_tx, token_rx) = watch::channel("token".to_string());
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
+        let forwarder = TunnelForwarder::new(
+            token_rx,
+            "127.0.0.1".to_string(),
+            3000,
+            None,
+            None,
+            event_tx,
+        );
+
+        forwarder.emit_presentation(TunnelEvent::Disconnected);
+
+        assert_eq!(forwarder.presentation_drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_delivery_releases_local_work_capacity() {
+        let budget = LocalWorkBudget::new();
+        let permit = budget.try_acquire(10 * 1024 * 1024).unwrap();
+        let mut workers = JoinSet::new();
+        let abort = workers.spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+
+        abort.abort();
+        assert!(
+            workers
+                .join_next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT);
+        assert_eq!(budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_priority_writer_sends_control_before_queued_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut events = Vec::new();
+            for _ in 0..2 {
+                let message = websocket.next().await.unwrap().unwrap();
+                let Message::Text(text) = message else {
+                    panic!("expected a text channel message");
+                };
+                let message: ChannelMessage = serde_json::from_str(&text).unwrap();
+                events.push(message.event);
+            }
+            events
+        });
+
+        let (websocket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let (write, _) = websocket.split();
+        let (control_tx, control_rx) = mpsc::channel(OUTBOUND_CONTROL_MAX_COUNT);
+        let (response_tx, response_rx) = mpsc::channel(OUTBOUND_RESPONSE_MAX_COUNT);
+        let writer = PriorityWriter {
+            control_tx,
+            response_tx,
+            bytes: Arc::new(Semaphore::new(OUTBOUND_MAX_BYTES)),
+        };
+
+        writer
+            .response(ChannelMessage {
+                topic: "cli:tunnel:test".to_string(),
+                event: "response".to_string(),
+                payload: serde_json::json!({}),
+                reference: None,
+            })
+            .await
+            .unwrap();
+        writer
+            .control(ChannelMessage {
+                topic: "cli:tunnel:test".to_string(),
+                event: "control".to_string(),
+                payload: serde_json::json!({}),
+                reference: None,
+            })
+            .await
+            .unwrap();
+        assert!(writer.available_bytes() < OUTBOUND_MAX_BYTES);
+
+        let writer_task = tokio::spawn(run_priority_writer(write, control_rx, response_rx));
+        let events = server.await.unwrap();
+        assert_eq!(events, vec!["control", "response"]);
+
+        drop(writer);
+        writer_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_slow_local_handler_does_not_delay_fast_delivery() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_address = local_listener.local_addr().unwrap();
+        let (slow_started_tx, slow_started_rx) = oneshot::channel();
+        let local_server = tokio::spawn(async move {
+            let mut slow_started_tx = Some(slow_started_tx);
+            let mut handlers = JoinSet::new();
+            for _ in 0..2 {
+                let (mut socket, _) = local_listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let read = socket.read(&mut request).await.unwrap();
+                let slow = String::from_utf8_lossy(&request[..read]).contains("GET /slow ");
+                if slow && let Some(sender) = slow_started_tx.take() {
+                    let _ = sender.send(());
+                }
+                handlers.spawn(async move {
+                    if slow {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await
+                        .unwrap();
+                });
+            }
+            while handlers.join_next().await.is_some() {}
+        });
+
+        let websocket_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_address = websocket_listener.local_addr().unwrap();
+        let websocket_server = tokio::spawn(async move {
+            let (socket, _) = websocket_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while websocket.next().await.is_some() {}
+        });
+        let (websocket, _) = connect_async(format!("ws://{websocket_address}"))
+            .await
+            .unwrap();
+        let (write, read) = websocket.split();
+        let (writer, writer_task) = PriorityWriter::spawn(write);
+
+        let (_token_tx, token_rx) = watch::channel("token".to_string());
+        let (event_tx, mut event_rx) = mpsc::channel(PRESENTATION_QUEUE_CAPACITY);
+        let forwarder = TunnelForwarder::new(
+            token_rx,
+            "127.0.0.1".to_string(),
+            local_address.port(),
+            None,
+            None,
+            event_tx,
+        );
+        let limits = TunnelLimits {
+            max_request_body_bytes: 1024,
+            max_response_body_bytes: 1024,
+            max_response_header_bytes: 1024,
+        };
+        let response_budget = ResponseBufferBudget::new();
+        let delivery = |request_id: &str, path: &str| LocalDelivery {
+            request_id: request_id.to_string(),
+            method: "GET".to_string(),
+            path: path.to_string(),
+            query_string: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            deadline_unix_ms: unix_time_ms() + 2_000,
+        };
+
+        let slow = tokio::spawn({
+            let forwarder = forwarder.clone();
+            let writer = writer.clone();
+            let response_budget = response_budget.clone();
+            async move {
+                forwarder
+                    .forward_tunnel_request(
+                        delivery("slow", "/slow"),
+                        Arc::new(AtomicU8::new(DELIVERY_QUEUED)),
+                        writer,
+                        "cli:tunnel:test".to_string(),
+                        limits,
+                        response_budget,
+                    )
+                    .await
+            }
+        });
+        slow_started_rx.await.unwrap();
+
+        let fast = tokio::spawn({
+            let forwarder = forwarder.clone();
+            let writer = writer.clone();
+            let response_budget = response_budget.clone();
+            async move {
+                forwarder
+                    .forward_tunnel_request(
+                        delivery("fast", "/fast"),
+                        Arc::new(AtomicU8::new(DELIVERY_QUEUED)),
+                        writer,
+                        "cli:tunnel:test".to_string(),
+                        limits,
+                        response_budget,
+                    )
+                    .await
+            }
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first,
+            TunnelEvent::RequestForwarded { request_id, .. } if request_id == "fast"
+        ));
+
+        fast.await.unwrap().unwrap();
+        slow.await.unwrap().unwrap();
+        local_server.await.unwrap();
+        drop(writer);
+        drop(read);
+        writer_task.await.unwrap().unwrap();
+        websocket_server.abort();
     }
 
     // TunnelWebhookRequest tests

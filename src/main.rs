@@ -1231,6 +1231,16 @@ fn tunnel_event_receipt(
                 serde_json::json!(["Check that the local target is running and reachable."]);
             receipt
         }
+        TunnelEvent::StreamGap { dropped_events } => {
+            let mut receipt = tunnel_event_base("stream_gap", "recoverable");
+            receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
+            receipt["dropped_events"] = serde_json::json!(dropped_events);
+            receipt["delivery_affected"] = serde_json::json!(false);
+            receipt["next_actions"] = serde_json::json!([
+                "Treat the request presentation stream as incomplete; relay responses remain active."
+            ]);
+            receipt
+        }
         TunnelEvent::ConnectionError(error) => {
             let mut receipt = tunnel_event_base("connection_error", "error");
             receipt["resource_uri"] = serde_json::json!(tunnel_session_resource_uri(host, port));
@@ -1568,7 +1578,7 @@ async fn run_listen_json(
         endpoint.as_ref(),
     ))?;
 
-    let (event_tx, event_rx) = mpsc::channel(100);
+    let (event_tx, event_rx) = mpsc::channel(tunnel::PRESENTATION_QUEUE_CAPACITY);
     let tunnel_client = tunnel::TunnelClient::new(
         access_token_rx,
         endpoint_slug.clone(),
@@ -1648,7 +1658,7 @@ async fn run_tunnel_json(
         slug.as_deref(),
     ))?;
 
-    let (event_tx, event_rx) = mpsc::channel(100);
+    let (event_tx, event_rx) = mpsc::channel(tunnel::PRESENTATION_QUEUE_CAPACITY);
     tokio::spawn(run_tunnel_forwarder_connection(
         access_token_rx,
         host.clone(),
@@ -1775,7 +1785,7 @@ async fn run(cli: Cli) -> Result<()> {
                 app.listening_target = target.clone();
 
                 // Create channel for tunnel events
-                let (event_tx, event_rx) = mpsc::channel(100);
+                let (event_tx, event_rx) = mpsc::channel(tunnel::PRESENTATION_QUEUE_CAPACITY);
 
                 // Create and spawn tunnel client
                 let tunnel_client = tunnel::TunnelClient::new(
@@ -2862,7 +2872,7 @@ async fn run(cli: Cli) -> Result<()> {
                 app.tunnel_requested_slug = slug.clone();
 
                 // Create channel for tunnel events
-                let (event_tx, event_rx) = mpsc::channel(100);
+                let (event_tx, event_rx) = mpsc::channel(tunnel::PRESENTATION_QUEUE_CAPACITY);
 
                 // Create and spawn tunnel forwarder manager
                 let reconnect_tx = spawn_tunnel_forwarder_manager(
@@ -4285,6 +4295,14 @@ where
                     }
                     app.tunnel_stats.failed += 1;
                 }
+                TunnelEvent::StreamGap { dropped_events } => {
+                    app.set_tunnel_feedback(
+                        FeedbackKind::Warning,
+                        format!(
+                            "Presentation skipped {dropped_events} event(s); relay delivery is unaffected"
+                        ),
+                    );
+                }
                 TunnelEvent::ReplayCompleted {
                     request_id,
                     status,
@@ -5336,6 +5354,17 @@ mod tests {
         );
         assert_eq!(receipt["body_size"], 11);
         assert_eq!(receipt["headers"]["content-type"], "application/json");
+    }
+
+    #[test]
+    fn tunnel_stream_gap_is_recoverable_and_does_not_affect_delivery() {
+        let event = TunnelEvent::StreamGap { dropped_events: 7 };
+        let receipt = tunnel_event_receipt(&event, "127.0.0.1", 8080, None, None);
+
+        assert_eq!(receipt["event"], "stream_gap");
+        assert_eq!(receipt["status"], "recoverable");
+        assert_eq!(receipt["dropped_events"], 7);
+        assert_eq!(receipt["delivery_affected"], false);
     }
 
     #[test]

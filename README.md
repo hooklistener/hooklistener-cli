@@ -131,6 +131,10 @@ hooklistener --json listen <endpoint-slug>
 hooklistener --json tunnel --port 3000
 ```
 
+Tunnel delivery is independent from terminal rendering. If a slow or stalled consumer fills the presentation queue, the CLI continues reading requests and returning local responses, then emits a recoverable `stream_gap` event with the number of presentation events omitted. Treat the displayed request history as incomplete after a gap; delivery itself is unaffected.
+
+The relay runtime admits at most 8 local requests and 64 MiB of retained request bodies at once. Inbound streams, buffered local responses, and the serialized WebSocket writer have separate count and byte ceilings. Requests rejected before the local connection begins report `known_not_executed`; cancellations or failures after forwarding begins report `outcome_unknown`.
+
 Runtime errors use a consistent envelope:
 
 ```json
