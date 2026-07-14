@@ -67,6 +67,11 @@ The result includes the endpoint URL, endpoint ID, and viewer token needed to in
 
 Reserved static tunnel slugs depend on your Hooklistener plan.
 
+Tunnel requests are forwarded concurrently, so a slow local response does not block later
+requests. If the WebSocket disconnects, in-flight work is cancelled and never replayed; static
+tunnels reacquire their slug on reconnect, while requests already dispatched to localhost are
+reported by the service as having an unknown outcome.
+
 ## Work with captured requests
 
 Select an organization once for account-backed commands:

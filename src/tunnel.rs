@@ -309,7 +309,13 @@ pub fn is_fatal_error(error_msg: &str) -> bool {
         || lower.contains("403")
         || lower.contains("endpoint not found")
         || lower.contains("channel join failed")
-        || lower.contains("tunnel join failed")
+        || lower.contains("static tunnel slug not found")
+        || lower.contains("belongs to another organization")
+        || lower.contains("not a member of the specified organization")
+        || lower.contains("user has no organizations")
+        || lower.contains("tunnel limit reached")
+        || lower.contains("tunnel route has expired")
+        || lower.contains("tunnel route has been revoked")
 }
 
 /// Calculate backoff duration with exponential backoff and jitter
@@ -878,6 +884,7 @@ impl TunnelClient {
 }
 
 /// HTTP Tunnel forwarder - connects to /tunnel endpoint and forwards HTTP requests
+#[derive(Clone)]
 pub struct TunnelForwarder {
     access_token_rx: watch::Receiver<String>,
     local_host: String,
@@ -1073,6 +1080,18 @@ impl TunnelForwarder {
             }
         }
 
+        // Keep WebSocket ownership in one task. Forwarded HTTP requests only enqueue
+        // their responses, which lets slow requests complete independently.
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(128);
+        let mut writer_task = tokio::spawn(async move {
+            while let Some(message) = outbound_rx.recv().await {
+                write.send(message).await?;
+            }
+
+            write.close().await
+        });
+        let mut in_flight = tokio::task::JoinSet::new();
+
         // Track last ping time
         let mut last_ping = tokio::time::Instant::now();
         let ping_interval = Duration::from_secs(30);
@@ -1080,6 +1099,23 @@ impl TunnelForwarder {
 
         // Listen for tunnel_request events
         loop {
+            while let Some(result) = in_flight.try_join_next() {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => error!(%error, "Tunnel request task failed"),
+                    Err(error) => error!(%error, "Tunnel request task stopped unexpectedly"),
+                }
+            }
+
+            if writer_task.is_finished() {
+                match (&mut writer_task).await {
+                    Ok(Ok(())) => warn!("Tunnel WebSocket writer stopped"),
+                    Ok(Err(error)) => error!(%error, "Tunnel WebSocket writer failed"),
+                    Err(error) => error!(%error, "Tunnel WebSocket writer task failed"),
+                }
+                break;
+            }
+
             // Check if we need to send a ping
             if last_ping.elapsed() >= ping_interval {
                 let ping_msg = ChannelMessage {
@@ -1091,7 +1127,7 @@ impl TunnelForwarder {
                 ping_counter += 1;
 
                 if let Ok(json) = serde_json::to_string(&ping_msg)
-                    && let Err(e) = write.send(Message::Text(json.into())).await
+                    && let Err(e) = outbound_tx.send(Message::Text(json.into())).await
                 {
                     error!("Failed to send ping: {}", e);
                     break;
@@ -1104,7 +1140,13 @@ impl TunnelForwarder {
                 Ok(Some(msg)) => match msg {
                     Ok(Message::Text(text)) => {
                         if let Err(e) = self
-                            .handle_tunnel_message(&text, &mut write, &tunnel_topic, tunnel_limits)
+                            .handle_tunnel_message(
+                                &text,
+                                &outbound_tx,
+                                &tunnel_topic,
+                                tunnel_limits,
+                                &mut in_flight,
+                            )
                             .await
                         {
                             error!("Error handling tunnel message: {}", e);
@@ -1117,7 +1159,7 @@ impl TunnelForwarder {
                     }
                     Ok(Message::Ping(data)) => {
                         debug!("Received ping, sending pong");
-                        if let Err(e) = write.send(Message::Pong(data)).await {
+                        if let Err(e) = outbound_tx.send(Message::Pong(data)).await {
                             error!("Failed to send pong: {}", e);
                             break;
                         }
@@ -1147,20 +1189,26 @@ impl TunnelForwarder {
             }
         }
 
+        // A replacement connection gets a new fenced session. Do not allow work
+        // from this connection to emit stale completions after reconnecting.
+        in_flight.abort_all();
+        while in_flight.join_next().await.is_some() {}
+        drop(outbound_tx);
+
+        if !writer_task.is_finished() {
+            let _ = writer_task.await;
+        }
+
         Ok(())
     }
 
     async fn handle_tunnel_message(
         &self,
         text: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        outbound_tx: &mpsc::Sender<Message>,
         tunnel_topic: &str,
         tunnel_limits: TunnelLimits,
+        in_flight: &mut tokio::task::JoinSet<Result<()>>,
     ) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
 
@@ -1225,7 +1273,7 @@ impl TunnelForwarder {
                                 body.len(),
                                 tunnel_limits.max_request_body_bytes
                             ),
-                            write,
+                            outbound_tx,
                             tunnel_topic,
                         )
                         .await?;
@@ -1255,19 +1303,27 @@ impl TunnelForwarder {
                         })
                         .await;
 
-                    // Forward the request
-                    self.forward_tunnel_request(
-                        request_id,
-                        method,
-                        path,
-                        query_string,
-                        headers,
-                        body,
-                        write,
-                        tunnel_topic,
-                        tunnel_limits,
-                    )
-                    .await?;
+                    // A local request owns no WebSocket state, so it can run in
+                    // parallel with every other request on this tunnel.
+                    let forwarder = self.clone();
+                    let outbound_tx = outbound_tx.clone();
+                    let tunnel_topic = tunnel_topic.to_string();
+
+                    in_flight.spawn(async move {
+                        forwarder
+                            .forward_tunnel_request(
+                                request_id,
+                                method,
+                                path,
+                                query_string,
+                                headers,
+                                body,
+                                &outbound_tx,
+                                &tunnel_topic,
+                                tunnel_limits,
+                            )
+                            .await
+                    });
                 }
             }
             "phx_reply" => {
@@ -1298,12 +1354,7 @@ impl TunnelForwarder {
         query_string: String,
         headers: serde_json::Map<String, serde_json::Value>,
         body: Vec<u8>,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        outbound_tx: &mpsc::Sender<Message>,
         tunnel_topic: &str,
         tunnel_limits: TunnelLimits,
     ) -> Result<()> {
@@ -1344,7 +1395,7 @@ impl TunnelForwarder {
                     .send_tunnel_error(
                         &request_id,
                         &format!("Unsupported method: {}", method),
-                        write,
+                        outbound_tx,
                         tunnel_topic,
                     )
                     .await;
@@ -1382,7 +1433,7 @@ impl TunnelForwarder {
                     );
 
                     return self
-                        .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                        .report_tunnel_failure(&request_id, error_msg, outbound_tx, tunnel_topic)
                         .await;
                 }
 
@@ -1406,7 +1457,7 @@ impl TunnelForwarder {
                     );
 
                     return self
-                        .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                        .report_tunnel_failure(&request_id, error_msg, outbound_tx, tunnel_topic)
                         .await;
                 }
 
@@ -1432,7 +1483,7 @@ impl TunnelForwarder {
                                     .report_tunnel_failure(
                                         &request_id,
                                         error_msg,
-                                        write,
+                                        outbound_tx,
                                         tunnel_topic,
                                     )
                                     .await;
@@ -1445,7 +1496,12 @@ impl TunnelForwarder {
                             let error_msg = format!("Failed to read local response: {error}");
 
                             return self
-                                .report_tunnel_failure(&request_id, error_msg, write, tunnel_topic)
+                                .report_tunnel_failure(
+                                    &request_id,
+                                    error_msg,
+                                    outbound_tx,
+                                    tunnel_topic,
+                                )
                                 .await;
                         }
                     }
@@ -1491,7 +1547,10 @@ impl TunnelForwarder {
                 };
 
                 let response_json = serde_json::to_string(&response_message)?;
-                write.send(Message::Text(response_json.into())).await?;
+                outbound_tx
+                    .send(Message::Text(response_json.into()))
+                    .await
+                    .context("Tunnel connection closed before response was sent")?;
             }
             Err(e) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1514,7 +1573,7 @@ impl TunnelForwarder {
                     .await;
 
                 // Send tunnel_error back to server
-                self.send_tunnel_error(&request_id, &error_msg, write, tunnel_topic)
+                self.send_tunnel_error(&request_id, &error_msg, outbound_tx, tunnel_topic)
                     .await?;
             }
         }
@@ -1526,12 +1585,7 @@ impl TunnelForwarder {
         &self,
         request_id: &str,
         error: &str,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        outbound_tx: &mpsc::Sender<Message>,
         tunnel_topic: &str,
     ) -> Result<()> {
         let error_message = ChannelMessage {
@@ -1545,7 +1599,10 @@ impl TunnelForwarder {
         };
 
         let error_json = serde_json::to_string(&error_message)?;
-        write.send(Message::Text(error_json.into())).await?;
+        outbound_tx
+            .send(Message::Text(error_json.into()))
+            .await
+            .context("Tunnel connection closed before error was sent")?;
         Ok(())
     }
 
@@ -1553,12 +1610,7 @@ impl TunnelForwarder {
         &self,
         request_id: &str,
         error: String,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        outbound_tx: &mpsc::Sender<Message>,
         tunnel_topic: &str,
     ) -> Result<()> {
         error!(request_id = %request_id, error = %error, "Tunnel request failed");
@@ -1571,7 +1623,7 @@ impl TunnelForwarder {
             })
             .await;
 
-        self.send_tunnel_error(request_id, &error, write, tunnel_topic)
+        self.send_tunnel_error(request_id, &error, outbound_tx, tunnel_topic)
             .await
     }
 
@@ -1851,6 +1903,23 @@ mod tests {
     #[test]
     fn test_is_fatal_error_join_failed() {
         assert!(is_fatal_error("Channel join failed: unknown"));
+    }
+
+    #[test]
+    fn test_static_tunnel_lease_contention_is_retryable() {
+        assert!(!is_fatal_error(
+            "Tunnel join failed: This static tunnel is already in use by another connection"
+        ));
+    }
+
+    #[test]
+    fn test_static_tunnel_configuration_errors_are_fatal() {
+        assert!(is_fatal_error(
+            "Tunnel join failed: Static tunnel slug not found. Create it first."
+        ));
+        assert!(is_fatal_error(
+            "Tunnel join failed: This slug belongs to another organization"
+        ));
     }
 
     #[test]
