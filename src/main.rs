@@ -6321,6 +6321,7 @@ mod tests {
     fn tunnel_request_event_includes_local_target_and_request_resource() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("authorization".to_string(), "Bearer secret".to_string());
         let event = TunnelEvent::RequestReceived {
             request_id: "req_123".to_string(),
             method: "POST".to_string(),
@@ -6340,6 +6341,8 @@ mod tests {
         );
         assert_eq!(receipt["body_size"], 11);
         assert_eq!(receipt["headers"]["content-type"], "application/json");
+        assert_eq!(receipt["headers"]["authorization"], "[REDACTED]");
+        assert!(!receipt.to_string().contains("Bearer secret"));
     }
 
     #[test]
