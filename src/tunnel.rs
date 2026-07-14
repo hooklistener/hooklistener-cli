@@ -18,6 +18,9 @@ type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 // A 256 MiB body expands to about 342 MiB as unpadded base64. The remaining
 // space covers the Phoenix envelope and the advertised response-header limit.
 const TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 402_653_184;
+const TUNNEL_PROTOCOL_VERSION: u64 = 2;
+const TUNNEL_MAX_FRAME_BYTES: usize = 65_536;
+const TUNNEL_MAX_RAW_CHUNK_BYTES: usize = 47_000;
 const LEGACY_MAX_REQUEST_BODY_BYTES: usize = 10_485_760;
 const LEGACY_MAX_RESPONSE_BODY_BYTES: usize = 7_000_000;
 const LEGACY_MAX_RESPONSE_HEADER_BYTES: usize = 1_048_576;
@@ -52,8 +55,8 @@ fn json_limit(limits: Option<&serde_json::Value>, key: &str) -> Option<usize> {
 
 fn tunnel_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
-        .max_message_size(Some(TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES))
-        .max_frame_size(Some(TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES))
+        .max_message_size(Some(TUNNEL_MAX_FRAME_BYTES))
+        .max_frame_size(Some(TUNNEL_MAX_FRAME_BYTES))
 }
 
 /// Extract the string representation of a JSON value.
@@ -95,6 +98,20 @@ fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<Stri
         .collect()
 }
 
+fn response_headers_to_pairs(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .keys()
+        .flat_map(|name| {
+            headers.get_all(name).iter().map(move |value| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("").to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
 fn encode_response_body(bytes: &[u8]) -> (String, &'static str) {
     if bytes.len() <= MAX_RAW_BODY_BYTES
         && let Ok(text) = std::str::from_utf8(bytes)
@@ -109,6 +126,14 @@ fn response_header_bytes(headers: &reqwest::header::HeaderMap) -> usize {
     headers.iter().fold(0usize, |total, (name, value)| {
         total.saturating_add(name.as_str().len() + value.as_bytes().len() + 4)
     })
+}
+
+fn tunnel_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("Failed to build local tunnel HTTP client")
 }
 
 fn body_preview(bytes: &[u8]) -> Option<String> {
@@ -147,6 +172,302 @@ struct ChannelMessage {
 const DIRECT_RESPONSE_MODE: &str = "direct_response";
 const CAPTURE_FORWARD_MODE: &str = "capture_forward";
 
+struct TunnelStreamAssembler {
+    stream_id: String,
+    direction: String,
+    deadline_unix_ms: u64,
+    total_bytes: usize,
+    frame_count: usize,
+    next_sequence: usize,
+    data: Vec<u8>,
+}
+
+impl TunnelStreamAssembler {
+    fn from_start(payload: &serde_json::Value, expected_direction: &str) -> Result<Self> {
+        let version = payload
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("Framed stream is missing a protocol version"))?;
+        if version != TUNNEL_PROTOCOL_VERSION {
+            return Err(anyhow!("Unsupported tunnel framing version: {version}"));
+        }
+
+        let direction = payload
+            .get("direction")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("Framed stream is missing a direction"))?;
+        if direction != expected_direction {
+            return Err(anyhow!("Unexpected tunnel stream direction: {direction}"));
+        }
+
+        let stream_id = payload
+            .get("stream_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|stream_id| !stream_id.is_empty())
+            .ok_or_else(|| anyhow!("Framed stream is missing an id"))?
+            .to_string();
+        let total_bytes = json_usize(payload, "total_bytes")?;
+        if total_bytes > TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES {
+            return Err(anyhow!("Tunnel stream exceeds the advertised limit"));
+        }
+
+        let frame_count = json_usize(payload, "frame_count")?;
+        let expected_frame_count = total_bytes.div_ceil(TUNNEL_MAX_RAW_CHUNK_BYTES).max(1);
+        if frame_count != expected_frame_count {
+            return Err(anyhow!("Tunnel stream has an invalid frame count"));
+        }
+
+        let deadline_unix_ms = payload
+            .get("deadline_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("Framed stream is missing its deadline"))?;
+        if deadline_unix_ms <= unix_time_ms() {
+            return Err(anyhow!("Tunnel stream deadline has expired"));
+        }
+
+        Ok(Self {
+            stream_id,
+            direction: direction.to_string(),
+            deadline_unix_ms,
+            total_bytes,
+            frame_count,
+            next_sequence: 0,
+            data: Vec::new(),
+        })
+    }
+
+    fn append(&mut self, payload: &serde_json::Value) -> Result<Option<serde_json::Value>> {
+        if payload.get("version").and_then(serde_json::Value::as_u64)
+            != Some(TUNNEL_PROTOCOL_VERSION)
+            || payload.get("stream_id").and_then(serde_json::Value::as_str)
+                != Some(self.stream_id.as_str())
+            || payload.get("direction").and_then(serde_json::Value::as_str)
+                != Some(self.direction.as_str())
+        {
+            return Err(anyhow!("Tunnel frame does not match its stream"));
+        }
+
+        let sequence = json_usize(payload, "sequence")?;
+        if sequence != self.next_sequence {
+            return Err(anyhow!(
+                "Out-of-order tunnel frame: expected {}, got {sequence}",
+                self.next_sequence
+            ));
+        }
+
+        let encoded = payload
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("Tunnel frame is missing data"))?;
+        let chunk = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .context("Tunnel frame contains invalid base64url data")?;
+        if chunk.len() > TUNNEL_MAX_RAW_CHUNK_BYTES
+            || self.data.len().saturating_add(chunk.len()) > self.total_bytes
+        {
+            return Err(anyhow!("Tunnel frame exceeds the 64 KiB framing contract"));
+        }
+
+        self.data.extend_from_slice(&chunk);
+        self.next_sequence += 1;
+        let final_frame = payload
+            .get("final")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| anyhow!("Tunnel frame is missing its final marker"))?;
+
+        if final_frame {
+            if self.data.len() != self.total_bytes || self.next_sequence != self.frame_count {
+                return Err(anyhow!("Tunnel stream ended before all bytes arrived"));
+            }
+
+            return Ok(Some(
+                serde_json::from_slice(&self.data)
+                    .context("Tunnel stream contains invalid JSON")?,
+            ));
+        }
+
+        if self.data.len() == self.total_bytes {
+            return Err(anyhow!("Tunnel stream omitted its final marker"));
+        }
+
+        Ok(None)
+    }
+}
+
+struct OutboundTunnelStream {
+    stream_id: String,
+    direction: &'static str,
+    deadline_unix_ms: u64,
+    encoded: Vec<u8>,
+    offset: usize,
+    sequence: usize,
+    frame_count: usize,
+}
+
+impl OutboundTunnelStream {
+    fn new(
+        stream_id: &str,
+        direction: &'static str,
+        deadline_unix_ms: u64,
+        payload: &serde_json::Value,
+    ) -> Result<Self> {
+        let encoded = serde_json::to_vec(payload)?;
+        if encoded.len() > TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES {
+            return Err(anyhow!("Tunnel stream exceeds the advertised limit"));
+        }
+
+        let frame_count = encoded.len().div_ceil(TUNNEL_MAX_RAW_CHUNK_BYTES).max(1);
+        Ok(Self {
+            stream_id: stream_id.to_string(),
+            direction,
+            deadline_unix_ms,
+            encoded,
+            offset: 0,
+            sequence: 0,
+            frame_count,
+        })
+    }
+
+    fn start_message(&self, topic: &str) -> ChannelMessage {
+        ChannelMessage {
+            topic: topic.to_string(),
+            event: "tunnel_stream_start".to_string(),
+            payload: serde_json::json!({
+                "version": TUNNEL_PROTOCOL_VERSION,
+                "stream_id": self.stream_id,
+                "direction": self.direction,
+                "deadline_unix_ms": self.deadline_unix_ms,
+                "total_bytes": self.encoded.len(),
+                "frame_count": self.frame_count,
+                "frame_encoding": "base64url",
+            }),
+            reference: None,
+        }
+    }
+
+    fn next_frame(&mut self, topic: &str) -> Result<Option<ChannelMessage>> {
+        if self.offset == self.encoded.len() && self.sequence > 0 {
+            return Ok(None);
+        }
+
+        let end = self
+            .offset
+            .saturating_add(TUNNEL_MAX_RAW_CHUNK_BYTES)
+            .min(self.encoded.len());
+        let chunk = &self.encoded[self.offset..end];
+        let final_frame = end == self.encoded.len();
+        let message = ChannelMessage {
+            topic: topic.to_string(),
+            event: "tunnel_stream_frame".to_string(),
+            payload: serde_json::json!({
+                "version": TUNNEL_PROTOCOL_VERSION,
+                "stream_id": self.stream_id,
+                "direction": self.direction,
+                "sequence": self.sequence,
+                "final": final_frame,
+                "data": URL_SAFE_NO_PAD.encode(chunk),
+            }),
+            reference: None,
+        };
+
+        if serde_json::to_vec(&message)?.len() > TUNNEL_MAX_FRAME_BYTES {
+            return Err(anyhow!("Serialized tunnel frame exceeds 64 KiB"));
+        }
+
+        self.offset = end;
+        self.sequence += 1;
+        Ok(Some(message))
+    }
+}
+
+fn json_usize(payload: &serde_json::Value, key: &str) -> Result<usize> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| anyhow!("Tunnel stream has invalid {key}"))
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn required_string(payload: &serde_json::Value, key: &str) -> Result<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("Tunnel request is missing {key}"))
+}
+
+fn ordered_header_pairs(value: Option<&serde_json::Value>) -> Result<Vec<(String, String)>> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(serde_json::Value::Array(headers)) => headers
+            .iter()
+            .map(|header| {
+                let pair = header
+                    .as_array()
+                    .filter(|pair| pair.len() == 2)
+                    .ok_or_else(|| anyhow!("Tunnel header is not an ordered name/value pair"))?;
+                let name = pair[0]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Tunnel header name is not text"))?;
+                let value = pair[1]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Tunnel header value is not text"))?;
+                Ok((name.to_string(), value.to_string()))
+            })
+            .collect(),
+        Some(serde_json::Value::Object(headers)) => Ok(headers
+            .iter()
+            .map(|(name, value)| (name.clone(), json_value_to_string(value)))
+            .collect()),
+        Some(_) => Err(anyhow!("Tunnel headers have an unsupported shape")),
+    }
+}
+
+async fn send_channel_message(write: &mut WsWrite, message: ChannelMessage) -> Result<()> {
+    let json = serde_json::to_vec(&message)?;
+    if json.len() > TUNNEL_MAX_FRAME_BYTES {
+        return Err(anyhow!("Tunnel channel message exceeds 64 KiB"));
+    }
+
+    write
+        .send(Message::Text(String::from_utf8(json)?.into()))
+        .await?;
+    Ok(())
+}
+
+fn validate_framing_contract(response: &serde_json::Value) -> Result<()> {
+    let framing = response
+        .get("framing")
+        .ok_or_else(|| anyhow!("Server did not advertise bounded tunnel framing"))?;
+
+    if framing.get("version").and_then(serde_json::Value::as_u64) != Some(TUNNEL_PROTOCOL_VERSION)
+        || framing
+            .get("max_frame_bytes")
+            .and_then(serde_json::Value::as_u64)
+            != Some(TUNNEL_MAX_FRAME_BYTES as u64)
+        || framing
+            .get("queue_depth_frames")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+    {
+        return Err(anyhow!(
+            "Server advertised an incompatible framing contract"
+        ));
+    }
+
+    Ok(())
+}
+
 fn listen_join_payload() -> serde_json::Value {
     serde_json::json!({"mode": CAPTURE_FORWARD_MODE})
 }
@@ -158,6 +479,7 @@ fn tunnel_join_payload(
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "mode": DIRECT_RESPONSE_MODE,
+        "protocol_version": TUNNEL_PROTOCOL_VERSION,
         "local_port": local_port,
     });
 
@@ -1048,6 +1370,15 @@ impl TunnelForwarder {
                                         return Err(error);
                                     }
 
+                                    if let Err(error) = validate_framing_contract(response) {
+                                        let reason = error.to_string();
+                                        let _ = self
+                                            .event_tx
+                                            .send(TunnelEvent::ConnectionError(reason.clone()))
+                                            .await;
+                                        return Err(error);
+                                    }
+
                                     tunnel_limits = TunnelLimits::from_join_response(response);
                                     let subdomain = response
                                         .get("subdomain")
@@ -1121,6 +1452,7 @@ impl TunnelForwarder {
         let mut last_ping = tokio::time::Instant::now();
         let ping_interval = Duration::from_secs(30);
         let mut ping_counter = 2;
+        let mut inbound_streams = HashMap::new();
 
         // Listen for tunnel_request events
         loop {
@@ -1148,7 +1480,13 @@ impl TunnelForwarder {
                 Ok(Some(msg)) => match msg {
                     Ok(Message::Text(text)) => {
                         if let Err(e) = self
-                            .handle_tunnel_message(&text, &mut write, &tunnel_topic, tunnel_limits)
+                            .handle_tunnel_message(
+                                &text,
+                                &mut write,
+                                &tunnel_topic,
+                                tunnel_limits,
+                                &mut inbound_streams,
+                            )
                             .await
                         {
                             error!("Error handling tunnel message: {}", e);
@@ -1205,6 +1543,7 @@ impl TunnelForwarder {
         >,
         tunnel_topic: &str,
         tunnel_limits: TunnelLimits,
+        inbound_streams: &mut HashMap<String, TunnelStreamAssembler>,
     ) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
 
@@ -1215,104 +1554,66 @@ impl TunnelForwarder {
         );
 
         match msg.event.as_str() {
-            "tunnel_request" => {
-                // Extract request details
-                if let Some(payload) = msg.payload.as_object() {
-                    let request_id = payload
-                        .get("request_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let method = payload
-                        .get("method")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("GET")
-                        .to_string();
-                    let path = payload
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("/")
-                        .to_string();
-                    let query_string = payload
-                        .get("query_string")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let headers = payload
-                        .get("headers")
-                        .and_then(|v| v.as_object())
-                        .cloned()
-                        .unwrap_or_default();
+            "tunnel_stream_start" => {
+                let assembler = TunnelStreamAssembler::from_start(&msg.payload, "request")?;
+                if inbound_streams.len() >= 128 {
+                    return Err(anyhow!("Too many concurrent tunnel streams"));
+                }
+                if inbound_streams.contains_key(&assembler.stream_id) {
+                    return Err(anyhow!("Duplicate tunnel stream id"));
+                }
 
-                    // Decode body based on body_encoding field
-                    let body_encoding = payload
-                        .get("body_encoding")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("raw");
-                    let raw_body = payload.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    let body: Vec<u8> = if body_encoding == "base64" {
-                        // Decode base64 body
-                        URL_SAFE_NO_PAD.decode(raw_body).unwrap_or_else(|e| {
-                            warn!("Failed to decode base64 body: {}", e);
-                            raw_body.as_bytes().to_vec()
-                        })
-                    } else {
-                        // Use body as-is (raw UTF-8)
-                        raw_body.as_bytes().to_vec()
-                    };
+                inbound_streams.insert(assembler.stream_id.clone(), assembler);
+            }
+            "tunnel_stream_frame" => {
+                let stream_id = msg
+                    .payload
+                    .get("stream_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow!("Tunnel frame is missing its stream id"))?
+                    .to_string();
+                let sequence = json_usize(&msg.payload, "sequence")?;
 
-                    if body.len() > tunnel_limits.max_request_body_bytes {
-                        self.report_tunnel_failure(
-                            &request_id,
-                            format!(
-                                "Tunnel request body exceeds advertised limit ({} > {} bytes)",
-                                body.len(),
-                                tunnel_limits.max_request_body_bytes
-                            ),
-                            write,
-                            tunnel_topic,
-                        )
-                        .await?;
+                let completed = inbound_streams
+                    .get_mut(&stream_id)
+                    .ok_or_else(|| anyhow!("Tunnel frame references an unknown stream"))?
+                    .append(&msg.payload)?;
 
-                        return Ok(());
-                    }
+                send_channel_message(
+                    write,
+                    ChannelMessage {
+                        topic: tunnel_topic.to_string(),
+                        event: "tunnel_stream_ack".to_string(),
+                        payload: serde_json::json!({
+                            "stream_id": stream_id,
+                            "sequence": sequence,
+                        }),
+                        reference: None,
+                    },
+                )
+                .await?;
 
-                    // Convert headers Map<String, Value> → HashMap<String, String>
-                    let headers_map: HashMap<String, String> = headers
-                        .iter()
-                        .map(|(k, v)| (k.clone(), json_value_to_string(v)))
-                        .collect();
-
-                    // Keep the TUI history bounded while forwarding the complete body.
-                    let body_string = body_preview(&body);
-
-                    // Notify UI about request
-                    let _ = self
-                        .event_tx
-                        .send(TunnelEvent::RequestReceived {
-                            request_id: request_id.clone(),
-                            method: method.clone(),
-                            path: path.clone(),
-                            headers: headers_map,
-                            body: body_string,
-                            query_string: query_string.clone(),
-                        })
-                        .await;
-
-                    // Forward the request
-                    self.forward_tunnel_request(
-                        request_id,
-                        method,
-                        path,
-                        query_string,
-                        headers,
-                        body,
+                if let Some(payload) = completed {
+                    let assembler = inbound_streams
+                        .remove(&stream_id)
+                        .ok_or_else(|| anyhow!("Completed tunnel stream disappeared"))?;
+                    self.handle_framed_tunnel_request(
+                        &payload,
+                        assembler.deadline_unix_ms,
                         write,
                         tunnel_topic,
                         tunnel_limits,
                     )
                     .await?;
                 }
+            }
+            "tunnel_stream_error" => {
+                let code = msg
+                    .payload
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("stream_error");
+                return Err(anyhow!("Tunnel stream failed: {code}"));
             }
             "phx_reply" => {
                 // Handle ping replies
@@ -1333,6 +1634,82 @@ impl TunnelForwarder {
         Ok(())
     }
 
+    async fn handle_framed_tunnel_request(
+        &self,
+        payload: &serde_json::Value,
+        deadline_unix_ms: u64,
+        write: &mut WsWrite,
+        tunnel_topic: &str,
+        tunnel_limits: TunnelLimits,
+    ) -> Result<()> {
+        let request_id = required_string(payload, "request_id")?;
+        let method = required_string(payload, "method")?;
+        let path = required_string(payload, "path")?;
+        let query_string = payload
+            .get("query_string")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let headers = ordered_header_pairs(payload.get("headers"))?;
+        let body_encoding = payload
+            .get("body_encoding")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("raw");
+        let raw_body = payload
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let body = match body_encoding {
+            "raw" => raw_body.as_bytes().to_vec(),
+            "base64" => URL_SAFE_NO_PAD
+                .decode(raw_body)
+                .context("Tunnel request contains invalid base64url body data")?,
+            encoding => return Err(anyhow!("Unsupported tunnel body encoding: {encoding}")),
+        };
+
+        if body.len() > tunnel_limits.max_request_body_bytes {
+            return self
+                .report_tunnel_failure(
+                    &request_id,
+                    format!(
+                        "Tunnel request body exceeds advertised limit ({} > {} bytes)",
+                        body.len(),
+                        tunnel_limits.max_request_body_bytes
+                    ),
+                    write,
+                    tunnel_topic,
+                )
+                .await;
+        }
+
+        let headers_map = headers.iter().cloned().collect();
+        let _ = self
+            .event_tx
+            .send(TunnelEvent::RequestReceived {
+                request_id: request_id.clone(),
+                method: method.clone(),
+                path: path.clone(),
+                headers: headers_map,
+                body: body_preview(&body),
+                query_string: query_string.clone(),
+            })
+            .await;
+
+        self.forward_tunnel_request(
+            request_id,
+            method,
+            path,
+            query_string,
+            headers,
+            body,
+            deadline_unix_ms,
+            write,
+            tunnel_topic,
+            tunnel_limits,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn forward_tunnel_request(
         &self,
@@ -1340,14 +1717,10 @@ impl TunnelForwarder {
         method: String,
         path: String,
         query_string: String,
-        headers: serde_json::Map<String, serde_json::Value>,
+        headers: Vec<(String, String)>,
         body: Vec<u8>,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
+        deadline_unix_ms: u64,
+        write: &mut WsWrite,
         tunnel_topic: &str,
         tunnel_limits: TunnelLimits,
     ) -> Result<()> {
@@ -1367,43 +1740,32 @@ impl TunnelForwarder {
             target.push_str(&query_string);
         }
 
-        // Create HTTP client with timeout
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let remaining_ms = deadline_unix_ms.saturating_sub(unix_time_ms());
+        if remaining_ms == 0 {
+            return self
+                .report_tunnel_failure(
+                    &request_id,
+                    "deadline_exceeded".to_string(),
+                    write,
+                    tunnel_topic,
+                )
+                .await;
+        }
 
-        // Build request
-        let mut req_builder = match method.as_str() {
-            "GET" => client.get(&target),
-            "POST" => client.post(&target),
-            "PUT" => client.put(&target),
-            "DELETE" => client.delete(&target),
-            "PATCH" => client.patch(&target),
-            "HEAD" => client.head(&target),
-            "OPTIONS" => client.request(reqwest::Method::OPTIONS, &target),
-            _ => {
-                warn!("Unsupported HTTP method: {}", method);
-                let _ = self
-                    .send_tunnel_error(
-                        &request_id,
-                        &format!("Unsupported method: {}", method),
-                        write,
-                        tunnel_topic,
-                    )
-                    .await;
-                return Ok(());
-            }
-        };
+        // One end-to-end deadline covers local connection and response streaming.
+        let client = tunnel_http_client(Duration::from_millis(remaining_ms))?;
+
+        let request_method = reqwest::Method::from_bytes(method.as_bytes())
+            .with_context(|| format!("Unsupported HTTP method: {method}"))?;
+        let mut req_builder = client.request(request_method, &target);
 
         // Add headers. reqwest sets request framing headers from the body we actually send.
         for (key, value) in headers {
-            if should_forward_request_header(&key) {
-                let value_str = json_value_to_string(&value);
-                if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                    && let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value_str)
-                {
-                    req_builder = req_builder.header(header_name, header_value);
-                }
+            if should_forward_request_header(&key)
+                && let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                && let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value)
+            {
+                req_builder = req_builder.header(header_name, header_value);
             }
         }
 
@@ -1429,11 +1791,8 @@ impl TunnelForwarder {
                         .await;
                 }
 
-                let response_headers: HashMap<String, String> = response
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                    .collect();
+                let response_header_pairs = response_headers_to_pairs(response.headers());
+                let response_headers = response_headers_to_map(response.headers());
 
                 if response
                     .content_length()
@@ -1515,22 +1874,20 @@ impl TunnelForwarder {
                     })
                     .await;
 
-                // Send tunnel_response back to server with body_encoding
-                let response_message = ChannelMessage {
-                    topic: tunnel_topic.to_string(),
-                    event: "tunnel_response".to_string(),
-                    payload: serde_json::json!({
+                self.send_framed_tunnel_response(
+                    write,
+                    tunnel_topic,
+                    &request_id,
+                    deadline_unix_ms,
+                    serde_json::json!({
                         "request_id": request_id,
                         "status": status,
-                        "headers": response_headers,
+                        "headers": response_header_pairs,
                         "body": response_body,
                         "body_encoding": body_encoding,
                     }),
-                    reference: None,
-                };
-
-                let response_json = serde_json::to_string(&response_message)?;
-                write.send(Message::Text(response_json.into())).await?;
+                )
+                .await?;
             }
             Err(e) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1556,6 +1913,32 @@ impl TunnelForwarder {
                 self.send_tunnel_error(&request_id, &error_msg, write, tunnel_topic)
                     .await?;
             }
+        }
+
+        Ok(())
+    }
+
+    async fn send_framed_tunnel_response(
+        &self,
+        write: &mut WsWrite,
+        tunnel_topic: &str,
+        request_id: &str,
+        deadline_unix_ms: u64,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let mut stream =
+            OutboundTunnelStream::new(request_id, "response", deadline_unix_ms, &payload)?;
+
+        send_channel_message(write, stream.start_message(tunnel_topic)).await?;
+
+        while let Some(frame) = stream.next_frame(tunnel_topic)? {
+            if unix_time_ms() >= deadline_unix_ms {
+                return Err(anyhow!("deadline_exceeded"));
+            }
+
+            // SinkExt::send waits for sink readiness, keeping the transport queue
+            // to one frame even when the service consumes slowly.
+            send_channel_message(write, frame).await?;
         }
 
         Ok(())
@@ -1720,6 +2103,7 @@ mod tests {
 
         let tunnel_payload = tunnel_join_payload(3000, Some("org-1"), Some("payments"));
         assert_eq!(tunnel_payload["mode"], DIRECT_RESPONSE_MODE);
+        assert_eq!(tunnel_payload["protocol_version"], TUNNEL_PROTOCOL_VERSION);
         assert_eq!(tunnel_payload["local_port"], 3000);
         assert_eq!(tunnel_payload["organization_id"], "org-1");
         assert_eq!(tunnel_payload["slug"], "payments");
@@ -1776,14 +2160,137 @@ mod tests {
     fn test_tunnel_websocket_config_accepts_advertised_messages() {
         let config = tunnel_websocket_config();
 
+        assert_eq!(config.max_message_size, Some(TUNNEL_MAX_FRAME_BYTES));
+        assert_eq!(config.max_frame_size, Some(TUNNEL_MAX_FRAME_BYTES));
+    }
+
+    #[test]
+    fn test_framed_stream_round_trips_with_one_bounded_frame_in_flight() {
+        let payload = serde_json::json!({
+            "request_id": "request-1",
+            "headers": [["x-repeat", "first"], ["x-repeat", "second"]],
+            "body": URL_SAFE_NO_PAD.encode(vec![0xff; 200_000]),
+            "body_encoding": "base64",
+        });
+        let deadline = unix_time_ms() + 30_000;
+        let mut outbound =
+            OutboundTunnelStream::new("request-1", "request", deadline, &payload).unwrap();
+        let start = outbound.start_message("tunnel:connect");
+        let mut inbound = TunnelStreamAssembler::from_start(&start.payload, "request").unwrap();
+        let mut decoded = None;
+        let mut peak_in_flight = 0;
+
+        while let Some(frame) = outbound.next_frame("tunnel:connect").unwrap() {
+            assert!(serde_json::to_vec(&frame).unwrap().len() <= TUNNEL_MAX_FRAME_BYTES);
+            peak_in_flight = peak_in_flight.max(1);
+            decoded = inbound.append(&frame.payload).unwrap().or(decoded);
+        }
+
+        assert_eq!(decoded.unwrap(), payload);
+        assert_eq!(peak_in_flight, 1);
+    }
+
+    #[test]
+    fn test_published_v2_contract_matches_cli_framing_constants() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/tunnel_framing_v2.json")).unwrap();
+
+        assert_eq!(fixture["version"], TUNNEL_PROTOCOL_VERSION);
+        assert_eq!(fixture["max_frame_bytes"], TUNNEL_MAX_FRAME_BYTES);
+        assert_eq!(fixture["max_raw_chunk_bytes"], TUNNEL_MAX_RAW_CHUNK_BYTES);
+        assert_eq!(fixture["queue_depth_frames"], 1);
+
+        let headers = ordered_header_pairs(fixture["sample_payload"].get("headers")).unwrap();
+        assert_eq!(headers[0], ("x-repeated".into(), "first".into()));
+        assert_eq!(headers[1], ("x-repeated".into(), "second".into()));
         assert_eq!(
-            config.max_message_size,
-            Some(TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES)
+            URL_SAFE_NO_PAD
+                .decode(fixture["sample_payload"]["body"].as_str().unwrap())
+                .unwrap(),
+            vec![0x00, 0xff, b'b', b'i', b'n']
         );
+    }
+
+    #[test]
+    fn test_framing_rejects_out_of_order_frames() {
+        let payload = serde_json::json!({"request_id": "request-1", "body": "ok"});
+        let deadline = unix_time_ms() + 30_000;
+        let mut outbound =
+            OutboundTunnelStream::new("request-1", "request", deadline, &payload).unwrap();
+        let start = outbound.start_message("tunnel:connect");
+        let mut inbound = TunnelStreamAssembler::from_start(&start.payload, "request").unwrap();
+        let mut frame = outbound.next_frame("tunnel:connect").unwrap().unwrap();
+        frame.payload["sequence"] = serde_json::json!(1);
+
+        assert!(
+            inbound
+                .append(&frame.payload)
+                .unwrap_err()
+                .to_string()
+                .contains("Out-of-order")
+        );
+    }
+
+    #[test]
+    fn test_ordered_headers_preserve_duplicates() {
+        let headers = ordered_header_pairs(Some(&serde_json::json!([
+            ["set-cookie", "first=1"],
+            ["set-cookie", "second=2"]
+        ])))
+        .unwrap();
+
         assert_eq!(
-            config.max_frame_size,
-            Some(TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES)
+            headers,
+            vec![
+                ("set-cookie".to_string(), "first=1".to_string()),
+                ("set-cookie".to_string(), "second=2".to_string())
+            ]
         );
+    }
+
+    #[test]
+    fn test_response_header_pairs_preserve_repeated_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append("set-cookie", "first=1".parse().unwrap());
+        headers.append("set-cookie", "second=2".parse().unwrap());
+
+        assert_eq!(
+            response_headers_to_pairs(&headers),
+            vec![
+                ("set-cookie".to_string(), "first=1".to_string()),
+                ("set-cookie".to_string(), "second=2".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_redirects_are_returned_without_following() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /must-not-follow\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = tunnel_http_client(Duration::from_secs(1))
+            .unwrap()
+            .get(format!("http://{address}/start"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.unwrap();
     }
 
     #[test]
