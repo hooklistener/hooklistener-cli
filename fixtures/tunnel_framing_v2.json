@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "transport": "framed",
+  "frame_encoding": "base64url",
+  "max_frame_bytes": 65536,
+  "max_raw_chunk_bytes": 47000,
+  "queue_depth_frames": 1,
+  "backpressure": "per_frame_ack",
+  "sample_payload": {
+    "request_id": "22222222-2222-4222-8222-222222222222",
+    "headers": [
+      ["x-repeated", "first"],
+      ["x-repeated", "second"],
+      ["content-type", "application/octet-stream"]
+    ],
+    "body": "AP9iaW4",
+    "body_encoding": "base64"
+  }
+}
