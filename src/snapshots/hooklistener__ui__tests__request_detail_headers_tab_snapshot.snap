@@ -1,6 +1,5 @@
 ---
 source: src/ui.rs
-assertion_line: 3188
 expression: snapshot
 ---
 
@@ -25,4 +24,4 @@ expression: snapshot
  │                                                                                                          │
  │                                                                                                          │
  └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- Request  Tab Tabs | ↑↓ Scroll | F Forward | E Export | B Back | Q Quit                        API connected
+ Request  Tab Tabs | ↑↓ Scroll | / Fuzzy | F Forward | E Export | B Back | Q Quit              API connected

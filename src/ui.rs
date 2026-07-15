@@ -1,4 +1,6 @@
-use crate::app::{App, AppState, FeedbackKind, TRUNCATED_BODY_MARKER, TunnelRequest};
+use crate::app::{
+    App, AppState, FeedbackKind, TRUNCATED_BODY_MARKER, TunnelRequest, fuzzy_matches,
+};
 use crate::syntax::JsonHighlighter;
 use crate::theme as colors;
 use ratatui::{
@@ -1509,11 +1511,13 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let show_search = app.detail_search_active || !app.detail_search_query.is_empty();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Tab bar
-            Constraint::Min(0),    // Tab content
+            Constraint::Length(3),                               // Tab bar
+            Constraint::Length(if show_search { 3 } else { 0 }), // Fuzzy search
+            Constraint::Min(0),                                  // Tab content
         ])
         .split(area);
 
@@ -1541,15 +1545,42 @@ fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
 
         frame.render_widget(tabs, chunks[0]);
 
+        if show_search {
+            draw_detail_search_bar(frame, app, chunks[1]);
+        }
+
         // Tab content
         match app.current_tab {
-            0 => draw_info_tab(frame, app, request, chunks[1]),
-            1 => draw_headers_tab(frame, app, request, chunks[1]),
-            2 => draw_body_tab(frame, app, request, chunks[1]),
-            3 => draw_response_tab(frame, app, chunks[1]),
+            0 => draw_info_tab(frame, app, request, chunks[2]),
+            1 => draw_headers_tab(frame, app, request, chunks[2]),
+            2 => draw_body_tab(frame, app, request, chunks[2]),
+            3 => draw_response_tab(frame, app, chunks[2]),
             _ => {}
         }
     }
+}
+
+fn draw_detail_search_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let border_color = if app.detail_search_active {
+        colors::PRIMARY
+    } else {
+        colors::MUTED
+    };
+    let cursor = if app.detail_search_active { "▎" } else { "" };
+    let title = if area.width >= 58 {
+        " Fuzzy filter: headers and body "
+    } else {
+        " Fuzzy filter "
+    };
+    let search = Paragraph::new(format!("/{}{}", app.detail_search_query, cursor))
+        .style(Style::default().fg(colors::TEXT))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        );
+    frame.render_widget(search, area);
 }
 
 fn draw_info_tab(
@@ -1700,16 +1731,47 @@ fn draw_headers_tab(
             .cmp(&k2.to_ascii_lowercase())
             .then_with(|| k1.cmp(k2))
     });
-    let lines = format_header_lines(&headers, detail_content_width(area));
+    let total_headers = headers.len();
+    headers.retain(|(key, value)| {
+        fuzzy_matches(key, &app.detail_search_query)
+            || fuzzy_matches(value, &app.detail_search_query)
+    });
+    let matching_headers = headers.len();
+    let lines = if headers.is_empty() && !app.detail_search_query.is_empty() {
+        vec![no_fuzzy_matches_line()]
+    } else {
+        format_header_lines(&headers, detail_content_width(area))
+    };
+    let title = filtered_section_title(
+        "Headers",
+        matching_headers,
+        total_headers,
+        &app.detail_search_query,
+    );
 
     render_scrollable_lines(
         frame,
         lines,
         app.headers_scroll_offset,
-        &format!("Headers ({})", headers.len()),
+        &title,
         colors::SECONDARY,
         area,
     );
+}
+
+fn filtered_section_title(label: &str, matching: usize, total: usize, query: &str) -> String {
+    if query.is_empty() {
+        format!("{} ({})", label, total)
+    } else {
+        format!("{} ({}/{})", label, matching, total)
+    }
+}
+
+fn no_fuzzy_matches_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "(no fuzzy matches)",
+        Style::default().fg(colors::MUTED),
+    ))
 }
 
 /// Render an empty/missing body placeholder.
@@ -1936,25 +1998,43 @@ fn char_display_width(ch: char) -> usize {
 }
 
 /// Render a scrollable, syntax-highlighted body section.
-/// `title_prefix` is e.g. "Body" or "Response Body".
-/// `title_extra` is appended after the prefix (e.g. " JSON (Full)").
 fn render_highlighted_body(
     frame: &mut Frame,
     content: &str,
     scroll_offset: usize,
-    title_prefix: &str,
-    title_extra: &str,
+    section_title: &str,
+    query: &str,
     border_color: Color,
     area: Rect,
 ) {
-    let highlighted_lines = JsonHighlighter::highlight_json(content);
+    let mut highlighted_lines = JsonHighlighter::highlight_json(content);
+    let total_lines = highlighted_lines.len();
+    if !query.is_empty() {
+        highlighted_lines.retain(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            fuzzy_matches(&text, query)
+        });
+    }
+    let matching_lines = highlighted_lines.len();
+    if matching_lines == 0 {
+        highlighted_lines.push(no_fuzzy_matches_line());
+    }
     let wrapped_lines = wrap_styled_lines(highlighted_lines, detail_content_width(area), 2);
+    let title = if query.is_empty() {
+        section_title.to_string()
+    } else {
+        format!("{} ({}/{})", section_title, matching_lines, total_lines)
+    };
 
     render_scrollable_lines(
         frame,
         wrapped_lines,
         scroll_offset,
-        &format!("{}{}", title_prefix, title_extra),
+        &title,
         border_color,
         area,
     );
@@ -1997,8 +2077,8 @@ fn draw_body_tab(
         frame,
         body_content,
         app.body_scroll_offset,
-        "Body",
-        &title_extra,
+        &format!("Body{}", title_extra),
+        &app.detail_search_query,
         colors::SUCCESS,
         area,
     );
@@ -2095,12 +2175,28 @@ fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
             .cmp(&k2.to_ascii_lowercase())
             .then_with(|| k1.cmp(k2))
     });
-    let header_lines = format_header_lines(&headers, detail_content_width(chunks[1]));
+    let total_headers = headers.len();
+    headers.retain(|(key, value)| {
+        fuzzy_matches(key, &app.detail_search_query)
+            || fuzzy_matches(value, &app.detail_search_query)
+    });
+    let matching_headers = headers.len();
+    let header_lines = if headers.is_empty() && !app.detail_search_query.is_empty() {
+        vec![no_fuzzy_matches_line()]
+    } else {
+        format_header_lines(&headers, detail_content_width(chunks[1]))
+    };
+    let headers_title = filtered_section_title(
+        "Response Headers",
+        matching_headers,
+        total_headers,
+        &app.detail_search_query,
+    );
     render_scrollable_lines(
         frame,
         header_lines,
         app.response_headers_scroll_offset,
-        &format!("Response Headers ({})", headers.len()),
+        &headers_title,
         colors::SECONDARY,
         chunks[1],
     );
@@ -2113,7 +2209,7 @@ fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
                 body_content,
                 app.response_scroll_offset,
                 "Response Body",
-                "",
+                &app.detail_search_query,
                 colors::SUCCESS,
                 chunks[2],
             );
@@ -2716,17 +2812,32 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     let (status_text, shortcuts, compact_shortcuts) = match &app.state {
         AppState::ShowRequestDetail => {
-            let replay =
-                if app.selected_request.is_some() && app.is_valid_url(&app.forward_url_input) {
-                    " | R Replay"
+            if app.detail_search_active {
+                (
+                    "Fuzzy filter".to_string(),
+                    "Type to filter | Enter Apply | Esc Clear".to_string(),
+                    None,
+                )
+            } else {
+                let replay =
+                    if app.selected_request.is_some() && app.is_valid_url(&app.forward_url_input) {
+                        " | R Replay"
+                    } else {
+                        ""
+                    };
+                let search = if app.detail_search_query.is_empty() {
+                    "/ Fuzzy"
                 } else {
-                    ""
+                    "Esc Clear | / Fuzzy"
                 };
-            (
-                "Request".to_string(),
-                format!("Tab Tabs | ↑↓ Scroll | F Forward{replay} | E Export | B Back | Q Quit"),
-                Some("Tab Tabs | ↑↓ Scroll | F Forward | B Back | Q Quit".to_string()),
-            )
+                (
+                    "Request".to_string(),
+                    format!(
+                        "Tab Tabs | ↑↓ Scroll | {search} | F Forward{replay} | E Export | B Back | Q Quit"
+                    ),
+                    Some(format!("Tab | ↑↓ | {search} | F Forward | B Back | Q Quit")),
+                )
+            }
         }
         AppState::InputForwardUrl => (
             "Forward".to_string(),
@@ -3229,6 +3340,50 @@ mod tests {
     }
 
     #[test]
+    fn request_detail_fuzzy_filters_headers_by_subsequence() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.current_tab = 1;
+        app.selected_request = Some(make_detail_request());
+        app.detail_search_query = "cntyp".to_string();
+
+        let rendered = render_app_to_text(&app, 110, 24);
+
+        assert!(rendered.contains("Headers (1/4)"));
+        assert!(rendered.contains("content-type"));
+        assert!(!rendered.contains("user-agent"));
+    }
+
+    #[test]
+    fn request_detail_fuzzy_filters_formatted_body_lines() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.current_tab = 2;
+        app.selected_request = Some(make_detail_request());
+        app.detail_search_query = "rpstry".to_string();
+
+        let rendered = render_app_to_text(&app, 110, 24);
+
+        assert!(rendered.contains("\"repository\": {"));
+        assert!(!rendered.contains("\"ref\": \"refs/heads/main\""));
+    }
+
+    #[test]
+    fn request_detail_active_fuzzy_search_shows_input_help() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.current_tab = 2;
+        app.selected_request = Some(make_detail_request());
+        app.detail_search_active = true;
+        app.detail_search_query = "repo".to_string();
+
+        let rendered = render_app_to_text(&app, 110, 24);
+
+        assert!(rendered.contains("Fuzzy filter: headers and body"));
+        assert!(rendered.contains("Type to filter | Enter Apply | Esc Clear"));
+    }
+
+    #[test]
     fn request_detail_response_tab_snapshot() {
         let mut app = App::with_config(valid_test_config());
         app.state = AppState::ShowRequestDetail;
@@ -3255,6 +3410,28 @@ mod tests {
         let snapshot = render_app_to_text(&app, 110, 28);
 
         insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn request_detail_fuzzy_filters_response_headers_and_body() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.current_tab = 3;
+        app.selected_request = Some(make_detail_request());
+        app.detail_search_query = "que".to_string();
+        app.selected_tunnel_response = Some(crate::app::TunnelResponseData {
+            status: Some(202),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: Some(r#"{"accepted":true,"queue":"webhook-forwarder"}"#.to_string()),
+            duration_ms: Some(64),
+            error: None,
+        });
+
+        let rendered = render_app_to_text(&app, 110, 28);
+
+        assert!(rendered.contains("Response Headers (0/1)"));
+        assert!(rendered.contains("\"queue\": \"webhook-forwarder\""));
+        assert!(!rendered.contains("\"accepted\": true"));
     }
 
     #[test]

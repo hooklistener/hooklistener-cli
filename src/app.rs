@@ -227,6 +227,30 @@ pub fn truncate_body(body: Option<String>) -> Option<String> {
 const VIEWPORT_LINES: usize = 20;
 const DETAIL_SCROLL_WRAP_WIDTH: usize = 100;
 
+pub(crate) fn fuzzy_matches(text: &str, query: &str) -> bool {
+    let mut query_chars = query.chars().flat_map(char::to_lowercase);
+    let Some(mut expected) = query_chars.next() else {
+        return true;
+    };
+
+    for candidate in text.chars().flat_map(char::to_lowercase) {
+        if candidate != expected {
+            continue;
+        }
+
+        let Some(next) = query_chars.next() else {
+            return true;
+        };
+        expected = next;
+    }
+
+    false
+}
+
+fn header_matches_query(key: &str, value: &str, query: &str) -> bool {
+    fuzzy_matches(key, query) || fuzzy_matches(value, query)
+}
+
 fn parse_query_string(query_string: &str) -> HashMap<String, String> {
     if query_string.is_empty() {
         return HashMap::new();
@@ -252,16 +276,25 @@ fn parse_query_string(query_string: &str) -> HashMap<String, String> {
 }
 
 /// Compute the maximum scroll offset for a text body given a fixed viewport.
-fn max_body_scroll(text: &str) -> usize {
+fn max_body_scroll(text: &str, query: &str) -> usize {
     let display_text = JsonHighlighter::format_json_for_display(text);
-    let line_count = visual_line_count(display_text.as_ref(), DETAIL_SCROLL_WRAP_WIDTH);
+    let line_count = display_text
+        .lines()
+        .filter(|line| fuzzy_matches(line, query))
+        .map(|line| visual_line_count(line, DETAIL_SCROLL_WRAP_WIDTH))
+        .sum::<usize>()
+        .max(1);
     line_count.saturating_sub(VIEWPORT_LINES)
 }
 
-fn max_headers_scroll(headers: &HashMap<String, String>) -> usize {
-    let entry_bound = headers.len().saturating_sub(1);
+fn max_headers_scroll(headers: &HashMap<String, String>, query: &str) -> usize {
+    let matching_headers = headers
+        .iter()
+        .filter(|(key, value)| header_matches_query(key, value, query));
+    let entry_bound = matching_headers.clone().count().saturating_sub(1);
     let visual_bound = headers
         .iter()
+        .filter(|(key, value)| header_matches_query(key, value, query))
         .map(|(key, value)| {
             visual_line_count(&format!("{}: {}", key, value), DETAIL_SCROLL_WRAP_WIDTH)
         })
@@ -339,6 +372,10 @@ pub struct App {
     // Search/filter
     pub search_active: bool,
     pub search_query: String,
+
+    // Fuzzy filter within request/response details
+    pub detail_search_active: bool,
+    pub detail_search_query: String,
 }
 
 impl App {
@@ -394,6 +431,8 @@ impl App {
             monochrome: false,
             search_active: false,
             search_query: String::new(),
+            detail_search_active: false,
+            detail_search_query: String::new(),
         }
     }
 
@@ -428,12 +467,42 @@ impl App {
     fn max_response_headers_scroll(&self) -> usize {
         self.selected_tunnel_response
             .as_ref()
-            .map(|r| max_headers_scroll(&r.headers))
+            .map(|r| max_headers_scroll(&r.headers, &self.detail_search_query))
             .unwrap_or(0)
+    }
+
+    fn reset_detail_scroll(&mut self) {
+        self.headers_scroll_offset = 0;
+        self.body_scroll_offset = 0;
+        self.response_headers_scroll_offset = 0;
+        self.response_scroll_offset = 0;
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+
+        if matches!(self.state, AppState::ShowRequestDetail) && self.detail_search_active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.detail_search_active = false;
+                    self.detail_search_query.clear();
+                    self.reset_detail_scroll();
+                }
+                KeyCode::Enter => {
+                    self.detail_search_active = false;
+                }
+                KeyCode::Backspace => {
+                    self.detail_search_query.pop();
+                    self.reset_detail_scroll();
+                }
+                KeyCode::Char(c) => {
+                    self.detail_search_query.push(c);
+                    self.reset_detail_scroll();
+                }
+                _ => {}
+            }
             return Ok(());
         }
 
@@ -443,12 +512,15 @@ impl App {
                     KeyCode::Char('q') => {
                         self.should_quit = true;
                     }
+                    KeyCode::Esc if !self.detail_search_query.is_empty() => {
+                        self.detail_search_query.clear();
+                        self.reset_detail_scroll();
+                    }
                     KeyCode::Char('b') | KeyCode::Esc => {
                         self.current_tab = 0;
-                        self.headers_scroll_offset = 0;
-                        self.body_scroll_offset = 0;
-                        self.response_headers_scroll_offset = 0;
-                        self.response_scroll_offset = 0;
+                        self.reset_detail_scroll();
+                        self.detail_search_active = false;
+                        self.detail_search_query.clear();
                         self.selected_tunnel_response = None;
                         self.state = match self.detail_return_state {
                             Some(DetailReturnTarget::Tunneling) => AppState::Tunneling,
@@ -476,6 +548,11 @@ impl App {
                     }
                     KeyCode::Char('e') if self.selected_request.is_some() => {
                         self.state = AppState::ExportMenu;
+                    }
+                    KeyCode::Char('/') => {
+                        self.detail_search_active = true;
+                        self.detail_search_query.clear();
+                        self.reset_detail_scroll();
                     }
                     KeyCode::Tab | KeyCode::Right => {
                         self.current_tab = (self.current_tab + 1) % self.num_detail_tabs();
@@ -510,7 +587,8 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') => match self.current_tab {
                         1 => {
                             if let Some(request) = &self.selected_request {
-                                let max = max_headers_scroll(&request.headers);
+                                let max =
+                                    max_headers_scroll(&request.headers, &self.detail_search_query);
                                 if self.headers_scroll_offset < max {
                                     self.headers_scroll_offset += 1;
                                 }
@@ -518,7 +596,7 @@ impl App {
                         }
                         2 => {
                             if let Some(body) = self.selected_body_text() {
-                                let max = max_body_scroll(body);
+                                let max = max_body_scroll(body, &self.detail_search_query);
                                 if self.body_scroll_offset < max {
                                     self.body_scroll_offset += 1;
                                 }
@@ -529,7 +607,7 @@ impl App {
                             if self.response_headers_scroll_offset < headers_max {
                                 self.response_headers_scroll_offset += 1;
                             } else if let Some(body) = self.response_body_text() {
-                                let body_max = max_body_scroll(body);
+                                let body_max = max_body_scroll(body, &self.detail_search_query);
                                 if self.response_scroll_offset < body_max {
                                     self.response_scroll_offset += 1;
                                 }
@@ -558,14 +636,15 @@ impl App {
                     KeyCode::PageDown => match self.current_tab {
                         1 => {
                             if let Some(request) = &self.selected_request {
-                                let max = max_headers_scroll(&request.headers);
+                                let max =
+                                    max_headers_scroll(&request.headers, &self.detail_search_query);
                                 self.headers_scroll_offset =
                                     (self.headers_scroll_offset + 10).min(max);
                             }
                         }
                         2 => {
                             if let Some(body) = self.selected_body_text() {
-                                let max = max_body_scroll(body);
+                                let max = max_body_scroll(body, &self.detail_search_query);
                                 self.body_scroll_offset = (self.body_scroll_offset + 10).min(max);
                             }
                         }
@@ -580,7 +659,7 @@ impl App {
                             if remaining > 0
                                 && let Some(body) = self.response_body_text()
                             {
-                                let body_max = max_body_scroll(body);
+                                let body_max = max_body_scroll(body, &self.detail_search_query);
                                 self.response_scroll_offset =
                                     (self.response_scroll_offset + remaining).min(body_max);
                             }
@@ -599,19 +678,22 @@ impl App {
                     KeyCode::End => match self.current_tab {
                         1 => {
                             if let Some(request) = &self.selected_request {
-                                self.headers_scroll_offset = max_headers_scroll(&request.headers);
+                                self.headers_scroll_offset =
+                                    max_headers_scroll(&request.headers, &self.detail_search_query);
                             }
                         }
                         2 => {
                             if let Some(body) = self.selected_body_text() {
-                                self.body_scroll_offset = max_body_scroll(body);
+                                self.body_scroll_offset =
+                                    max_body_scroll(body, &self.detail_search_query);
                             }
                         }
                         3 => {
                             self.response_headers_scroll_offset =
                                 self.max_response_headers_scroll();
                             if let Some(body) = self.response_body_text() {
-                                self.response_scroll_offset = max_body_scroll(body);
+                                self.response_scroll_offset =
+                                    max_body_scroll(body, &self.detail_search_query);
                             } else {
                                 self.response_scroll_offset = 0;
                             }
@@ -680,9 +762,9 @@ impl App {
                             {
                                 self.selected_request = Some(request.clone());
                                 self.current_tab = 0;
-                                self.headers_scroll_offset = 0;
-                                self.body_scroll_offset = 0;
-                                self.response_headers_scroll_offset = 0;
+                                self.reset_detail_scroll();
+                                self.detail_search_active = false;
+                                self.detail_search_query.clear();
                                 self.detail_return_state = Some(DetailReturnTarget::Listening);
                                 self.state = AppState::ShowRequestDetail;
                             }
@@ -1532,10 +1614,9 @@ impl App {
         });
 
         self.current_tab = 0;
-        self.headers_scroll_offset = 0;
-        self.body_scroll_offset = 0;
-        self.response_headers_scroll_offset = 0;
-        self.response_scroll_offset = 0;
+        self.reset_detail_scroll();
+        self.detail_search_active = false;
+        self.detail_search_query.clear();
         self.detail_return_state = Some(DetailReturnTarget::Tunneling);
         self.state = AppState::ShowRequestDetail;
     }
@@ -1625,6 +1706,16 @@ mod tests {
             response_body: None,
             pinned: false,
         }
+    }
+
+    #[test]
+    fn fuzzy_matches_accepts_case_insensitive_subsequences() {
+        assert!(fuzzy_matches("Content-Type", "cntyp"));
+    }
+
+    #[test]
+    fn fuzzy_matches_rejects_characters_in_the_wrong_order() {
+        assert!(!fuzzy_matches("Content-Type", "typecontent"));
     }
 
     // is_valid_url tests
@@ -1849,6 +1940,44 @@ mod tests {
         assert_eq!(app.current_tab, 2);
         app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
         assert_eq!(app.current_tab, 0);
+    }
+
+    #[test]
+    fn slash_starts_fuzzy_search_in_request_detail() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+
+        app.handle_key_event(key_event(KeyCode::Char('/'))).unwrap();
+        app.handle_key_event(key_event(KeyCode::Char('q'))).unwrap();
+
+        assert!(app.detail_search_active);
+        assert_eq!(app.detail_search_query, "q");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn escape_clears_applied_detail_search_before_going_back() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        app.detail_return_state = Some(DetailReturnTarget::Listening);
+        app.detail_search_query = "signature".to_string();
+
+        app.handle_key_event(key_event(KeyCode::Esc)).unwrap();
+
+        assert!(matches!(app.state, AppState::ShowRequestDetail));
+        assert!(app.detail_search_query.is_empty());
+    }
+
+    #[test]
+    fn opening_detail_keeps_the_request_list_filter() {
+        let mut app = make_app_with_state(AppState::Listening);
+        app.listening_requests
+            .push_back(make_request("POST", "/billing"));
+        app.search_query = "billing".to_string();
+
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(app.state, AppState::ShowRequestDetail));
+        assert_eq!(app.search_query, "billing");
+        assert!(app.detail_search_query.is_empty());
     }
 
     #[test]
