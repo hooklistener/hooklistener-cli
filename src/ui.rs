@@ -1,5 +1,6 @@
 use crate::app::{
-    App, AppState, FeedbackKind, TRUNCATED_BODY_MARKER, TunnelRequest, fuzzy_matches,
+    App, AppState, DetailSearchTarget, FeedbackKind, TRUNCATED_BODY_MARKER, TunnelRequest,
+    detail_label_width, detail_match_indices, detail_value_width, sorted_headers,
 };
 use crate::syntax::JsonHighlighter;
 use crate::theme as colors;
@@ -1511,13 +1512,11 @@ fn draw_tunneling(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let show_search = app.detail_search_active || !app.detail_search_query.is_empty();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),                               // Tab bar
-            Constraint::Length(if show_search { 3 } else { 0 }), // Fuzzy search
-            Constraint::Min(0),                                  // Tab content
+            Constraint::Length(3), // Tab bar
+            Constraint::Min(0),    // Tab content
         ])
         .split(area);
 
@@ -1545,42 +1544,68 @@ fn draw_request_detail(frame: &mut Frame, app: &App, area: Rect) {
 
         frame.render_widget(tabs, chunks[0]);
 
-        if show_search {
-            draw_detail_search_bar(frame, app, chunks[1]);
-        }
-
         // Tab content
         match app.current_tab {
-            0 => draw_info_tab(frame, app, request, chunks[2]),
-            1 => draw_headers_tab(frame, app, request, chunks[2]),
-            2 => draw_body_tab(frame, app, request, chunks[2]),
-            3 => draw_response_tab(frame, app, chunks[2]),
+            0 => draw_info_tab(frame, app, request, chunks[1]),
+            1 => draw_headers_tab(frame, app, request, chunks[1]),
+            2 => draw_body_tab(frame, app, request, chunks[1]),
+            3 => draw_response_tab(frame, app, chunks[1]),
             _ => {}
         }
     }
 }
 
-fn draw_detail_search_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let border_color = if app.detail_search_active {
-        colors::PRIMARY
-    } else {
-        colors::MUTED
-    };
-    let cursor = if app.detail_search_active { "▎" } else { "" };
-    let title = if area.width >= 58 {
-        " Fuzzy filter: headers and body "
-    } else {
-        " Fuzzy filter "
-    };
-    let search = Paragraph::new(format!("/{}{}", app.detail_search_query, cursor))
-        .style(Style::default().fg(colors::TEXT))
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        );
-    frame.render_widget(search, area);
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn highlight_detail_search_match(
+    app: &App,
+    target: DetailSearchTarget,
+    line: Line<'static>,
+) -> Line<'static> {
+    if app.detail_search_matches().binary_search(&target).is_err() {
+        return line;
+    }
+
+    let indices = detail_match_indices(
+        &line_text(&line),
+        app.detail_search_text(),
+        app.detail_search_is_fuzzy(),
+    );
+    if indices.is_empty() {
+        return line;
+    }
+
+    let is_active = app.active_detail_search_match() == Some(target);
+    let line_style = line.style;
+    let alignment = line.alignment;
+    let mut highlighted_spans = Vec::new();
+    let mut char_index = 0;
+
+    for span in line.spans {
+        for ch in span.content.chars() {
+            let mut style = span.style;
+            if indices.binary_search(&char_index).is_ok() {
+                style = style.add_modifier(Modifier::REVERSED);
+                if is_active {
+                    style = style
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::UNDERLINED);
+                }
+            }
+            push_styled_char(&mut highlighted_spans, ch, style);
+            char_index += 1;
+        }
+    }
+
+    let mut highlighted = Line::from(highlighted_spans);
+    highlighted.style = line_style;
+    highlighted.alignment = alignment;
+    highlighted
 }
 
 fn draw_info_tab(
@@ -1595,6 +1620,8 @@ fn draw_info_tab(
 
     let mut rows = vec![
         info_table_row(
+            app,
+            0,
             "Method",
             Line::from(Span::styled(
                 request.method.clone(),
@@ -1605,6 +1632,8 @@ fn draw_info_tab(
             value_width,
         ),
         info_table_row(
+            app,
+            1,
             "URL",
             Line::from(Span::styled(
                 request.url.clone(),
@@ -1613,6 +1642,8 @@ fn draw_info_tab(
             value_width,
         ),
         info_table_row(
+            app,
+            2,
             "Remote IP",
             Line::from(Span::styled(
                 request.remote_addr.clone(),
@@ -1621,6 +1652,8 @@ fn draw_info_tab(
             value_width,
         ),
         info_table_row(
+            app,
+            3,
             "Timestamp",
             Line::from(Span::styled(
                 request.created_at.clone(),
@@ -1629,6 +1662,8 @@ fn draw_info_tab(
             value_width,
         ),
         info_table_row(
+            app,
+            4,
             "Content Length",
             Line::from(Span::styled(
                 request.content_length.to_string(),
@@ -1637,6 +1672,8 @@ fn draw_info_tab(
             value_width,
         ),
         info_table_row(
+            app,
+            5,
             "Request ID",
             Line::from(Span::styled(
                 request.id.clone(),
@@ -1648,6 +1685,8 @@ fn draw_info_tab(
 
     if !app.forward_url_input.is_empty() {
         rows.push(info_table_row(
+            app,
+            6,
             "Last Forward URL",
             Line::from(vec![
                 Span::styled(
@@ -1662,6 +1701,8 @@ fn draw_info_tab(
 
     if let Some(feedback) = &app.status_message {
         rows.push(info_table_row(
+            app,
+            rows.len(),
             "Status",
             Line::from(Span::styled(
                 format!("[{}] {}", feedback_label(feedback.kind), feedback.message),
@@ -1688,35 +1729,33 @@ fn draw_info_tab(
     frame.render_widget(info, area);
 }
 
-fn info_table_row(label: &'static str, value: Line<'static>, value_width: usize) -> Row<'static> {
-    let value_lines = wrap_styled_line(value, value_width, 2);
-    let row_height = lines_to_height(value_lines.len());
-
-    Row::new(vec![
-        Cell::from(Span::styled(
+fn info_table_row(
+    app: &App,
+    index: usize,
+    label: &'static str,
+    value: Line<'static>,
+    value_width: usize,
+) -> Row<'static> {
+    let target = DetailSearchTarget::Info(index);
+    let label = highlight_detail_search_match(
+        app,
+        target,
+        Line::from(Span::styled(
             label,
             Style::default()
                 .fg(colors::PRIMARY)
                 .add_modifier(Modifier::BOLD),
         )),
-        Cell::from(Text::from(value_lines)),
-    ])
-    .height(row_height)
+    );
+    let value = highlight_detail_search_match(app, target, value);
+    let value_lines = wrap_styled_line(value, value_width, 2);
+    let row_height = lines_to_height(value_lines.len());
+
+    Row::new(vec![Cell::from(label), Cell::from(Text::from(value_lines))]).height(row_height)
 }
 
 fn lines_to_height(line_count: usize) -> u16 {
     line_count.min(u16::MAX as usize).max(1) as u16
-}
-
-fn detail_label_width(total_width: usize, preferred_width: usize) -> usize {
-    total_width.saturating_sub(22).min(preferred_width).max(1)
-}
-
-fn detail_value_width(total_width: usize, label_width: usize) -> usize {
-    total_width
-        .saturating_sub(label_width)
-        .saturating_sub(2)
-        .max(1)
 }
 
 fn draw_headers_tab(
@@ -1725,29 +1764,18 @@ fn draw_headers_tab(
     request: &crate::models::WebhookRequest,
     area: Rect,
 ) {
-    let mut headers: Vec<(&String, &String)> = request.headers.iter().collect();
-    headers.sort_by(|(k1, _), (k2, _)| {
-        k1.to_ascii_lowercase()
-            .cmp(&k2.to_ascii_lowercase())
-            .then_with(|| k1.cmp(k2))
-    });
-    let total_headers = headers.len();
-    headers.retain(|(key, value)| {
-        fuzzy_matches(key, &app.detail_search_query)
-            || fuzzy_matches(value, &app.detail_search_query)
-    });
-    let matching_headers = headers.len();
-    let lines = if headers.is_empty() && !app.detail_search_query.is_empty() {
-        vec![no_fuzzy_matches_line()]
-    } else {
+    let headers = sorted_headers(&request.headers);
+    let lines = if app.detail_search_text().is_empty() {
         format_header_lines(&headers, detail_content_width(area))
+    } else {
+        format_searchable_header_lines(
+            &headers,
+            detail_content_width(area),
+            app,
+            HeaderSearchScope::Request,
+        )
     };
-    let title = filtered_section_title(
-        "Headers",
-        matching_headers,
-        total_headers,
-        &app.detail_search_query,
-    );
+    let title = format!("Headers ({})", headers.len());
 
     render_scrollable_lines(
         frame,
@@ -1757,21 +1785,6 @@ fn draw_headers_tab(
         colors::SECONDARY,
         area,
     );
-}
-
-fn filtered_section_title(label: &str, matching: usize, total: usize, query: &str) -> String {
-    if query.is_empty() {
-        format!("{} ({})", label, total)
-    } else {
-        format!("{} ({}/{})", label, matching, total)
-    }
-}
-
-fn no_fuzzy_matches_line() -> Line<'static> {
-    Line::from(Span::styled(
-        "(no fuzzy matches)",
-        Style::default().fg(colors::MUTED),
-    ))
 }
 
 /// Render an empty/missing body placeholder.
@@ -1793,6 +1806,29 @@ fn detail_content_width(area: Rect) -> usize {
 }
 
 fn format_header_lines(headers: &[(&String, &String)], width: usize) -> Vec<Line<'static>> {
+    format_header_lines_with_search(headers, width, None)
+}
+
+#[derive(Clone, Copy)]
+enum HeaderSearchScope {
+    Request,
+    Response,
+}
+
+fn format_searchable_header_lines(
+    headers: &[(&String, &String)],
+    width: usize,
+    app: &App,
+    scope: HeaderSearchScope,
+) -> Vec<Line<'static>> {
+    format_header_lines_with_search(headers, width, Some((app, scope)))
+}
+
+fn format_header_lines_with_search(
+    headers: &[(&String, &String)],
+    width: usize,
+    search: Option<(&App, HeaderSearchScope)>,
+) -> Vec<Line<'static>> {
     if headers.is_empty() {
         return vec![Line::from(Span::styled(
             "(no headers)",
@@ -1804,25 +1840,28 @@ fn format_header_lines(headers: &[(&String, &String)], width: usize) -> Vec<Line
     let value_width = detail_value_width(width, key_width);
     let mut lines = Vec::new();
 
-    for (key, value) in headers {
-        let key_lines = wrap_styled_line(
-            Line::from(Span::styled(
-                (*key).clone(),
-                Style::default()
-                    .fg(colors::PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            key_width,
-            0,
-        );
-        let value_lines = wrap_styled_line(
-            Line::from(Span::styled(
-                (*value).clone(),
-                Style::default().fg(colors::TEXT),
-            )),
-            value_width,
-            0,
-        );
+    for (index, (key, value)) in headers.iter().enumerate() {
+        let mut key_line = Line::from(Span::styled(
+            (*key).clone(),
+            Style::default()
+                .fg(colors::PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let mut value_line = Line::from(Span::styled(
+            (*value).clone(),
+            Style::default().fg(colors::TEXT),
+        ));
+        if let Some((app, scope)) = search {
+            let target = match scope {
+                HeaderSearchScope::Request => DetailSearchTarget::RequestHeader(index),
+                HeaderSearchScope::Response => DetailSearchTarget::ResponseHeader(index),
+            };
+            key_line = highlight_detail_search_match(app, target, key_line);
+            value_line = highlight_detail_search_match(app, target, value_line);
+        }
+
+        let key_lines = wrap_styled_line(key_line, key_width, 0);
+        let value_lines = wrap_styled_line(value_line, value_width, 0);
         let row_height = key_lines.len().max(value_lines.len());
 
         for line_index in 0..row_height {
@@ -1997,45 +2036,46 @@ fn char_display_width(ch: char) -> usize {
     Span::raw(encoded).width().max(1)
 }
 
+#[derive(Clone, Copy)]
+enum BodySearchScope {
+    Request,
+    Response,
+}
+
+struct HighlightedBodyOptions<'a> {
+    scroll_offset: usize,
+    section_title: &'a str,
+    border_color: Color,
+    app: &'a App,
+    scope: BodySearchScope,
+}
+
 /// Render a scrollable, syntax-highlighted body section.
 fn render_highlighted_body(
     frame: &mut Frame,
     content: &str,
-    scroll_offset: usize,
-    section_title: &str,
-    query: &str,
-    border_color: Color,
     area: Rect,
+    options: HighlightedBodyOptions<'_>,
 ) {
-    let mut highlighted_lines = JsonHighlighter::highlight_json(content);
-    let total_lines = highlighted_lines.len();
-    if !query.is_empty() {
-        highlighted_lines.retain(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            fuzzy_matches(&text, query)
-        });
-    }
-    let matching_lines = highlighted_lines.len();
-    if matching_lines == 0 {
-        highlighted_lines.push(no_fuzzy_matches_line());
-    }
+    let highlighted_lines = JsonHighlighter::highlight_json(content)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let target = match options.scope {
+                BodySearchScope::Request => DetailSearchTarget::RequestBody(index),
+                BodySearchScope::Response => DetailSearchTarget::ResponseBody(index),
+            };
+            highlight_detail_search_match(options.app, target, line)
+        })
+        .collect();
     let wrapped_lines = wrap_styled_lines(highlighted_lines, detail_content_width(area), 2);
-    let title = if query.is_empty() {
-        section_title.to_string()
-    } else {
-        format!("{} ({}/{})", section_title, matching_lines, total_lines)
-    };
 
     render_scrollable_lines(
         frame,
         wrapped_lines,
-        scroll_offset,
-        &title,
-        border_color,
+        options.scroll_offset,
+        options.section_title,
+        options.border_color,
         area,
     );
 }
@@ -2076,11 +2116,14 @@ fn draw_body_tab(
     render_highlighted_body(
         frame,
         body_content,
-        app.body_scroll_offset,
-        &format!("Body{}", title_extra),
-        &app.detail_search_query,
-        colors::SUCCESS,
         area,
+        HighlightedBodyOptions {
+            scroll_offset: app.body_scroll_offset,
+            section_title: &format!("Body{}", title_extra),
+            border_color: colors::SUCCESS,
+            app,
+            scope: BodySearchScope::Request,
+        },
     );
 }
 
@@ -2156,9 +2199,16 @@ fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(colors::ERROR)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(error.as_str(), Style::default().fg(colors::ERROR)),
+            Span::styled(error.clone(), Style::default().fg(colors::ERROR)),
         ]));
     }
+    let status_lines: Vec<_> = status_lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            highlight_detail_search_match(app, DetailSearchTarget::ResponseStatus(index), line)
+        })
+        .collect();
 
     let status_info = Paragraph::new(status_lines).block(
         Block::default()
@@ -2169,29 +2219,18 @@ fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(status_info, chunks[0]);
 
     // Section 2: Response headers
-    let mut headers: Vec<(&String, &String)> = resp.headers.iter().collect();
-    headers.sort_by(|(k1, _), (k2, _)| {
-        k1.to_ascii_lowercase()
-            .cmp(&k2.to_ascii_lowercase())
-            .then_with(|| k1.cmp(k2))
-    });
-    let total_headers = headers.len();
-    headers.retain(|(key, value)| {
-        fuzzy_matches(key, &app.detail_search_query)
-            || fuzzy_matches(value, &app.detail_search_query)
-    });
-    let matching_headers = headers.len();
-    let header_lines = if headers.is_empty() && !app.detail_search_query.is_empty() {
-        vec![no_fuzzy_matches_line()]
-    } else {
+    let headers = sorted_headers(&resp.headers);
+    let header_lines = if app.detail_search_text().is_empty() {
         format_header_lines(&headers, detail_content_width(chunks[1]))
+    } else {
+        format_searchable_header_lines(
+            &headers,
+            detail_content_width(chunks[1]),
+            app,
+            HeaderSearchScope::Response,
+        )
     };
-    let headers_title = filtered_section_title(
-        "Response Headers",
-        matching_headers,
-        total_headers,
-        &app.detail_search_query,
-    );
+    let headers_title = format!("Response Headers ({})", headers.len());
     render_scrollable_lines(
         frame,
         header_lines,
@@ -2207,11 +2246,14 @@ fn draw_response_tab(frame: &mut Frame, app: &App, area: Rect) {
             render_highlighted_body(
                 frame,
                 body_content,
-                app.response_scroll_offset,
-                "Response Body",
-                &app.detail_search_query,
-                colors::SUCCESS,
                 chunks[2],
+                HighlightedBodyOptions {
+                    scroll_offset: app.response_scroll_offset,
+                    section_title: "Response Body",
+                    border_color: colors::SUCCESS,
+                    app,
+                    scope: BodySearchScope::Response,
+                },
             );
         }
         Some(_) => {
@@ -2813,10 +2855,22 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let (status_text, shortcuts, compact_shortcuts) = match &app.state {
         AppState::ShowRequestDetail => {
             if app.detail_search_active {
+                let match_status = match app.detail_search_progress() {
+                    Some((current, total)) if total > 0 => {
+                        let kind = if app.detail_search_is_fuzzy() {
+                            "fuzzy"
+                        } else {
+                            "exact"
+                        };
+                        format!("Match {current} of {total} ({kind})")
+                    }
+                    Some(_) => "No matches".to_string(),
+                    None => "Type to find".to_string(),
+                };
                 (
-                    "Fuzzy filter".to_string(),
-                    "Type to filter | Enter Apply | Esc Clear".to_string(),
-                    None,
+                    format!("Find /{}▎", app.detail_search_text()),
+                    format!("{match_status} | Enter Done | Esc Cancel"),
+                    Some(format!("{match_status} | Enter Done | Esc Cancel")),
                 )
             } else {
                 let replay =
@@ -2825,18 +2879,43 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     } else {
                         ""
                     };
-                let search = if app.detail_search_query.is_empty() {
-                    "/ Fuzzy"
+                if let Some((current, total)) = app.detail_search_progress() {
+                    if total == 0 {
+                        (
+                            "No matches".to_string(),
+                            format!(
+                                "/ Edit | Esc Clear | Tab Tabs | ↑↓ Scroll | F Forward{replay} | E Export | B Back | Q Quit"
+                            ),
+                            Some(
+                                "/ Edit | Esc Clear | Tab | ↑↓ | F Forward | B Back | Q Quit"
+                                    .to_string(),
+                            ),
+                        )
+                    } else {
+                        let kind = if app.detail_search_is_fuzzy() {
+                            "fuzzy"
+                        } else {
+                            "exact"
+                        };
+                        (
+                            format!("Match {current} of {total}"),
+                            format!(
+                                "{kind} | n/N Next/Prev | / Edit | Esc Clear | Tab Tabs | ↑↓ Scroll | F Forward{replay} | E Export | B Back | Q Quit"
+                            ),
+                            Some(format!(
+                                "{kind} | n/N | / Edit | Esc Clear | Tab | ↑↓ | F Forward | B Back | Q Quit"
+                            )),
+                        )
+                    }
                 } else {
-                    "Esc Clear | / Fuzzy"
-                };
-                (
-                    "Request".to_string(),
-                    format!(
-                        "Tab Tabs | ↑↓ Scroll | {search} | F Forward{replay} | E Export | B Back | Q Quit"
-                    ),
-                    Some(format!("Tab | ↑↓ | {search} | F Forward | B Back | Q Quit")),
-                )
+                    (
+                        "Request".to_string(),
+                        format!(
+                            "Tab Tabs | ↑↓ Scroll | / Find | F Forward{replay} | E Export | B Back | Q Quit"
+                        ),
+                        Some("Tab | ↑↓ | / Find | F Forward | B Back | Q Quit".to_string()),
+                    )
+                }
             }
         }
         AppState::InputForwardUrl => (
@@ -2898,7 +2977,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let (status_text, status_color) = if let Some(feedback) = &app.status_message {
+    let search_has_focus =
+        matches!(app.state, AppState::ShowRequestDetail) && app.detail_search_active;
+    let (status_text, status_color) = if let Some(feedback) = &app.status_message
+        && !search_has_focus
+    {
         (
             format!("{} {}", feedback_label(feedback.kind), feedback.message),
             feedback_color(feedback.kind),
@@ -2956,6 +3039,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use chrono::{Duration as ChronoDuration, Utc};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -2985,6 +3069,19 @@ mod tests {
         }
 
         lines.join("\n")
+    }
+
+    fn apply_detail_search(app: &mut App, query: &str, keep_editor_open: bool) {
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .expect("find should open");
+        for ch in query.chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("find query should accept text");
+        }
+        if !keep_editor_open {
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .expect("find query should apply");
+        }
     }
 
     fn render_tunnel_80x24_to_buffer() -> Buffer {
@@ -3340,47 +3437,113 @@ mod tests {
     }
 
     #[test]
-    fn request_detail_fuzzy_filters_headers_by_subsequence() {
+    fn request_detail_fuzzy_find_preserves_header_context() {
         let mut app = App::with_config(valid_test_config());
         app.state = AppState::ShowRequestDetail;
         app.current_tab = 1;
         app.selected_request = Some(make_detail_request());
-        app.detail_search_query = "cntyp".to_string();
+        apply_detail_search(&mut app, "cntyp", false);
 
         let rendered = render_app_to_text(&app, 110, 24);
 
-        assert!(rendered.contains("Headers (1/4)"));
+        assert!(rendered.contains("Headers (4)"));
         assert!(rendered.contains("content-type"));
-        assert!(!rendered.contains("user-agent"));
+        assert!(rendered.contains("user-agent"));
+        assert!(rendered.contains("Match 1 of 1"));
+        assert!(rendered.contains("fuzzy"));
     }
 
     #[test]
-    fn request_detail_fuzzy_filters_formatted_body_lines() {
+    fn request_detail_find_visually_distinguishes_matches_and_active_match() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.current_tab = 1;
+        app.selected_request = Some(make_detail_request());
+        apply_detail_search(&mut app, "a", false);
+
+        let buffer = render_app_to_buffer(&app, 110, 24);
+        let highlighted_cells: Vec<_> = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .collect();
+
+        assert!(!highlighted_cells.is_empty());
+        assert!(
+            highlighted_cells
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::UNDERLINED))
+        );
+        assert!(
+            highlighted_cells
+                .iter()
+                .any(|cell| !cell.modifier.contains(Modifier::UNDERLINED))
+        );
+    }
+
+    #[test]
+    fn request_detail_find_scrolls_to_a_wrapped_header_at_80_columns() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.current_tab = 1;
+        let mut request = make_detail_request();
+        request.headers = (0..10)
+            .map(|index| (format!("a-header-{index:02}"), "x".repeat(200)))
+            .chain([("z-needle".to_string(), "target".to_string())])
+            .collect();
+        app.selected_request = Some(request);
+        app.set_detail_content_width(76);
+        apply_detail_search(&mut app, "needle", false);
+
+        let rendered = render_app_to_text(&app, 80, 24);
+
+        assert!(rendered.contains("z-needle"));
+    }
+
+    #[test]
+    fn request_detail_find_preserves_formatted_body_structure() {
         let mut app = App::with_config(valid_test_config());
         app.state = AppState::ShowRequestDetail;
         app.current_tab = 2;
         app.selected_request = Some(make_detail_request());
-        app.detail_search_query = "rpstry".to_string();
+        apply_detail_search(&mut app, "rpstry", false);
 
         let rendered = render_app_to_text(&app, 110, 24);
 
         assert!(rendered.contains("\"repository\": {"));
-        assert!(!rendered.contains("\"ref\": \"refs/heads/main\""));
+        assert!(rendered.contains("\"ref\": \"refs/heads/main\""));
+        assert!(rendered.contains("Match 1 of 1"));
     }
 
     #[test]
-    fn request_detail_active_fuzzy_search_shows_input_help() {
+    fn request_detail_active_find_uses_status_bar_without_reducing_content() {
         let mut app = App::with_config(valid_test_config());
         app.state = AppState::ShowRequestDetail;
         app.current_tab = 2;
         app.selected_request = Some(make_detail_request());
-        app.detail_search_active = true;
-        app.detail_search_query = "repo".to_string();
+        apply_detail_search(&mut app, "repo", true);
 
         let rendered = render_app_to_text(&app, 110, 24);
 
-        assert!(rendered.contains("Fuzzy filter: headers and body"));
-        assert!(rendered.contains("Type to filter | Enter Apply | Esc Clear"));
+        assert!(rendered.contains("Find /repo▎"));
+        assert!(rendered.contains("Match 1 of 1 (exact) | Enter Done | Esc Cancel"));
+        assert!(rendered.contains("\"ref\": \"refs/heads/main\""));
+    }
+
+    #[test]
+    fn request_detail_find_keeps_navigation_and_clear_controls_at_80_columns() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::ShowRequestDetail;
+        app.current_tab = 2;
+        app.selected_request = Some(make_detail_request());
+        apply_detail_search(&mut app, "repo", false);
+
+        let rendered = render_app_to_text(&app, 80, 24);
+
+        assert!(rendered.contains("Match 1 of 1"));
+        assert!(rendered.contains("n/N"));
+        assert!(rendered.contains("/ Edit"));
+        assert!(rendered.contains("Esc Clear"));
     }
 
     #[test]
@@ -3413,12 +3576,11 @@ mod tests {
     }
 
     #[test]
-    fn request_detail_fuzzy_filters_response_headers_and_body() {
+    fn request_detail_find_searches_response_as_one_sequence() {
         let mut app = App::with_config(valid_test_config());
         app.state = AppState::ShowRequestDetail;
         app.current_tab = 3;
         app.selected_request = Some(make_detail_request());
-        app.detail_search_query = "que".to_string();
         app.selected_tunnel_response = Some(crate::app::TunnelResponseData {
             status: Some(202),
             headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
@@ -3426,12 +3588,14 @@ mod tests {
             duration_ms: Some(64),
             error: None,
         });
+        apply_detail_search(&mut app, "que", false);
 
         let rendered = render_app_to_text(&app, 110, 28);
 
-        assert!(rendered.contains("Response Headers (0/1)"));
+        assert!(rendered.contains("Response Headers (1)"));
         assert!(rendered.contains("\"queue\": \"webhook-forwarder\""));
-        assert!(!rendered.contains("\"accepted\": true"));
+        assert!(rendered.contains("\"accepted\": true"));
+        assert!(rendered.contains("Match 1 of 1"));
     }
 
     #[test]

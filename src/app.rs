@@ -5,6 +5,7 @@ use crate::models::{ForwardResponse, WebhookRequest};
 use crate::syntax::JsonHighlighter;
 use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::text::Span;
 use std::collections::{HashMap, VecDeque};
 
 pub const MAX_LISTENING_REQUESTS: usize = 500;
@@ -225,30 +226,88 @@ pub fn truncate_body(body: Option<String>) -> Option<String> {
 }
 
 const VIEWPORT_LINES: usize = 20;
-const DETAIL_SCROLL_WRAP_WIDTH: usize = 100;
+const DEFAULT_DETAIL_CONTENT_WIDTH: usize = 100;
 
-pub(crate) fn fuzzy_matches(text: &str, query: &str) -> bool {
-    let mut query_chars = query.chars().flat_map(char::to_lowercase);
-    let Some(mut expected) = query_chars.next() else {
-        return true;
-    };
+fn chars_equal_ignore_case(left: char, right: char) -> bool {
+    left.to_lowercase().eq(right.to_lowercase())
+}
 
-    for candidate in text.chars().flat_map(char::to_lowercase) {
-        if candidate != expected {
+fn fuzzy_match_indices(text: &str, query: &str) -> Option<Vec<usize>> {
+    let query_chars: Vec<char> = query.chars().collect();
+    if query_chars.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut matched_indices = Vec::with_capacity(query_chars.len());
+    let mut query_index = 0;
+
+    for (candidate_index, candidate) in text.chars().enumerate() {
+        if !chars_equal_ignore_case(candidate, query_chars[query_index]) {
             continue;
         }
 
-        let Some(next) = query_chars.next() else {
-            return true;
-        };
-        expected = next;
+        matched_indices.push(candidate_index);
+        query_index += 1;
+        if query_index == query_chars.len() {
+            return Some(matched_indices);
+        }
     }
 
-    false
+    None
 }
 
-fn header_matches_query(key: &str, value: &str, query: &str) -> bool {
-    fuzzy_matches(key, query) || fuzzy_matches(value, query)
+fn exact_match_indices(text: &str, query: &str) -> Option<Vec<usize>> {
+    let text_chars: Vec<char> = text.chars().collect();
+    let query_chars: Vec<char> = query.chars().collect();
+    if query_chars.is_empty() {
+        return Some(Vec::new());
+    }
+    if query_chars.len() > text_chars.len() {
+        return None;
+    }
+
+    let mut matched = vec![false; text_chars.len()];
+    let mut found = false;
+    for start in 0..=text_chars.len() - query_chars.len() {
+        if text_chars[start..start + query_chars.len()]
+            .iter()
+            .zip(&query_chars)
+            .all(|(&candidate, &expected)| chars_equal_ignore_case(candidate, expected))
+        {
+            matched[start..start + query_chars.len()].fill(true);
+            found = true;
+        }
+    }
+
+    found.then(|| {
+        matched
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, is_match)| is_match.then_some(index))
+            .collect()
+    })
+}
+
+pub(crate) fn fuzzy_matches(text: &str, query: &str) -> bool {
+    fuzzy_match_indices(text, query).is_some()
+}
+
+pub(crate) fn detail_match_indices(text: &str, query: &str, fuzzy: bool) -> Vec<usize> {
+    if fuzzy {
+        fuzzy_match_indices(text, query).unwrap_or_default()
+    } else {
+        exact_match_indices(text, query).unwrap_or_default()
+    }
+}
+
+pub(crate) fn sorted_headers(headers: &HashMap<String, String>) -> Vec<(&String, &String)> {
+    let mut headers: Vec<_> = headers.iter().collect();
+    headers.sort_by(|(k1, _), (k2, _)| {
+        k1.to_ascii_lowercase()
+            .cmp(&k2.to_ascii_lowercase())
+            .then_with(|| k1.cmp(k2))
+    });
+    headers
 }
 
 fn parse_query_string(query_string: &str) -> HashMap<String, String> {
@@ -276,44 +335,90 @@ fn parse_query_string(query_string: &str) -> HashMap<String, String> {
 }
 
 /// Compute the maximum scroll offset for a text body given a fixed viewport.
-fn max_body_scroll(text: &str, query: &str) -> usize {
+fn max_body_scroll(text: &str, width: usize) -> usize {
     let display_text = JsonHighlighter::format_json_for_display(text);
     let line_count = display_text
         .lines()
-        .filter(|line| fuzzy_matches(line, query))
-        .map(|line| visual_line_count(line, DETAIL_SCROLL_WRAP_WIDTH))
+        .map(|line| visual_line_count(line, width, 2))
         .sum::<usize>()
         .max(1);
     line_count.saturating_sub(VIEWPORT_LINES)
 }
 
-fn max_headers_scroll(headers: &HashMap<String, String>, query: &str) -> usize {
-    let matching_headers = headers
-        .iter()
-        .filter(|(key, value)| header_matches_query(key, value, query));
-    let entry_bound = matching_headers.clone().count().saturating_sub(1);
-    let visual_bound = headers
-        .iter()
-        .filter(|(key, value)| header_matches_query(key, value, query))
-        .map(|(key, value)| {
-            visual_line_count(&format!("{}: {}", key, value), DETAIL_SCROLL_WRAP_WIDTH)
-        })
+fn max_headers_scroll(headers: &HashMap<String, String>, width: usize) -> usize {
+    let entry_bound = headers.len().saturating_sub(1);
+    let visual_bound = sorted_headers(headers)
+        .into_iter()
+        .map(|(key, value)| header_visual_line_count(key, value, width))
         .sum::<usize>()
         .saturating_sub(VIEWPORT_LINES);
 
     entry_bound.max(visual_bound)
 }
 
-fn visual_line_count(text: &str, width: usize) -> usize {
+fn visual_line_count(text: &str, width: usize, continuation_indent: usize) -> usize {
     let width = width.max(1);
-    let mut count = 0;
+    let indent = continuation_indent.min(width.saturating_sub(1));
+    let mut count = 1;
+    let mut current_width = 0;
 
-    for line in text.lines() {
-        let line_width = line.chars().count().max(1);
-        count += line_width.div_ceil(width);
+    for ch in text.chars() {
+        let ch_width = Span::raw(ch.to_string()).width().max(1);
+        if current_width > 0 && current_width + ch_width > width {
+            count += 1;
+            current_width = indent;
+        }
+        current_width += ch_width;
     }
 
-    count.max(1)
+    count
+}
+
+pub(crate) fn detail_label_width(total_width: usize, preferred_width: usize) -> usize {
+    total_width.saturating_sub(22).min(preferred_width).max(1)
+}
+
+pub(crate) fn detail_value_width(total_width: usize, label_width: usize) -> usize {
+    total_width
+        .saturating_sub(label_width)
+        .saturating_sub(2)
+        .max(1)
+}
+
+fn header_visual_line_count(key: &str, value: &str, width: usize) -> usize {
+    let key_width = detail_label_width(width, 28);
+    let value_width = detail_value_width(width, key_width);
+    visual_line_count(key, key_width, 0).max(visual_line_count(value, value_width, 0))
+}
+
+fn body_line_scroll_offset(text: &str, line_index: usize, width: usize) -> usize {
+    JsonHighlighter::format_json_for_display(text)
+        .lines()
+        .take(line_index)
+        .map(|line| visual_line_count(line, width, 2))
+        .sum()
+}
+
+fn header_scroll_offset(
+    headers: &HashMap<String, String>,
+    header_index: usize,
+    width: usize,
+) -> usize {
+    sorted_headers(headers)
+        .into_iter()
+        .take(header_index)
+        .map(|(key, value)| header_visual_line_count(key, value, width))
+        .sum()
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DetailSearchTarget {
+    Info(usize),
+    RequestHeader(usize),
+    RequestBody(usize),
+    ResponseStatus(usize),
+    ResponseHeader(usize),
+    ResponseBody(usize),
 }
 
 pub struct App {
@@ -373,9 +478,15 @@ pub struct App {
     pub search_active: bool,
     pub search_query: String,
 
-    // Fuzzy filter within request/response details
+    // Find within request/response details
     pub detail_search_active: bool,
     pub detail_search_query: String,
+    detail_search_input: String,
+    detail_search_matches: Vec<DetailSearchTarget>,
+    detail_search_match_index: usize,
+    detail_search_saved_match_index: usize,
+    detail_search_is_fuzzy: bool,
+    detail_content_width: usize,
 }
 
 impl App {
@@ -433,6 +544,12 @@ impl App {
             search_query: String::new(),
             detail_search_active: false,
             detail_search_query: String::new(),
+            detail_search_input: String::new(),
+            detail_search_matches: Vec::new(),
+            detail_search_match_index: 0,
+            detail_search_saved_match_index: 0,
+            detail_search_is_fuzzy: false,
+            detail_content_width: DEFAULT_DETAIL_CONTENT_WIDTH,
         }
     }
 
@@ -467,7 +584,7 @@ impl App {
     fn max_response_headers_scroll(&self) -> usize {
         self.selected_tunnel_response
             .as_ref()
-            .map(|r| max_headers_scroll(&r.headers, &self.detail_search_query))
+            .map(|r| max_headers_scroll(&r.headers, self.detail_content_width))
             .unwrap_or(0)
     }
 
@@ -476,6 +593,232 @@ impl App {
         self.body_scroll_offset = 0;
         self.response_headers_scroll_offset = 0;
         self.response_scroll_offset = 0;
+    }
+
+    pub(crate) fn detail_search_text(&self) -> &str {
+        if self.detail_search_active {
+            &self.detail_search_input
+        } else {
+            &self.detail_search_query
+        }
+    }
+
+    pub(crate) fn detail_search_matches(&self) -> &[DetailSearchTarget] {
+        &self.detail_search_matches
+    }
+
+    pub(crate) fn active_detail_search_match(&self) -> Option<DetailSearchTarget> {
+        self.detail_search_matches
+            .get(self.detail_search_match_index)
+            .copied()
+    }
+
+    pub(crate) fn detail_search_progress(&self) -> Option<(usize, usize)> {
+        if self.detail_search_text().is_empty() {
+            None
+        } else {
+            Some((
+                self.detail_search_match_index
+                    .min(self.detail_search_matches.len().saturating_sub(1))
+                    + usize::from(!self.detail_search_matches.is_empty()),
+                self.detail_search_matches.len(),
+            ))
+        }
+    }
+
+    pub(crate) fn detail_search_is_fuzzy(&self) -> bool {
+        self.detail_search_is_fuzzy
+    }
+
+    pub fn set_detail_content_width(&mut self, width: usize) {
+        let width = width.max(1);
+        if self.detail_content_width == width {
+            return;
+        }
+
+        self.detail_content_width = width;
+        self.scroll_to_active_detail_search_match();
+    }
+
+    fn clear_detail_search(&mut self) {
+        self.detail_search_active = false;
+        self.detail_search_query.clear();
+        self.detail_search_input.clear();
+        self.detail_search_matches.clear();
+        self.detail_search_match_index = 0;
+        self.detail_search_saved_match_index = 0;
+        self.detail_search_is_fuzzy = false;
+        self.reset_detail_scroll();
+    }
+
+    fn detail_targets_matching<F>(&self, matches: F) -> Vec<DetailSearchTarget>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut targets = Vec::new();
+
+        match self.current_tab {
+            0 => {
+                let Some(request) = &self.selected_request else {
+                    return targets;
+                };
+                let content_length = request.content_length.to_string();
+                let mut fields = vec![
+                    ("Method", request.method.as_str()),
+                    ("URL", request.url.as_str()),
+                    ("Remote IP", request.remote_addr.as_str()),
+                    ("Timestamp", request.created_at.as_str()),
+                    ("Content Length", content_length.as_str()),
+                    ("Request ID", request.id.as_str()),
+                ];
+                if !self.forward_url_input.is_empty() {
+                    fields.push(("Last Forward URL", self.forward_url_input.as_str()));
+                }
+
+                for (index, (label, value)) in fields.into_iter().enumerate() {
+                    if matches(label) || matches(value) {
+                        targets.push(DetailSearchTarget::Info(index));
+                    }
+                }
+            }
+            1 => {
+                if let Some(request) = &self.selected_request {
+                    for (index, (key, value)) in sorted_headers(&request.headers).iter().enumerate()
+                    {
+                        if matches(key) || matches(value) {
+                            targets.push(DetailSearchTarget::RequestHeader(index));
+                        }
+                    }
+                }
+            }
+            2 => {
+                if let Some(body) = self.selected_body_text() {
+                    let display_body = JsonHighlighter::format_json_for_display(body);
+                    for (index, line) in display_body.lines().enumerate() {
+                        if matches(line) {
+                            targets.push(DetailSearchTarget::RequestBody(index));
+                        }
+                    }
+                }
+            }
+            3 => {
+                let Some(response) = &self.selected_tunnel_response else {
+                    return targets;
+                };
+                let status = response
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "Pending".to_string());
+                if matches("Status") || matches(&status) {
+                    targets.push(DetailSearchTarget::ResponseStatus(0));
+                }
+
+                let duration = response
+                    .duration_ms
+                    .map(|duration| format!("{duration}ms"))
+                    .unwrap_or_else(|| "-".to_string());
+                if matches("Duration") || matches(&duration) {
+                    targets.push(DetailSearchTarget::ResponseStatus(1));
+                }
+
+                if let Some(error) = &response.error
+                    && (matches("Error") || matches(error))
+                {
+                    targets.push(DetailSearchTarget::ResponseStatus(2));
+                }
+
+                for (index, (key, value)) in sorted_headers(&response.headers).iter().enumerate() {
+                    if matches(key) || matches(value) {
+                        targets.push(DetailSearchTarget::ResponseHeader(index));
+                    }
+                }
+
+                if let Some(body) = &response.body {
+                    let display_body = JsonHighlighter::format_json_for_display(body);
+                    for (index, line) in display_body.lines().enumerate() {
+                        if matches(line) {
+                            targets.push(DetailSearchTarget::ResponseBody(index));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        targets
+    }
+
+    fn refresh_detail_search_matches(&mut self) {
+        self.detail_search_matches.clear();
+        self.detail_search_match_index = 0;
+        self.detail_search_is_fuzzy = false;
+
+        let query = self.detail_search_text().to_string();
+        if query.is_empty() {
+            self.reset_detail_scroll();
+            return;
+        }
+
+        self.detail_search_matches =
+            self.detail_targets_matching(|text| exact_match_indices(text, &query).is_some());
+        if self.detail_search_matches.is_empty() {
+            self.detail_search_matches =
+                self.detail_targets_matching(|text| fuzzy_matches(text, &query));
+            self.detail_search_is_fuzzy = !self.detail_search_matches.is_empty();
+        }
+
+        self.reset_detail_scroll();
+        self.scroll_to_active_detail_search_match();
+    }
+
+    fn scroll_to_active_detail_search_match(&mut self) {
+        let Some(target) = self.active_detail_search_match() else {
+            return;
+        };
+
+        match target {
+            DetailSearchTarget::Info(_) | DetailSearchTarget::ResponseStatus(_) => {}
+            DetailSearchTarget::RequestHeader(index) => {
+                if let Some(request) = &self.selected_request {
+                    self.headers_scroll_offset =
+                        header_scroll_offset(&request.headers, index, self.detail_content_width);
+                }
+            }
+            DetailSearchTarget::RequestBody(index) => {
+                if let Some(body) = self.selected_body_text() {
+                    self.body_scroll_offset =
+                        body_line_scroll_offset(body, index, self.detail_content_width);
+                }
+            }
+            DetailSearchTarget::ResponseHeader(index) => {
+                if let Some(response) = &self.selected_tunnel_response {
+                    self.response_headers_scroll_offset =
+                        header_scroll_offset(&response.headers, index, self.detail_content_width);
+                }
+            }
+            DetailSearchTarget::ResponseBody(index) => {
+                if let Some(body) = self.response_body_text() {
+                    self.response_scroll_offset =
+                        body_line_scroll_offset(body, index, self.detail_content_width);
+                }
+            }
+        }
+    }
+
+    fn move_detail_search_match(&mut self, forward: bool) {
+        let match_count = self.detail_search_matches.len();
+        if match_count == 0 {
+            return;
+        }
+
+        self.detail_search_match_index = if forward {
+            (self.detail_search_match_index + 1) % match_count
+        } else {
+            self.detail_search_match_index
+                .checked_sub(1)
+                .unwrap_or(match_count - 1)
+        };
+        self.scroll_to_active_detail_search_match();
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
@@ -487,19 +830,26 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.detail_search_active = false;
-                    self.detail_search_query.clear();
-                    self.reset_detail_scroll();
+                    self.detail_search_input.clear();
+                    let saved_match_index = self.detail_search_saved_match_index;
+                    self.refresh_detail_search_matches();
+                    if !self.detail_search_matches.is_empty() {
+                        self.detail_search_match_index =
+                            saved_match_index.min(self.detail_search_matches.len() - 1);
+                        self.scroll_to_active_detail_search_match();
+                    }
                 }
                 KeyCode::Enter => {
+                    self.detail_search_query = std::mem::take(&mut self.detail_search_input);
                     self.detail_search_active = false;
                 }
                 KeyCode::Backspace => {
-                    self.detail_search_query.pop();
-                    self.reset_detail_scroll();
+                    self.detail_search_input.pop();
+                    self.refresh_detail_search_matches();
                 }
                 KeyCode::Char(c) => {
-                    self.detail_search_query.push(c);
-                    self.reset_detail_scroll();
+                    self.detail_search_input.push(c);
+                    self.refresh_detail_search_matches();
                 }
                 _ => {}
             }
@@ -513,14 +863,11 @@ impl App {
                         self.should_quit = true;
                     }
                     KeyCode::Esc if !self.detail_search_query.is_empty() => {
-                        self.detail_search_query.clear();
-                        self.reset_detail_scroll();
+                        self.clear_detail_search();
                     }
                     KeyCode::Char('b') | KeyCode::Esc => {
                         self.current_tab = 0;
-                        self.reset_detail_scroll();
-                        self.detail_search_active = false;
-                        self.detail_search_query.clear();
+                        self.clear_detail_search();
                         self.selected_tunnel_response = None;
                         self.state = match self.detail_return_state {
                             Some(DetailReturnTarget::Tunneling) => AppState::Tunneling,
@@ -551,11 +898,12 @@ impl App {
                     }
                     KeyCode::Char('/') => {
                         self.detail_search_active = true;
-                        self.detail_search_query.clear();
-                        self.reset_detail_scroll();
+                        self.detail_search_input = self.detail_search_query.clone();
+                        self.detail_search_saved_match_index = self.detail_search_match_index;
                     }
                     KeyCode::Tab | KeyCode::Right => {
                         self.current_tab = (self.current_tab + 1) % self.num_detail_tabs();
+                        self.refresh_detail_search_matches();
                     }
                     KeyCode::BackTab | KeyCode::Left => {
                         let num_tabs = self.num_detail_tabs();
@@ -564,6 +912,13 @@ impl App {
                         } else {
                             self.current_tab - 1
                         };
+                        self.refresh_detail_search_matches();
+                    }
+                    KeyCode::Char('n') if !self.detail_search_query.is_empty() => {
+                        self.move_detail_search_match(true);
+                    }
+                    KeyCode::Char('N') if !self.detail_search_query.is_empty() => {
+                        self.move_detail_search_match(false);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         match self.current_tab {
@@ -588,7 +943,7 @@ impl App {
                         1 => {
                             if let Some(request) = &self.selected_request {
                                 let max =
-                                    max_headers_scroll(&request.headers, &self.detail_search_query);
+                                    max_headers_scroll(&request.headers, self.detail_content_width);
                                 if self.headers_scroll_offset < max {
                                     self.headers_scroll_offset += 1;
                                 }
@@ -596,7 +951,7 @@ impl App {
                         }
                         2 => {
                             if let Some(body) = self.selected_body_text() {
-                                let max = max_body_scroll(body, &self.detail_search_query);
+                                let max = max_body_scroll(body, self.detail_content_width);
                                 if self.body_scroll_offset < max {
                                     self.body_scroll_offset += 1;
                                 }
@@ -607,7 +962,7 @@ impl App {
                             if self.response_headers_scroll_offset < headers_max {
                                 self.response_headers_scroll_offset += 1;
                             } else if let Some(body) = self.response_body_text() {
-                                let body_max = max_body_scroll(body, &self.detail_search_query);
+                                let body_max = max_body_scroll(body, self.detail_content_width);
                                 if self.response_scroll_offset < body_max {
                                     self.response_scroll_offset += 1;
                                 }
@@ -637,14 +992,14 @@ impl App {
                         1 => {
                             if let Some(request) = &self.selected_request {
                                 let max =
-                                    max_headers_scroll(&request.headers, &self.detail_search_query);
+                                    max_headers_scroll(&request.headers, self.detail_content_width);
                                 self.headers_scroll_offset =
                                     (self.headers_scroll_offset + 10).min(max);
                             }
                         }
                         2 => {
                             if let Some(body) = self.selected_body_text() {
-                                let max = max_body_scroll(body, &self.detail_search_query);
+                                let max = max_body_scroll(body, self.detail_content_width);
                                 self.body_scroll_offset = (self.body_scroll_offset + 10).min(max);
                             }
                         }
@@ -659,7 +1014,7 @@ impl App {
                             if remaining > 0
                                 && let Some(body) = self.response_body_text()
                             {
-                                let body_max = max_body_scroll(body, &self.detail_search_query);
+                                let body_max = max_body_scroll(body, self.detail_content_width);
                                 self.response_scroll_offset =
                                     (self.response_scroll_offset + remaining).min(body_max);
                             }
@@ -679,13 +1034,13 @@ impl App {
                         1 => {
                             if let Some(request) = &self.selected_request {
                                 self.headers_scroll_offset =
-                                    max_headers_scroll(&request.headers, &self.detail_search_query);
+                                    max_headers_scroll(&request.headers, self.detail_content_width);
                             }
                         }
                         2 => {
                             if let Some(body) = self.selected_body_text() {
                                 self.body_scroll_offset =
-                                    max_body_scroll(body, &self.detail_search_query);
+                                    max_body_scroll(body, self.detail_content_width);
                             }
                         }
                         3 => {
@@ -693,7 +1048,7 @@ impl App {
                                 self.max_response_headers_scroll();
                             if let Some(body) = self.response_body_text() {
                                 self.response_scroll_offset =
-                                    max_body_scroll(body, &self.detail_search_query);
+                                    max_body_scroll(body, self.detail_content_width);
                             } else {
                                 self.response_scroll_offset = 0;
                             }
@@ -762,9 +1117,7 @@ impl App {
                             {
                                 self.selected_request = Some(request.clone());
                                 self.current_tab = 0;
-                                self.reset_detail_scroll();
-                                self.detail_search_active = false;
-                                self.detail_search_query.clear();
+                                self.clear_detail_search();
                                 self.detail_return_state = Some(DetailReturnTarget::Listening);
                                 self.state = AppState::ShowRequestDetail;
                             }
@@ -983,6 +1336,7 @@ impl App {
                 }
                 KeyCode::Esc => {
                     self.state = AppState::ShowRequestDetail;
+                    self.refresh_detail_search_matches();
                 }
                 _ => {}
             },
@@ -992,6 +1346,7 @@ impl App {
                 }
                 KeyCode::Char('b') | KeyCode::Esc => {
                     self.state = AppState::ShowRequestDetail;
+                    self.refresh_detail_search_matches();
                 }
                 _ => {}
             },
@@ -1001,6 +1356,7 @@ impl App {
                 }
                 KeyCode::Char('b') | KeyCode::Esc => {
                     self.state = AppState::ShowRequestDetail;
+                    self.refresh_detail_search_matches();
                 }
                 KeyCode::Char('r') => {
                     if self.selected_request.is_some() && self.is_valid_url(&self.forward_url_input)
@@ -1614,9 +1970,7 @@ impl App {
         });
 
         self.current_tab = 0;
-        self.reset_detail_scroll();
-        self.detail_search_active = false;
-        self.detail_search_query.clear();
+        self.clear_detail_search();
         self.detail_return_state = Some(DetailReturnTarget::Tunneling);
         self.state = AppState::ShowRequestDetail;
     }
@@ -1677,6 +2031,14 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    fn apply_detail_search(app: &mut App, query: &str) {
+        app.handle_key_event(key_event(KeyCode::Char('/'))).unwrap();
+        for ch in query.chars() {
+            app.handle_key_event(key_event(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key_event(key_event(KeyCode::Enter)).unwrap();
     }
 
     fn make_app_with_state(state: AppState) -> App {
@@ -1943,15 +2305,144 @@ mod tests {
     }
 
     #[test]
-    fn slash_starts_fuzzy_search_in_request_detail() {
+    fn slash_starts_find_in_request_detail() {
         let mut app = make_app_with_state(AppState::ShowRequestDetail);
 
         app.handle_key_event(key_event(KeyCode::Char('/'))).unwrap();
         app.handle_key_event(key_event(KeyCode::Char('q'))).unwrap();
 
         assert!(app.detail_search_active);
-        assert_eq!(app.detail_search_query, "q");
+        assert_eq!(app.detail_search_text(), "q");
+        assert!(app.detail_search_query.is_empty());
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn detail_find_prefers_exact_matches_over_fuzzy_matches() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        let mut request = make_request("POST", "/webhook");
+        request.body = Some("repository\nr-e-p-o".to_string());
+        app.selected_request = Some(request);
+        app.current_tab = 2;
+
+        apply_detail_search(&mut app, "repo");
+
+        assert_eq!(
+            app.detail_search_matches,
+            [DetailSearchTarget::RequestBody(0)]
+        );
+        assert!(!app.detail_search_is_fuzzy());
+        assert_eq!(app.detail_search_progress(), Some((1, 1)));
+    }
+
+    #[test]
+    fn detail_find_falls_back_to_fuzzy_subsequence_matching() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        let mut request = make_request("POST", "/webhook");
+        request.body = Some("r-e-p-o".to_string());
+        app.selected_request = Some(request);
+        app.current_tab = 2;
+
+        apply_detail_search(&mut app, "repo");
+
+        assert_eq!(
+            app.detail_search_matches,
+            [DetailSearchTarget::RequestBody(0)]
+        );
+        assert!(app.detail_search_is_fuzzy());
+    }
+
+    #[test]
+    fn detail_find_navigation_wraps_and_scrolls_to_matches() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        let mut request = make_request("POST", "/webhook");
+        let mut lines = vec!["needle".to_string()];
+        lines.extend((1..25).map(|index| format!("line {index}")));
+        lines.push("needle again".to_string());
+        request.body = Some(lines.join("\n"));
+        app.selected_request = Some(request);
+        app.current_tab = 2;
+
+        apply_detail_search(&mut app, "needle");
+        assert_eq!(app.detail_search_progress(), Some((1, 2)));
+
+        app.handle_key_event(key_event(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.detail_search_progress(), Some((2, 2)));
+        assert!(app.body_scroll_offset > 0);
+
+        app.handle_key_event(key_event(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.detail_search_progress(), Some((1, 2)));
+        assert_eq!(app.body_scroll_offset, 0);
+
+        app.handle_key_event(key_event(KeyCode::Char('N'))).unwrap();
+        assert_eq!(app.detail_search_progress(), Some((2, 2)));
+    }
+
+    #[test]
+    fn escape_cancels_detail_find_edits_before_clearing_applied_query() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        let mut request = make_request("POST", "/webhook");
+        request.body = Some("repository".to_string());
+        app.selected_request = Some(request);
+        app.current_tab = 2;
+        apply_detail_search(&mut app, "repo");
+
+        app.handle_key_event(key_event(KeyCode::Char('/'))).unwrap();
+        app.handle_key_event(key_event(KeyCode::Char('x'))).unwrap();
+        assert_eq!(app.detail_search_text(), "repox");
+
+        app.handle_key_event(key_event(KeyCode::Esc)).unwrap();
+        assert!(!app.detail_search_active);
+        assert_eq!(app.detail_search_query, "repo");
+        assert_eq!(app.detail_search_progress(), Some((1, 1)));
+
+        app.handle_key_event(key_event(KeyCode::Esc)).unwrap();
+        assert!(app.detail_search_query.is_empty());
+        assert_eq!(app.detail_search_progress(), None);
+    }
+
+    #[test]
+    fn detail_find_is_scoped_to_the_current_tab() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        let mut request = make_request("POST", "/webhook");
+        request
+            .headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        request.body = Some("no matching content".to_string());
+        app.selected_request = Some(request);
+        app.current_tab = 1;
+        apply_detail_search(&mut app, "content-type");
+        assert_eq!(app.detail_search_progress(), Some((1, 1)));
+
+        app.handle_key_event(key_event(KeyCode::Tab)).unwrap();
+        assert_eq!(app.current_tab, 2);
+        assert_eq!(app.detail_search_progress(), Some((0, 0)));
+    }
+
+    #[test]
+    fn response_find_orders_status_headers_and_body_as_one_sequence() {
+        let mut app = make_app_with_state(AppState::ShowRequestDetail);
+        app.selected_request = Some(make_request("POST", "/webhook"));
+        app.selected_tunnel_response = Some(TunnelResponseData {
+            status: Some(500),
+            headers: HashMap::from([("x-error".to_string(), "needle header".to_string())]),
+            body: Some("needle body".to_string()),
+            duration_ms: Some(42),
+            error: Some("needle error".to_string()),
+        });
+        app.current_tab = 3;
+
+        apply_detail_search(&mut app, "needle");
+
+        assert_eq!(
+            app.detail_search_matches,
+            [
+                DetailSearchTarget::ResponseStatus(2),
+                DetailSearchTarget::ResponseHeader(0),
+                DetailSearchTarget::ResponseBody(0),
+            ]
+        );
+        assert_eq!(app.detail_search_progress(), Some((1, 3)));
     }
 
     #[test]

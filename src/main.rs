@@ -4273,6 +4273,8 @@ where
             }
         }
 
+        let terminal_width = terminal.size()?.width;
+        app.set_detail_content_width(terminal_width.saturating_sub(4) as usize);
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         // Update animations
