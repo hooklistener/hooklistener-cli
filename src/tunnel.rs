@@ -528,10 +528,14 @@ impl TunnelClient {
                             && let Some(status) = msg.payload.get("status")
                         {
                             if status == "ok" {
-                                let response = msg
-                                    .payload
-                                    .get("response")
-                                    .ok_or_else(|| anyhow!("Channel join response was missing"))?;
+                                let Some(response) = msg.payload.get("response") else {
+                                    let error = anyhow!("Channel join response was missing");
+                                    let _ = self
+                                        .event_tx
+                                        .send(TunnelEvent::ConnectionError(error.to_string()))
+                                        .await;
+                                    return Err(error);
+                                };
 
                                 if let Err(error) =
                                     validate_join_mode(response, CAPTURE_FORWARD_MODE)
@@ -1087,58 +1091,64 @@ impl TunnelForwarder {
                         {
                             if status == "ok" {
                                 // Extract subdomain, tunnel_id, and static flag from response
-                                if let Some(response) = msg.payload.get("response") {
-                                    if let Err(error) =
-                                        validate_join_mode(response, DIRECT_RESPONSE_MODE)
-                                    {
-                                        let reason = error.to_string();
-                                        let _ = self
-                                            .event_tx
-                                            .send(TunnelEvent::ConnectionError(reason.clone()))
-                                            .await;
-                                        return Err(error);
-                                    }
-
-                                    tunnel_limits = TunnelLimits::from_join_response(response);
-                                    let subdomain = response
-                                        .get("subdomain")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or("unknown")
-                                        .to_string();
-                                    let tunnel_id = response
-                                        .get("tunnel_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or("unknown")
-                                        .to_string();
-                                    let is_static = response
-                                        .get("static")
-                                        .and_then(|s| s.as_bool())
-                                        .unwrap_or(false);
-
-                                    let tunnel_type =
-                                        if is_static { "static" } else { "ephemeral" };
-                                    info!(
-                                        subdomain = %subdomain,
-                                        tunnel_id = %tunnel_id,
-                                        tunnel_type = %tunnel_type,
-                                        max_request_body_bytes = tunnel_limits.max_request_body_bytes,
-                                        max_response_body_bytes = tunnel_limits.max_response_body_bytes,
-                                        max_response_header_bytes = tunnel_limits.max_response_header_bytes,
-                                        "Tunnel established"
-                                    );
-
+                                let Some(response) = msg.payload.get("response") else {
+                                    let error = anyhow!("Tunnel join response was missing");
                                     let _ = self
                                         .event_tx
-                                        .send(TunnelEvent::TunnelEstablished {
-                                            subdomain,
-                                            tunnel_id,
-                                            is_static,
-                                        })
+                                        .send(TunnelEvent::ConnectionError(error.to_string()))
                                         .await;
+                                    return Err(error);
+                                };
 
-                                    tunnel_topic = msg.topic.clone();
-                                    joined = true;
+                                if let Err(error) =
+                                    validate_join_mode(response, DIRECT_RESPONSE_MODE)
+                                {
+                                    let reason = error.to_string();
+                                    let _ = self
+                                        .event_tx
+                                        .send(TunnelEvent::ConnectionError(reason.clone()))
+                                        .await;
+                                    return Err(error);
                                 }
+
+                                tunnel_limits = TunnelLimits::from_join_response(response);
+                                let subdomain = response
+                                    .get("subdomain")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let tunnel_id = response
+                                    .get("tunnel_id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let is_static = response
+                                    .get("static")
+                                    .and_then(|s| s.as_bool())
+                                    .unwrap_or(false);
+
+                                let tunnel_type = if is_static { "static" } else { "ephemeral" };
+                                info!(
+                                    subdomain = %subdomain,
+                                    tunnel_id = %tunnel_id,
+                                    tunnel_type = %tunnel_type,
+                                    max_request_body_bytes = tunnel_limits.max_request_body_bytes,
+                                    max_response_body_bytes = tunnel_limits.max_response_body_bytes,
+                                    max_response_header_bytes = tunnel_limits.max_response_header_bytes,
+                                    "Tunnel established"
+                                );
+
+                                let _ = self
+                                    .event_tx
+                                    .send(TunnelEvent::TunnelEstablished {
+                                        subdomain,
+                                        tunnel_id,
+                                        is_static,
+                                    })
+                                    .await;
+
+                                tunnel_topic = msg.topic.clone();
+                                joined = true;
                             } else {
                                 let reason = msg
                                     .payload
