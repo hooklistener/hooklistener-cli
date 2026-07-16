@@ -1072,11 +1072,14 @@ impl ApiClient {
                     }
                 }
 
-                // Get response body
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "(Failed to read response body)".to_string());
+                // Decode a bounded, content-aware preview for display. The tunnel path
+                // separately preserves original response bytes for the public caller.
+                let body = match response.bytes().await {
+                    Ok(bytes) => {
+                        crate::tunnel::body_preview(&bytes, &response_headers).unwrap_or_default()
+                    }
+                    Err(_) => "(Failed to read response body)".to_string(),
+                };
 
                 let duration = start_time.elapsed();
 
@@ -1110,6 +1113,8 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
 
     #[tokio::test]
     async fn test_forward_request_success() {
@@ -1143,6 +1148,46 @@ mod tests {
         let result = client.forward_request(&request, &target_url).await.unwrap();
         assert!(result.success);
         assert_eq!(result.status_code, Some(200));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_forward_request_decodes_compressed_response_for_display() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"compressed forward response").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/webhook")
+            .with_status(200)
+            .with_header("content-type", "text/plain; charset=utf-8")
+            .with_header("content-encoding", "gzip")
+            .with_body(compressed)
+            .create_async()
+            .await;
+
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+        let request = WebhookRequest {
+            id: "req-1".to_string(),
+            timestamp: 0,
+            remote_addr: "127.0.0.1".to_string(),
+            headers: HashMap::new(),
+            content_length: 0,
+            method: "GET".to_string(),
+            url: "/webhook".to_string(),
+            path: Some("/webhook".to_string()),
+            query_params: HashMap::new(),
+            created_at: "2024-01-01".to_string(),
+            body_preview: None,
+            body: None,
+        };
+
+        let target_url = format!("{}/webhook", server.url());
+        let result = client.forward_request(&request, &target_url).await.unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.body, "compressed forward response");
         mock.assert_async().await;
     }
 

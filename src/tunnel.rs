@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use brotli::Decompressor as BrotliDecoder;
+use encoding_rs::{Encoding, UTF_8};
+use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{
@@ -131,19 +135,247 @@ fn response_header_bytes(headers: &reqwest::header::HeaderMap) -> usize {
     })
 }
 
-fn body_preview(bytes: &[u8]) -> Option<String> {
+struct DecodedBodyPreview {
+    bytes: Vec<u8>,
+    truncated: bool,
+    content_encoded: bool,
+}
+
+pub(crate) fn body_preview(bytes: &[u8], headers: &HashMap<String, String>) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
 
-    let preview_length = bytes.len().min(UI_BODY_PREVIEW_BYTES);
-    let mut preview = String::from_utf8_lossy(&bytes[..preview_length]).into_owned();
+    let decoded = match decode_body_preview(bytes, headers) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return Some(format!(
+                "[body preview unavailable: {error}; {} bytes received]",
+                bytes.len()
+            ));
+        }
+    };
 
-    if bytes.len() > preview_length {
-        preview.push_str(&format!("\n… [truncated; {} bytes total]", bytes.len()));
+    let content_type = header_value(headers, "content-type");
+    if !is_text_body(content_type, &decoded.bytes) {
+        let content_type = content_type
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown content type");
+        let encoding = header_value(headers, "content-encoding")
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("identity"));
+
+        return Some(match encoding {
+            Some(encoding) => format!(
+                "[binary body: {} encoded bytes; content-type: {content_type}; content-encoding: {encoding}]",
+                bytes.len()
+            ),
+            None => format!(
+                "[binary body: {} bytes; content-type: {content_type}]",
+                bytes.len()
+            ),
+        });
+    }
+
+    let mut preview = match decode_text(&decoded.bytes, content_type, decoded.truncated) {
+        Ok(text) => sanitize_preview_text(&text),
+        Err(error) => {
+            return Some(format!(
+                "[text body preview unavailable: {error}; {} bytes received]",
+                bytes.len()
+            ));
+        }
+    };
+
+    if decoded.truncated {
+        if decoded.content_encoded {
+            preview.push_str(&format!(
+                "\n… [decoded preview truncated; {} encoded bytes received]",
+                bytes.len()
+            ));
+        } else {
+            preview.push_str(&format!(
+                "\n… [preview truncated; {} bytes total]",
+                bytes.len()
+            ));
+        }
     }
 
     Some(preview)
+}
+
+fn decode_body_preview(
+    bytes: &[u8],
+    headers: &HashMap<String, String>,
+) -> std::result::Result<DecodedBodyPreview, String> {
+    let encodings = content_encodings(headers)?;
+    let content_encoded = !encodings.is_empty();
+    let mut reader: Box<dyn Read + '_> = Box::new(Cursor::new(bytes));
+
+    // Content codings are listed in application order, so decoding wraps them
+    // in reverse order. Keeping this as a reader chain avoids materializing an
+    // unbounded intermediate body for stacked encodings.
+    for encoding in encodings.iter().rev() {
+        reader = match encoding.as_str() {
+            "gzip" | "x-gzip" => Box::new(MultiGzDecoder::new(reader)),
+            "deflate" => {
+                let mut buffered = BufReader::new(reader);
+                let is_zlib_wrapped = buffered
+                    .fill_buf()
+                    .map_err(|error| format!("could not inspect deflate body: {error}"))?
+                    .get(..2)
+                    .is_some_and(|prefix| is_zlib_header(prefix[0], prefix[1]));
+
+                if is_zlib_wrapped {
+                    Box::new(ZlibDecoder::new(buffered))
+                } else {
+                    // Some older servers use raw DEFLATE despite RFC 9110
+                    // defining the coding as a zlib-wrapped stream.
+                    Box::new(DeflateDecoder::new(buffered))
+                }
+            }
+            "br" => Box::new(BrotliDecoder::new(reader, 4_096)),
+            "zstd" => Box::new(
+                zstd::stream::read::Decoder::new(reader)
+                    .map_err(|error| format!("could not initialize zstd decoder: {error}"))?,
+            ),
+            _ => unreachable!("content_encodings validates supported values"),
+        };
+    }
+
+    let mut limited = reader.take((UI_BODY_PREVIEW_BYTES + 1) as u64);
+    let mut preview = Vec::with_capacity(UI_BODY_PREVIEW_BYTES.min(bytes.len()));
+    limited
+        .read_to_end(&mut preview)
+        .map_err(|error| format!("could not decode response body: {error}"))?;
+    let truncated = preview.len() > UI_BODY_PREVIEW_BYTES;
+    preview.truncate(UI_BODY_PREVIEW_BYTES);
+
+    Ok(DecodedBodyPreview {
+        bytes: preview,
+        truncated,
+        content_encoded,
+    })
+}
+
+fn content_encodings(
+    headers: &HashMap<String, String>,
+) -> std::result::Result<Vec<String>, String> {
+    let Some(value) = header_value(headers, "content-encoding") else {
+        return Ok(Vec::new());
+    };
+
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+        .map(|encoding| {
+            let normalized = encoding.to_ascii_lowercase();
+            match normalized.as_str() {
+                "gzip" | "x-gzip" | "deflate" | "br" | "zstd" => Ok(normalized),
+                _ => Err(format!("unsupported content-encoding {encoding:?}")),
+            }
+        })
+        .collect()
+}
+
+fn is_zlib_header(cmf: u8, flags: u8) -> bool {
+    cmf & 0x0f == 8 && (u16::from(cmf) << 8 | u16::from(flags)) % 31 == 0
+}
+
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn is_text_body(content_type: Option<&str>, bytes: &[u8]) -> bool {
+    match content_type.and_then(|value| value.split(';').next()) {
+        Some(media_type) => is_text_media_type(media_type.trim()),
+        None => looks_like_text(bytes),
+    }
+}
+
+fn is_text_media_type(media_type: &str) -> bool {
+    let media_type = media_type.to_ascii_lowercase();
+
+    media_type.starts_with("text/")
+        || media_type.ends_with("+json")
+        || media_type.ends_with("+xml")
+        || matches!(
+            media_type.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/graphql"
+                | "application/x-www-form-urlencoded"
+                | "application/sql"
+                | "application/rtf"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "application/toml"
+                | "application/x-ndjson"
+                | "image/svg+xml"
+        )
+}
+
+fn looks_like_text(bytes: &[u8]) -> bool {
+    (0..=3.min(bytes.len())).any(|trim| std::str::from_utf8(&bytes[..bytes.len() - trim]).is_ok())
+        && !bytes.contains(&0)
+        && bytes
+            .iter()
+            .filter(|byte| byte.is_ascii_control() && !matches!(byte, b'\n' | b'\r' | b'\t'))
+            .count()
+            <= bytes.len() / 100
+}
+
+fn decode_text(
+    bytes: &[u8],
+    content_type: Option<&str>,
+    truncated: bool,
+) -> std::result::Result<String, String> {
+    let charset = content_type.and_then(content_type_charset);
+    let encoding = match charset {
+        Some(charset) => Encoding::for_label(charset.as_bytes())
+            .ok_or_else(|| format!("unsupported charset {charset:?}"))?,
+        None => UTF_8,
+    };
+
+    let max_trim = if truncated { 8.min(bytes.len()) } else { 0 };
+    for trim in 0..=max_trim {
+        let candidate = &bytes[..bytes.len() - trim];
+        let (decoded, _, had_errors) = encoding.decode(candidate);
+        if !had_errors {
+            return Ok(decoded.into_owned());
+        }
+    }
+
+    Err(format!("body is not valid {} text", encoding.name()))
+}
+
+fn content_type_charset(content_type: &str) -> Option<&str> {
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches(['\"', '\'']))
+    })
+}
+
+fn sanitize_preview_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn with_forward_id(mut payload: serde_json::Value, forward_id: Option<&str>) -> serde_json::Value {
@@ -1397,7 +1629,7 @@ impl TunnelForwarder {
                         .collect();
 
                     // Keep the TUI history bounded while forwarding the complete body.
-                    let body_string = body_preview(&body);
+                    let body_string = body_preview(&body, &headers_map);
 
                     // Notify UI about request
                     let _ = self
@@ -1722,7 +1954,7 @@ impl TunnelForwarder {
                     }
                 }
 
-                let response_body_preview = body_preview(&response_bytes);
+                let response_body_preview = body_preview(&response_bytes, &response_headers);
                 let (response_body, body_encoding) = encode_response_body(&response_bytes);
 
                 let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1911,6 +2143,45 @@ impl TunnelForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::DeflateEncoder, write::GzEncoder, write::ZlibEncoder};
+    use std::io::Write;
+
+    fn preview_headers(values: &[(&str, &str)]) -> HashMap<String, String> {
+        values
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn compressed_with<W>(mut encoder: W, body: &[u8]) -> Vec<u8>
+    where
+        W: Write + FinishEncoder,
+    {
+        encoder.write_all(body).unwrap();
+        encoder.finish_encoder()
+    }
+
+    trait FinishEncoder {
+        fn finish_encoder(self) -> Vec<u8>;
+    }
+
+    impl FinishEncoder for GzEncoder<Vec<u8>> {
+        fn finish_encoder(self) -> Vec<u8> {
+            self.finish().unwrap()
+        }
+    }
+
+    impl FinishEncoder for ZlibEncoder<Vec<u8>> {
+        fn finish_encoder(self) -> Vec<u8> {
+            self.finish().unwrap()
+        }
+    }
+
+    impl FinishEncoder for DeflateEncoder<Vec<u8>> {
+        fn finish_encoder(self) -> Vec<u8> {
+            self.finish().unwrap()
+        }
+    }
 
     // ChannelMessage serialization tests
     #[test]
@@ -2081,11 +2352,141 @@ mod tests {
     #[test]
     fn test_body_preview_is_bounded() {
         let body = vec![b'a'; UI_BODY_PREVIEW_BYTES * 2];
-        let preview = body_preview(&body).unwrap();
+        let preview = body_preview(&body, &HashMap::new()).unwrap();
 
         assert!(preview.len() <= UI_BODY_PREVIEW_BYTES + 64);
         assert!(preview.contains("truncated"));
         assert!(preview.contains(&(UI_BODY_PREVIEW_BYTES * 2).to_string()));
+    }
+
+    #[test]
+    fn test_gzip_text_body_preview_is_decoded_without_changing_transport_bytes() {
+        let body = b"<html><body>Not found</body></html>";
+        let compressed = compressed_with(GzEncoder::new(Vec::new(), Compression::default()), body);
+        let headers = preview_headers(&[
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-encoding", "gzip"),
+        ]);
+
+        assert_eq!(
+            body_preview(&compressed, &headers).as_deref(),
+            Some("<html><body>Not found</body></html>")
+        );
+
+        let (transport_body, transport_encoding) = encode_response_body(&compressed);
+        assert_eq!(transport_encoding, "base64");
+        assert_eq!(URL_SAFE_NO_PAD.decode(transport_body).unwrap(), compressed);
+    }
+
+    #[test]
+    fn test_standard_and_legacy_deflate_body_previews_are_decoded() {
+        let body = b"deflate response";
+        let headers = preview_headers(&[
+            ("content-type", "text/plain"),
+            ("content-encoding", "deflate"),
+        ]);
+        let zlib = compressed_with(ZlibEncoder::new(Vec::new(), Compression::default()), body);
+        let raw = compressed_with(
+            DeflateEncoder::new(Vec::new(), Compression::default()),
+            body,
+        );
+
+        assert_eq!(
+            body_preview(&zlib, &headers).as_deref(),
+            Some("deflate response")
+        );
+        assert_eq!(
+            body_preview(&raw, &headers).as_deref(),
+            Some("deflate response")
+        );
+    }
+
+    #[test]
+    fn test_brotli_and_zstd_body_previews_are_decoded() {
+        let body = b"compressed response";
+
+        let mut brotli = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut brotli, 4_096, 5, 22);
+            encoder.write_all(body).unwrap();
+        }
+        let brotli_headers =
+            preview_headers(&[("content-type", "text/plain"), ("content-encoding", "br")]);
+        assert_eq!(
+            body_preview(&brotli, &brotli_headers).as_deref(),
+            Some("compressed response")
+        );
+
+        let zstd = zstd::stream::encode_all(Cursor::new(body), 0).unwrap();
+        let zstd_headers =
+            preview_headers(&[("content-type", "text/plain"), ("content-encoding", "zstd")]);
+        assert_eq!(
+            body_preview(&zstd, &zstd_headers).as_deref(),
+            Some("compressed response")
+        );
+    }
+
+    #[test]
+    fn test_stacked_content_encodings_are_decoded_in_reverse_order() {
+        let body = b"stacked response";
+        let gzip = compressed_with(GzEncoder::new(Vec::new(), Compression::default()), body);
+        let mut gzip_then_brotli = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut gzip_then_brotli, 4_096, 5, 22);
+            encoder.write_all(&gzip).unwrap();
+        }
+        let headers = preview_headers(&[
+            ("content-type", "text/plain"),
+            ("content-encoding", "gzip, br"),
+        ]);
+
+        assert_eq!(
+            body_preview(&gzip_then_brotli, &headers).as_deref(),
+            Some("stacked response")
+        );
+    }
+
+    #[test]
+    fn test_text_body_preview_honors_declared_charset() {
+        let headers = preview_headers(&[("Content-Type", "text/plain; charset=iso-8859-1")]);
+
+        assert_eq!(body_preview(b"caf\xe9", &headers).as_deref(), Some("café"));
+    }
+
+    #[test]
+    fn test_binary_body_preview_uses_metadata_instead_of_lossy_text() {
+        let body = b"\x89PNG\r\n\x1a\n\0\xff";
+        let headers = preview_headers(&[("content-type", "image/png")]);
+        let preview = body_preview(body, &headers).unwrap();
+
+        assert_eq!(preview, "[binary body: 10 bytes; content-type: image/png]");
+        assert!(!preview.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn test_unsupported_or_malformed_content_encoding_has_safe_preview() {
+        let unsupported = preview_headers(&[("content-encoding", "compress")]);
+        let malformed = preview_headers(&[("content-encoding", "gzip")]);
+
+        let unsupported_preview = body_preview(b"encoded", &unsupported).unwrap();
+        assert!(unsupported_preview.contains("unsupported content-encoding"));
+
+        let malformed_preview = body_preview(b"not gzip", &malformed).unwrap();
+        assert!(malformed_preview.contains("preview unavailable"));
+        assert!(!malformed_preview.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn test_compressed_body_preview_is_bounded_after_decompression() {
+        let body = vec![b'a'; UI_BODY_PREVIEW_BYTES * 2];
+        let compressed = compressed_with(GzEncoder::new(Vec::new(), Compression::default()), &body);
+        let headers =
+            preview_headers(&[("content-type", "text/plain"), ("content-encoding", "gzip")]);
+        let preview = body_preview(&compressed, &headers).unwrap();
+
+        assert!(preview.starts_with("aaaa"));
+        assert!(preview.contains("decoded preview truncated"));
+        assert!(preview.len() <= UI_BODY_PREVIEW_BYTES + 96);
     }
 
     // TunnelWebhookRequest tests
