@@ -164,6 +164,46 @@ struct ChannelMessage {
     reference: Option<String>,
 }
 
+const DIRECT_RESPONSE_MODE: &str = "direct_response";
+const CAPTURE_FORWARD_MODE: &str = "capture_forward";
+
+fn listen_join_payload() -> serde_json::Value {
+    serde_json::json!({"mode": CAPTURE_FORWARD_MODE})
+}
+
+fn tunnel_join_payload(
+    local_port: u16,
+    organization_id: Option<&str>,
+    slug: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "mode": DIRECT_RESPONSE_MODE,
+        "local_port": local_port,
+    });
+
+    if let Some(organization_id) = organization_id {
+        payload["organization_id"] = serde_json::Value::String(organization_id.to_string());
+    }
+
+    if let Some(slug) = slug {
+        payload["slug"] = serde_json::Value::String(slug.to_string());
+    }
+
+    payload
+}
+
+fn validate_join_mode(response: &serde_json::Value, expected: &str) -> Result<()> {
+    match response.get("mode").and_then(|mode| mode.as_str()) {
+        Some(mode) if mode == expected => Ok(()),
+        Some(mode) => Err(anyhow!(
+            "Channel join failed: Server activated incompatible mode '{mode}' (expected '{expected}'); no requests were forwarded"
+        )),
+        None => Err(anyhow!(
+            "Channel join failed: Server did not confirm activation mode '{expected}'; upgrade the Hooklistener service before retrying"
+        )),
+    }
+}
+
 /// Webhook request received from the server (Tunnel format)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TunnelWebhookRequest {
@@ -466,7 +506,7 @@ impl TunnelClient {
         let join_message = ChannelMessage {
             topic: channel_topic.clone(),
             event: "phx_join".to_string(),
-            payload: serde_json::json!({}),
+            payload: listen_join_payload(),
             reference: Some("1".to_string()),
         };
 
@@ -488,6 +528,26 @@ impl TunnelClient {
                             && let Some(status) = msg.payload.get("status")
                         {
                             if status == "ok" {
+                                let Some(response) = msg.payload.get("response") else {
+                                    let error = anyhow!("Channel join response was missing");
+                                    let _ = self
+                                        .event_tx
+                                        .send(TunnelEvent::ConnectionError(error.to_string()))
+                                        .await;
+                                    return Err(error);
+                                };
+
+                                if let Err(error) =
+                                    validate_join_mode(response, CAPTURE_FORWARD_MODE)
+                                {
+                                    let reason = error.to_string();
+                                    let _ = self
+                                        .event_tx
+                                        .send(TunnelEvent::ConnectionError(reason.clone()))
+                                        .await;
+                                    return Err(error);
+                                }
+
                                 let _ = self.event_tx.send(TunnelEvent::Connected).await;
                                 info!(channel = %channel_topic, "Joined channel");
                                 joined = true;
@@ -987,16 +1047,13 @@ impl TunnelForwarder {
         let (mut write, mut read) = ws_stream.split();
 
         // Join the tunnel:connect channel with local_port, organization_id, and optional slug
-        let mut join_payload = serde_json::json!({
-            "local_port": self.local_port,
-        });
-
-        if let Some(org_id) = &self.org_id {
-            join_payload["organization_id"] = serde_json::Value::String(org_id.clone());
-        }
+        let join_payload = tunnel_join_payload(
+            self.local_port,
+            self.org_id.as_deref(),
+            self.slug.as_deref(),
+        );
 
         if let Some(slug) = &self.slug {
-            join_payload["slug"] = serde_json::Value::String(slug.clone());
             info!(slug = %slug, "Requesting static tunnel");
         }
 
@@ -1034,47 +1091,64 @@ impl TunnelForwarder {
                         {
                             if status == "ok" {
                                 // Extract subdomain, tunnel_id, and static flag from response
-                                if let Some(response) = msg.payload.get("response") {
-                                    tunnel_limits = TunnelLimits::from_join_response(response);
-                                    let subdomain = response
-                                        .get("subdomain")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or("unknown")
-                                        .to_string();
-                                    let tunnel_id = response
-                                        .get("tunnel_id")
-                                        .and_then(|s| s.as_str())
-                                        .unwrap_or("unknown")
-                                        .to_string();
-                                    let is_static = response
-                                        .get("static")
-                                        .and_then(|s| s.as_bool())
-                                        .unwrap_or(false);
-
-                                    let tunnel_type =
-                                        if is_static { "static" } else { "ephemeral" };
-                                    info!(
-                                        subdomain = %subdomain,
-                                        tunnel_id = %tunnel_id,
-                                        tunnel_type = %tunnel_type,
-                                        max_request_body_bytes = tunnel_limits.max_request_body_bytes,
-                                        max_response_body_bytes = tunnel_limits.max_response_body_bytes,
-                                        max_response_header_bytes = tunnel_limits.max_response_header_bytes,
-                                        "Tunnel established"
-                                    );
-
+                                let Some(response) = msg.payload.get("response") else {
+                                    let error = anyhow!("Tunnel join response was missing");
                                     let _ = self
                                         .event_tx
-                                        .send(TunnelEvent::TunnelEstablished {
-                                            subdomain,
-                                            tunnel_id,
-                                            is_static,
-                                        })
+                                        .send(TunnelEvent::ConnectionError(error.to_string()))
                                         .await;
+                                    return Err(error);
+                                };
 
-                                    tunnel_topic = msg.topic.clone();
-                                    joined = true;
+                                if let Err(error) =
+                                    validate_join_mode(response, DIRECT_RESPONSE_MODE)
+                                {
+                                    let reason = error.to_string();
+                                    let _ = self
+                                        .event_tx
+                                        .send(TunnelEvent::ConnectionError(reason.clone()))
+                                        .await;
+                                    return Err(error);
                                 }
+
+                                tunnel_limits = TunnelLimits::from_join_response(response);
+                                let subdomain = response
+                                    .get("subdomain")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let tunnel_id = response
+                                    .get("tunnel_id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let is_static = response
+                                    .get("static")
+                                    .and_then(|s| s.as_bool())
+                                    .unwrap_or(false);
+
+                                let tunnel_type = if is_static { "static" } else { "ephemeral" };
+                                info!(
+                                    subdomain = %subdomain,
+                                    tunnel_id = %tunnel_id,
+                                    tunnel_type = %tunnel_type,
+                                    max_request_body_bytes = tunnel_limits.max_request_body_bytes,
+                                    max_response_body_bytes = tunnel_limits.max_response_body_bytes,
+                                    max_response_header_bytes = tunnel_limits.max_response_header_bytes,
+                                    "Tunnel established"
+                                );
+
+                                let _ = self
+                                    .event_tx
+                                    .send(TunnelEvent::TunnelEstablished {
+                                        subdomain,
+                                        tunnel_id,
+                                        is_static,
+                                    })
+                                    .await;
+
+                                tunnel_topic = msg.topic.clone();
+                                joined = true;
                             } else {
                                 let reason = msg
                                     .payload
@@ -1866,6 +1940,55 @@ mod tests {
         let json = r#"{"topic":"t","event":"e","payload":{}}"#;
         let msg: ChannelMessage = serde_json::from_str(json).unwrap();
         assert!(msg.reference.is_none());
+    }
+
+    #[test]
+    fn test_join_payloads_select_explicit_activation_modes() {
+        assert_eq!(listen_join_payload()["mode"], CAPTURE_FORWARD_MODE);
+
+        let tunnel_payload = tunnel_join_payload(3000, Some("org-1"), Some("payments"));
+        assert_eq!(tunnel_payload["mode"], DIRECT_RESPONSE_MODE);
+        assert_eq!(tunnel_payload["local_port"], 3000);
+        assert_eq!(tunnel_payload["organization_id"], "org-1");
+        assert_eq!(tunnel_payload["slug"], "payments");
+    }
+
+    #[test]
+    fn test_join_mode_must_be_confirmed_by_server() {
+        assert!(
+            validate_join_mode(
+                &serde_json::json!({"mode": DIRECT_RESPONSE_MODE}),
+                DIRECT_RESPONSE_MODE
+            )
+            .is_ok()
+        );
+
+        let missing = validate_join_mode(&serde_json::json!({}), DIRECT_RESPONSE_MODE)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("did not confirm"));
+
+        let incompatible = validate_join_mode(
+            &serde_json::json!({"mode": CAPTURE_FORWARD_MODE}),
+            DIRECT_RESPONSE_MODE,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(incompatible.contains("incompatible mode"));
+    }
+
+    #[test]
+    fn test_join_mode_rejections_are_fatal() {
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"mode": CAPTURE_FORWARD_MODE}),
+        ] {
+            let error = validate_join_mode(&response, DIRECT_RESPONSE_MODE)
+                .unwrap_err()
+                .to_string();
+
+            assert!(is_fatal_error(&error), "expected fatal error: {error}");
+        }
     }
 
     #[test]
