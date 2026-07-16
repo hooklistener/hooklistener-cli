@@ -196,10 +196,10 @@ fn validate_join_mode(response: &serde_json::Value, expected: &str) -> Result<()
     match response.get("mode").and_then(|mode| mode.as_str()) {
         Some(mode) if mode == expected => Ok(()),
         Some(mode) => Err(anyhow!(
-            "Server activated incompatible mode '{mode}' (expected '{expected}'); no requests were forwarded"
+            "Channel join failed: Server activated incompatible mode '{mode}' (expected '{expected}'); no requests were forwarded"
         )),
         None => Err(anyhow!(
-            "Server did not confirm activation mode '{expected}'; upgrade the Hooklistener service before retrying"
+            "Channel join failed: Server did not confirm activation mode '{expected}'; upgrade the Hooklistener service before retrying"
         )),
     }
 }
@@ -1975,6 +1975,20 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(incompatible.contains("incompatible mode"));
+    }
+
+    #[test]
+    fn test_join_mode_rejections_are_fatal() {
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"mode": CAPTURE_FORWARD_MODE}),
+        ] {
+            let error = validate_join_mode(&response, DIRECT_RESPONSE_MODE)
+                .unwrap_err()
+                .to_string();
+
+            assert!(is_fatal_error(&error), "expected fatal error: {error}");
+        }
     }
 
     #[test]
