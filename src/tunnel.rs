@@ -49,6 +49,18 @@ const OUTBOUND_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const PRESENTATION_QUEUE_CAPACITY: usize = 100;
 const PRESENTATION_MAX_EVENT_BYTES: usize = 256 * 1024;
 
+fn bounded_budget_permits(bytes: usize, capacity: usize) -> Option<u32> {
+    bytes.max(1).min(capacity).try_into().ok()
+}
+
+fn inbound_stream_fits_budget(reserved_bytes: usize, stream_bytes: usize) -> bool {
+    if stream_bytes > INBOUND_STREAM_MAX_BYTES {
+        reserved_bytes == 0
+    } else {
+        reserved_bytes.saturating_add(stream_bytes) <= INBOUND_STREAM_MAX_BYTES
+    }
+}
+
 const DELIVERY_QUEUED: u8 = 0;
 const DELIVERY_STARTED: u8 = 1;
 const DELIVERY_TERMINAL: u8 = 2;
@@ -162,6 +174,13 @@ struct ResponseBufferBudget {
     bytes: Arc<Semaphore>,
 }
 
+struct ResponseBufferReservation {
+    budget: ResponseBufferBudget,
+    permits: Vec<OwnedSemaphorePermit>,
+    reserved_bytes: usize,
+    exclusive: bool,
+}
+
 impl ResponseBufferBudget {
     fn new() -> Self {
         Self {
@@ -169,14 +188,50 @@ impl ResponseBufferBudget {
         }
     }
 
+    fn try_reserve(&self, expected_bytes: Option<usize>) -> Option<ResponseBufferReservation> {
+        let mut reservation = ResponseBufferReservation {
+            budget: self.clone(),
+            permits: Vec::new(),
+            reserved_bytes: 0,
+            exclusive: false,
+        };
+
+        reservation
+            .try_grow_to(expected_bytes.unwrap_or(0))
+            .then_some(reservation)
+    }
+
     fn try_acquire(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        let bytes: u32 = bytes.max(1).try_into().ok()?;
+        let bytes = bounded_budget_permits(bytes, RESPONSE_BUFFER_MAX_BYTES)?;
         self.bytes.clone().try_acquire_many_owned(bytes).ok()
     }
 
     #[cfg(test)]
     fn available_bytes(&self) -> usize {
         self.bytes.available_permits()
+    }
+}
+
+impl ResponseBufferReservation {
+    fn try_grow_to(&mut self, total_bytes: usize) -> bool {
+        if self.exclusive || total_bytes <= self.reserved_bytes {
+            return true;
+        }
+
+        let previous_permits = self.reserved_bytes.min(RESPONSE_BUFFER_MAX_BYTES);
+        let target_permits = total_bytes.min(RESPONSE_BUFFER_MAX_BYTES);
+        let additional_permits = target_permits.saturating_sub(previous_permits);
+
+        if additional_permits > 0 {
+            let Some(permit) = self.budget.try_acquire(additional_permits) else {
+                return false;
+            };
+            self.permits.push(permit);
+        }
+
+        self.reserved_bytes = total_bytes;
+        self.exclusive = total_bytes > RESPONSE_BUFFER_MAX_BYTES;
+        true
     }
 }
 
@@ -189,7 +244,7 @@ impl LocalWorkBudget {
     }
 
     fn try_acquire(&self, bytes: usize) -> Option<LocalWorkPermit> {
-        let bytes: u32 = bytes.max(1).try_into().ok()?;
+        let bytes = bounded_budget_permits(bytes, LOCAL_WORK_MAX_BYTES)?;
         let count = self.count.clone().try_acquire_owned().ok()?;
         let bytes = self.bytes.clone().try_acquire_many_owned(bytes).ok()?;
         Some(LocalWorkPermit {
@@ -2224,10 +2279,10 @@ impl TunnelForwarder {
             "tunnel_stream_start" => {
                 let assembler = TunnelStreamAssembler::from_start(&msg.payload, "request")?;
                 if runtime.inbound_streams.len() >= INBOUND_STREAM_MAX_COUNT
-                    || runtime
-                        .inbound_reserved_bytes
-                        .saturating_add(assembler.total_bytes)
-                        > INBOUND_STREAM_MAX_BYTES
+                    || !inbound_stream_fits_budget(
+                        runtime.inbound_reserved_bytes,
+                        assembler.total_bytes,
+                    )
                 {
                     writer
                         .control(stream_error_message(
@@ -2749,9 +2804,12 @@ impl TunnelForwarder {
                 let response_header_pairs = response_headers_to_ordered_pairs(response.headers());
                 let response_headers = response_headers_to_map(response.headers());
 
-                if response
+                let response_content_length = response
                     .content_length()
-                    .is_some_and(|length| length > tunnel_limits.max_response_body_bytes as u64)
+                    .and_then(|length| usize::try_from(length).ok());
+
+                if response_content_length
+                    .is_some_and(|length| length > tunnel_limits.max_response_body_bytes)
                 {
                     let error_msg = format!(
                         "Local response body exceeds tunnel limit (max {} bytes)",
@@ -2769,13 +2827,27 @@ impl TunnelForwarder {
                         .await;
                 }
 
-                let initial_capacity = response
-                    .content_length()
-                    .and_then(|length| usize::try_from(length).ok())
+                let initial_capacity = response_content_length
                     .unwrap_or(0)
                     .min(tunnel_limits.max_response_body_bytes);
                 let mut response_bytes = Vec::with_capacity(initial_capacity);
-                let mut response_permits = Vec::new();
+
+                let Some(mut response_reservation) =
+                    response_budget.try_reserve(response_content_length)
+                else {
+                    return self
+                        .report_tunnel_failure(
+                            &request_id,
+                            DeliveryFailure::unknown(
+                                "relay_response_overloaded",
+                                "Concurrent local responses exceed the relay buffer budget",
+                            ),
+                            &writer,
+                            &tunnel_topic,
+                            &phase,
+                        )
+                        .await;
+                };
 
                 loop {
                     match response.chunk().await {
@@ -2802,7 +2874,9 @@ impl TunnelForwarder {
                                     .await;
                             }
 
-                            let Some(permit) = response_budget.try_acquire(chunk.len()) else {
+                            if !response_reservation
+                                .try_grow_to(response_bytes.len().saturating_add(chunk.len()))
+                            {
                                 return self
                                     .report_tunnel_failure(
                                         &request_id,
@@ -2815,8 +2889,7 @@ impl TunnelForwarder {
                                         &phase,
                                     )
                                     .await;
-                            };
-                            response_permits.push(permit);
+                            }
 
                             response_bytes.extend_from_slice(&chunk);
                         }
@@ -3551,18 +3624,70 @@ mod tests {
     }
 
     #[test]
+    fn test_local_work_budget_allows_one_oversized_delivery_exclusively() {
+        let budget = LocalWorkBudget::new();
+        let permit = budget.try_acquire(LOCAL_WORK_MAX_BYTES * 2).unwrap();
+
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 1);
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_acquire(1).is_none());
+
+        drop(permit);
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT);
+        assert_eq!(budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
+    }
+
+    #[test]
     fn test_response_buffer_budget_bounds_concurrent_ten_megabyte_responses() {
         let budget = ResponseBufferBudget::new();
         let ten_mib = 10 * 1024 * 1024;
         let permits = (0..6)
-            .map(|_| budget.try_acquire(ten_mib).unwrap())
+            .map(|_| budget.try_reserve(Some(ten_mib)).unwrap())
             .collect::<Vec<_>>();
 
         assert_eq!(budget.available_bytes(), 4 * 1024 * 1024);
-        assert!(budget.try_acquire(ten_mib).is_none());
+        assert!(budget.try_reserve(Some(ten_mib)).is_none());
 
         drop(permits);
         assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_response_buffer_budget_allows_one_oversized_response_exclusively() {
+        let budget = ResponseBufferBudget::new();
+        let permit = budget
+            .try_reserve(Some(RESPONSE_BUFFER_MAX_BYTES * 2))
+            .unwrap();
+
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_reserve(Some(1)).is_none());
+
+        drop(permit);
+        assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_unknown_response_length_can_upgrade_to_exclusive_reservation() {
+        let budget = ResponseBufferBudget::new();
+        let mut reservation = budget.try_reserve(None).unwrap();
+
+        assert!(reservation.try_grow_to(RESPONSE_BUFFER_MAX_BYTES / 2));
+        assert!(reservation.try_grow_to(RESPONSE_BUFFER_MAX_BYTES * 2));
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_reserve(Some(1)).is_none());
+
+        drop(reservation);
+        assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_inbound_stream_budget_allows_one_oversized_stream_exclusively() {
+        let oversized = INBOUND_STREAM_MAX_BYTES * 2;
+
+        assert!(inbound_stream_fits_budget(0, oversized));
+        assert!(!inbound_stream_fits_budget(1, oversized));
+        assert!(!inbound_stream_fits_budget(oversized, 1));
+        assert!(inbound_stream_fits_budget(INBOUND_STREAM_MAX_BYTES - 1, 1));
     }
 
     #[test]
