@@ -8,6 +8,7 @@ mod logo;
 mod models;
 mod output;
 mod syntax;
+mod target_policy;
 mod theme;
 mod tunnel;
 mod ui;
@@ -99,6 +100,14 @@ enum Commands {
         /// WebSocket server URL (defaults to production)
         #[arg(long)]
         ws_url: Option<String>,
+
+        /// Allow forwarding to a target that resolves outside loopback
+        #[arg(long)]
+        allow_non_loopback: bool,
+
+        /// Disable target TLS certificate verification (visible and plan-bound)
+        #[arg(long)]
+        insecure_tls: bool,
     },
     /// Generate a diagnostic bundle for support
     Diagnostics {
@@ -179,6 +188,10 @@ enum Commands {
         /// Static tunnel slug (paid plans only, creates persistent subdomain)
         #[arg(short, long)]
         slug: Option<String>,
+
+        /// Allow forwarding to a host that resolves outside loopback
+        #[arg(long)]
+        allow_non_loopback: bool,
 
         /// Do not automatically replay requests buffered while the tunnel was offline
         #[arg(long)]
@@ -1634,7 +1647,12 @@ async fn run_listen_json(
     target_url: String,
     ws_url: Option<String>,
     organization_id: Option<String>,
+    allow_non_loopback: bool,
+    insecure_tls: bool,
 ) -> Result<()> {
+    let target =
+        target_policy::TargetPolicy::resolve(&target_url, allow_non_loopback, insecure_tls).await?;
+    let target_url = target.display_url();
     let access_token = access_token_rx.borrow().clone();
     let endpoint = resolve_listen_endpoint(&access_token, organization_id, &endpoint_slug).await;
 
@@ -1649,7 +1667,7 @@ async fn run_listen_json(
     let tunnel_client = tunnel::TunnelClient::new(
         access_token_rx,
         endpoint_slug.clone(),
-        target_url.clone(),
+        target,
         ws_url,
         event_tx,
     );
@@ -1717,6 +1735,7 @@ async fn run_tunnel_json(
     port: u16,
     organization_id: Option<String>,
     slug: Option<String>,
+    target: target_policy::TargetPolicy,
     replay_buffered: bool,
 ) -> Result<()> {
     print_json_line(&tunnel_started_receipt(
@@ -1733,6 +1752,7 @@ async fn run_tunnel_json(
         port,
         organization_id.clone(),
         slug.clone(),
+        target,
         event_tx,
         replay_buffered,
     ));
@@ -1816,6 +1836,8 @@ async fn run(cli: Cli) -> Result<()> {
             endpoint,
             target,
             ws_url,
+            allow_non_loopback,
+            insecure_tls,
         } => {
             // Initialize logging for tunnel
             let log_config = LogConfig {
@@ -1840,9 +1862,16 @@ async fn run(cli: Cli) -> Result<()> {
                     target,
                     ws_url,
                     selected_organization_id,
+                    allow_non_loopback,
+                    insecure_tls,
                 )
                 .await?;
             } else {
+                let target_policy =
+                    target_policy::TargetPolicy::resolve(&target, allow_non_loopback, insecure_tls)
+                        .await?;
+                let target = target_policy.display_url();
+
                 // Setup TUI for listen command
                 let mut terminal = setup_terminal()?;
                 let mut app = App::new()?;
@@ -1860,7 +1889,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let tunnel_client = tunnel::TunnelClient::new(
                     access_token_rx,
                     endpoint.clone(),
-                    target.clone(),
+                    target_policy,
                     ws_url,
                     event_tx,
                 );
@@ -1958,16 +1987,11 @@ async fn run(cli: Cli) -> Result<()> {
                     print_field("CONFIG FILE", config_path.display());
                     println!();
                     match &config.access_token {
-                        Some(token) => {
-                            let truncated = if token.len() > 8 {
-                                format!("{}...", &token[..8])
-                            } else {
-                                token.clone()
-                            };
+                        Some(_) => {
                             if config.is_token_valid() {
-                                print_field("TOKEN", format!("{truncated} {}", "(valid)".green()));
+                                print_field("TOKEN", "(present, valid)".green());
                             } else {
-                                print_field("TOKEN", format!("{truncated} {}", "(expired)".red()));
+                                print_field("TOKEN", "(present, expired)".red());
                             }
                         }
                         None => print_field("TOKEN", "(none)".dim()),
@@ -2907,6 +2931,7 @@ async fn run(cli: Cli) -> Result<()> {
             host,
             org,
             slug,
+            allow_non_loopback,
             no_replay_buffered,
         } => {
             // Initialize logging for tunnel
@@ -2924,6 +2949,12 @@ async fn run(cli: Cli) -> Result<()> {
             let selected_org = resolve_tunnel_org(org, &config);
             let access_token = ensure_valid_token(&mut config).await?;
             let access_token_rx = refreshed_access_token_rx(access_token, config);
+            let target = target_policy::TargetPolicy::resolve(
+                &local_tunnel_target_url(&host, port),
+                allow_non_loopback,
+                false,
+            )
+            .await?;
 
             let replay_buffered = !no_replay_buffered;
 
@@ -2934,6 +2965,7 @@ async fn run(cli: Cli) -> Result<()> {
                     port,
                     selected_org,
                     slug,
+                    target,
                     replay_buffered,
                 )
                 .await?;
@@ -2961,6 +2993,7 @@ async fn run(cli: Cli) -> Result<()> {
                     port,
                     selected_org,
                     slug,
+                    target,
                     event_tx.clone(),
                     replay_buffered,
                 );
@@ -4164,12 +4197,14 @@ fn print_uptime_checks(response: &api::UptimeChecksResponse) {
     print_pagination(&response.pagination);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_tunnel_forwarder_manager(
     access_token_rx: watch::Receiver<String>,
     host: String,
     port: u16,
     org: Option<String>,
     slug: Option<String>,
+    target: target_policy::TargetPolicy,
     event_tx: mpsc::Sender<TunnelEvent>,
     replay_buffered: bool,
 ) -> mpsc::UnboundedSender<()> {
@@ -4182,6 +4217,7 @@ fn spawn_tunnel_forwarder_manager(
             port,
             org.clone(),
             slug.clone(),
+            target.clone(),
             event_tx.clone(),
             replay_buffered,
         ));
@@ -4199,6 +4235,7 @@ fn spawn_tunnel_forwarder_manager(
                 port,
                 org.clone(),
                 slug.clone(),
+                target.clone(),
                 event_tx.clone(),
                 replay_buffered,
             ));
@@ -4211,12 +4248,14 @@ fn spawn_tunnel_forwarder_manager(
     reconnect_tx
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tunnel_forwarder_connection(
     access_token_rx: watch::Receiver<String>,
     host: String,
     port: u16,
     org: Option<String>,
     slug: Option<String>,
+    target: target_policy::TargetPolicy,
     event_tx: mpsc::Sender<TunnelEvent>,
     replay_buffered: bool,
 ) {
@@ -4224,6 +4263,7 @@ async fn run_tunnel_forwarder_connection(
         access_token_rx,
         host,
         port,
+        target,
         org,
         slug,
         event_tx,

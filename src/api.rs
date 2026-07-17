@@ -7,7 +7,9 @@ use reqwest::{
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const RELAY_TICKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn deserialize_map_or_default<'de, D>(
     deserializer: D,
@@ -23,6 +25,19 @@ where
 pub struct Organization {
     pub id: String,
     pub name: String,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct RelayTicket {
+    pub ticket: String,
+    pub scope: String,
+    pub plan_fingerprint: String,
+    pub expires_at: String,
+}
+
+#[derive(Deserialize)]
+struct RelayTicketEnvelope {
+    data: RelayTicket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,6 +544,47 @@ pub async fn revoke_refresh_token(refresh_token: &str) -> Result<()> {
     let client = Client::new();
     let _ = client.post(&url).json(&body).send().await;
     Ok(())
+}
+
+/// Exchange a long-lived HTTP credential for a short-lived relay handshake ticket.
+pub async fn issue_relay_ticket(
+    access_token: &str,
+    base_url: &str,
+    plan: &Value,
+) -> Result<RelayTicket> {
+    let http_base = base_url
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1);
+    let url = format!(
+        "{}/api/v1/tunnel/relay-tickets",
+        http_base.trim_end_matches('/')
+    );
+
+    let response = Client::new()
+        .post(url)
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({"plan": plan}))
+        .timeout(RELAY_TICKET_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .context("Failed to request relay handshake ticket")?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        let permanent_client_error =
+            status.is_client_error() && !matches!(status.as_u16(), 408 | 429);
+        let failure = if permanent_client_error {
+            "Relay handshake rejected"
+        } else {
+            "Relay handshake ticket request failed"
+        };
+        return Err(anyhow!("{} (HTTP {}): {}", failure, status, text));
+    }
+
+    serde_json::from_str::<RelayTicketEnvelope>(&text)
+        .map(|envelope| envelope.data)
+        .context("Failed to parse relay handshake ticket")
 }
 
 impl ApiClient {
@@ -1115,6 +1171,64 @@ mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
+
+    #[tokio::test]
+    async fn relay_ticket_exchange_uses_authorization_header_and_parses_safe_receipt() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v1/tunnel/relay-tickets")
+            .match_header("authorization", "Bearer access-secret")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "plan": {"mode": "capture_forward"}
+            })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"ticket":"hktr_once","scope":"relay:listen","plan_fingerprint":"fingerprint","expires_at":"2026-07-14T20:01:00Z"}}"#,
+            )
+            .create_async()
+            .await;
+
+        let ticket = issue_relay_ticket(
+            "access-secret",
+            &server.url(),
+            &serde_json::json!({"mode": "capture_forward"}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ticket.ticket, "hktr_once");
+        assert_eq!(ticket.scope, "relay:listen");
+        assert_eq!(ticket.plan_fingerprint, "fingerprint");
+        assert_eq!(ticket.expires_at, "2026-07-14T20:01:00Z");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_exchange_classifies_permanent_http_rejections() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v1/tunnel/relay-tickets")
+            .with_status(401)
+            .with_body(r#"{"error":{"code":"unauthorized"}}"#)
+            .create_async()
+            .await;
+
+        let error = match issue_relay_ticket(
+            "expired-secret",
+            &server.url(),
+            &serde_json::json!({"mode": "capture_forward"}),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected relay-ticket rejection"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("Relay handshake rejected"));
+        assert!(error.to_string().contains("HTTP 401 Unauthorized"));
+        mock.assert_async().await;
+    }
 
     #[tokio::test]
     async fn test_forward_request_success() {

@@ -242,7 +242,13 @@ impl Logger {
         // Remove sensitive data
         if let Some(obj) = config.as_object_mut() {
             obj.remove("access_token");
+            obj.remove("refresh_token");
             if let Some(token_expires) = obj.get_mut("token_expires_at")
+                && token_expires.is_string()
+            {
+                *token_expires = serde_json::Value::String("[REDACTED]".to_string());
+            }
+            if let Some(token_expires) = obj.get_mut("refresh_token_expires_at")
                 && token_expires.is_string()
             {
                 *token_expires = serde_json::Value::String("[REDACTED]".to_string());

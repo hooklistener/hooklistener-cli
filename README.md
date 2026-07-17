@@ -43,6 +43,12 @@ hooklistener listen stripe-sandbox \
   --target http://localhost:3000/webhooks/stripe
 ```
 
+Listener targets are loopback-only by default. Hooklistener resolves and pins the target address,
+does not follow redirects, ignores proxy environment variables, and rejects target URLs containing
+credentials, query strings, or fragments. Use `--allow-non-loopback` only for an explicitly trusted
+remote target. HTTPS certificate verification can be disabled only with the visible
+`--insecure-tls` opt-in.
+
 ### Try it without logging in
 
 Create a temporary anonymous endpoint:
