@@ -96,6 +96,19 @@ fn should_forward_request_header(key: &str) -> bool {
         .any(|header| key.eq_ignore_ascii_case(header))
 }
 
+fn supported_tunnel_method(method: &str) -> Option<reqwest::Method> {
+    match method {
+        "GET" => Some(reqwest::Method::GET),
+        "POST" => Some(reqwest::Method::POST),
+        "PUT" => Some(reqwest::Method::PUT),
+        "DELETE" => Some(reqwest::Method::DELETE),
+        "PATCH" => Some(reqwest::Method::PATCH),
+        "HEAD" => Some(reqwest::Method::HEAD),
+        "OPTIONS" => Some(reqwest::Method::OPTIONS),
+        _ => None,
+    }
+}
+
 fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
@@ -2216,9 +2229,9 @@ impl TunnelForwarder {
         }
 
         let client = tunnel_http_client(Duration::from_millis(remaining_ms))?;
-        let request_method = match reqwest::Method::from_bytes(method.as_bytes()) {
-            Ok(method) => method,
-            Err(_) => {
+        let request_method = match supported_tunnel_method(&method) {
+            Some(method) => method,
+            None => {
                 warn!("Unsupported HTTP method: {}", method);
                 self.send_tunnel_error(
                     &request_id,
@@ -2672,6 +2685,16 @@ mod tests {
         assert!(should_forward_request_header("content-type"));
         assert!(should_forward_request_header("authorization"));
         assert!(should_forward_request_header("x-custom-header"));
+    }
+
+    #[test]
+    fn test_supported_tunnel_method_rejects_extension_methods() {
+        assert_eq!(supported_tunnel_method("GET"), Some(reqwest::Method::GET));
+        assert_eq!(
+            supported_tunnel_method("OPTIONS"),
+            Some(reqwest::Method::OPTIONS)
+        );
+        assert_eq!(supported_tunnel_method("PURGE"), None);
     }
 
     #[test]
