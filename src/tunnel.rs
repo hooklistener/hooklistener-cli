@@ -458,16 +458,7 @@ fn should_forward_request_header(key: &str) -> bool {
 }
 
 fn supported_tunnel_method(method: &str) -> Option<reqwest::Method> {
-    match method {
-        "GET" => Some(reqwest::Method::GET),
-        "POST" => Some(reqwest::Method::POST),
-        "PUT" => Some(reqwest::Method::PUT),
-        "DELETE" => Some(reqwest::Method::DELETE),
-        "PATCH" => Some(reqwest::Method::PATCH),
-        "HEAD" => Some(reqwest::Method::HEAD),
-        "OPTIONS" => Some(reqwest::Method::OPTIONS),
-        _ => None,
-    }
+    reqwest::Method::from_bytes(method.as_bytes()).ok()
 }
 
 fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
@@ -3356,13 +3347,17 @@ mod tests {
     }
 
     #[test]
-    fn test_supported_tunnel_method_rejects_extension_methods() {
+    fn test_supported_tunnel_method_accepts_token_valid_extension_methods() {
         assert_eq!(supported_tunnel_method("GET"), Some(reqwest::Method::GET));
         assert_eq!(
             supported_tunnel_method("OPTIONS"),
             Some(reqwest::Method::OPTIONS)
         );
-        assert_eq!(supported_tunnel_method("PURGE"), None);
+        assert_eq!(
+            supported_tunnel_method("PURGE"),
+            Some(reqwest::Method::from_bytes(b"PURGE").unwrap())
+        );
+        assert_eq!(supported_tunnel_method("BAD METHOD"), None);
     }
 
     #[test]
