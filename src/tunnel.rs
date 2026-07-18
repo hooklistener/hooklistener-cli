@@ -43,10 +43,10 @@ const MAX_RAW_BODY_BYTES: usize = 1_048_576;
 const UI_BODY_PREVIEW_BYTES: usize = 65_536;
 const REDACTED_SECRET: &str = "[REDACTED]";
 const LOCAL_WORK_MAX_COUNT: usize = 8;
-const LOCAL_WORK_MAX_BYTES: usize = 64 * 1024 * 1024;
+const LOCAL_WORK_MAX_BYTES: usize = 256 * 1024 * 1024;
 const INBOUND_STREAM_MAX_COUNT: usize = 16;
-const INBOUND_STREAM_MAX_BYTES: usize = 64 * 1024 * 1024;
-const RESPONSE_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
+const INBOUND_STREAM_MAX_BYTES: usize = TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES;
+const RESPONSE_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
 const OUTBOUND_CONTROL_MAX_COUNT: usize = 256;
 const OUTBOUND_RESPONSE_MAX_COUNT: usize = 256;
 const OUTBOUND_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -310,15 +310,11 @@ struct LocalDelivery {
 
 impl LocalDelivery {
     fn retained_bytes(&self) -> usize {
+        // This semaphore is the retained body budget. Request count is bounded
+        // separately, while request metadata has protocol and HTTP ingress
+        // limits of its own. Including metadata here would reject a body that
+        // is exactly at the server-advertised limit.
         self.body.len()
-            + self.method.len()
-            + self.path.len()
-            + self.query_string.len()
-            + self
-                .headers
-                .iter()
-                .map(|(name, value)| name.len() + value.len())
-                .sum::<usize>()
     }
 
     fn received_event(&self) -> TunnelEvent {
@@ -462,16 +458,7 @@ fn should_forward_request_header(key: &str) -> bool {
 }
 
 fn supported_tunnel_method(method: &str) -> Option<reqwest::Method> {
-    match method {
-        "GET" => Some(reqwest::Method::GET),
-        "POST" => Some(reqwest::Method::POST),
-        "PUT" => Some(reqwest::Method::PUT),
-        "DELETE" => Some(reqwest::Method::DELETE),
-        "PATCH" => Some(reqwest::Method::PATCH),
-        "HEAD" => Some(reqwest::Method::HEAD),
-        "OPTIONS" => Some(reqwest::Method::OPTIONS),
-        _ => None,
-    }
+    reqwest::Method::from_bytes(method.as_bytes()).ok()
 }
 
 fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
@@ -1881,6 +1868,7 @@ impl TunnelClient {
                 }
                 Err(ref e) => {
                     let err_msg = e.to_string();
+                    warn!(error = %err_msg, "Tunnel connection attempt failed");
                     if is_fatal_error(&err_msg) {
                         let _ = self
                             .event_tx
@@ -3159,6 +3147,7 @@ impl TunnelForwarder {
                 }
                 Err(ref e) => {
                     let err_msg = e.to_string();
+                    warn!(error = %err_msg, "Tunnel connection attempt failed");
                     if is_fatal_error(&err_msg) {
                         let _ = self
                             .event_tx
@@ -3358,13 +3347,17 @@ mod tests {
     }
 
     #[test]
-    fn test_supported_tunnel_method_rejects_extension_methods() {
+    fn test_supported_tunnel_method_accepts_token_valid_extension_methods() {
         assert_eq!(supported_tunnel_method("GET"), Some(reqwest::Method::GET));
         assert_eq!(
             supported_tunnel_method("OPTIONS"),
             Some(reqwest::Method::OPTIONS)
         );
-        assert_eq!(supported_tunnel_method("PURGE"), None);
+        assert_eq!(
+            supported_tunnel_method("PURGE"),
+            Some(reqwest::Method::from_bytes(b"PURGE").unwrap())
+        );
+        assert_eq!(supported_tunnel_method("BAD METHOD"), None);
     }
 
     #[test]
@@ -3717,19 +3710,43 @@ mod tests {
     fn test_local_work_budget_bounds_concurrent_ten_megabyte_deliveries() {
         let budget = LocalWorkBudget::new();
         let ten_mib = 10 * 1024 * 1024;
-        let mut permits = Vec::new();
+        let permits = (0..LOCAL_WORK_MAX_COUNT)
+            .map(|_| budget.try_acquire(ten_mib).unwrap())
+            .collect::<Vec<_>>();
 
-        for _ in 0..6 {
-            permits.push(budget.try_acquire(ten_mib).unwrap());
-        }
-
-        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 6);
-        assert_eq!(budget.available_bytes(), 4 * 1024 * 1024);
+        assert_eq!(budget.available_count(), 0);
         assert!(budget.try_acquire(ten_mib).is_none());
-        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 6);
 
-        permits.pop();
-        assert!(budget.try_acquire(ten_mib).is_some());
+        drop(permits);
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT);
+        assert_eq!(budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_local_work_budget_allows_one_advertised_limit_body() {
+        let budget = LocalWorkBudget::new();
+        let delivery = LocalDelivery {
+            request_id: "request-at-limit".to_string(),
+            method: "POST".to_string(),
+            path: "/metadata-does-not-reduce-the-body-budget".to_string(),
+            query_string: "source=conformance".to_string(),
+            headers: vec![(
+                "content-type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body: Vec::new(),
+            deadline_unix_ms: unix_time_ms() + 1_000,
+            replay: false,
+        };
+        assert_eq!(delivery.retained_bytes(), 0);
+
+        let permit = budget.try_acquire(LOCAL_WORK_MAX_BYTES).unwrap();
+
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_acquire(1).is_none());
+
+        drop(permit);
+        assert_eq!(budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
     }
 
     #[test]
@@ -3765,14 +3782,26 @@ mod tests {
     fn test_response_buffer_budget_bounds_concurrent_ten_megabyte_responses() {
         let budget = ResponseBufferBudget::new();
         let ten_mib = 10 * 1024 * 1024;
-        let permits = (0..6)
+        let permits = (0..25)
             .map(|_| budget.try_reserve(Some(ten_mib)).unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(budget.available_bytes(), 4 * 1024 * 1024);
+        assert_eq!(budget.available_bytes(), 6 * 1024 * 1024);
         assert!(budget.try_reserve(Some(ten_mib)).is_none());
 
         drop(permits);
+        assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_response_buffer_allows_one_advertised_limit_body() {
+        let budget = ResponseBufferBudget::new();
+        let permit = budget.try_reserve(Some(RESPONSE_BUFFER_MAX_BYTES)).unwrap();
+
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_reserve(Some(1)).is_none());
+
+        drop(permit);
         assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
     }
 
