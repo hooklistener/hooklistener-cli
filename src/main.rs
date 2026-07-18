@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::{
     sync::{mpsc, watch},
+    task::JoinHandle,
     time::sleep,
 };
 use tracing::error;
@@ -1986,8 +1987,8 @@ async fn run(cli: Cli) -> Result<()> {
         ));
     }
 
-    // Spawn background version check for non-interactive, non-update commands
-    let update_handle =
+    // Spawn a background version check for eligible commands.
+    let mut update_handle =
         if !json && !matches!(command, Commands::Update | Commands::Completions { .. }) {
             config::Config::load()
                 .ok()
@@ -2081,8 +2082,16 @@ async fn run(cli: Cli) -> Result<()> {
                 });
 
                 let logo_rx = logo::spawn_logo_animation();
-                let res =
-                    run_app(&mut terminal, &mut app, event_rx, None, None, Some(logo_rx)).await;
+                let res = run_app(
+                    &mut terminal,
+                    &mut app,
+                    event_rx,
+                    None,
+                    None,
+                    Some(logo_rx),
+                    &mut update_handle,
+                )
+                .await;
 
                 restore_terminal(&mut terminal)?;
 
@@ -2773,8 +2782,16 @@ async fn run(cli: Cli) -> Result<()> {
                 ttl,
                 allow_non_loopback,
             } => {
-                run_anonymous_tunnel_activation(host, port, name, ttl, allow_non_loopback, json)
-                    .await?;
+                run_anonymous_tunnel_activation(
+                    host,
+                    port,
+                    name,
+                    ttl,
+                    allow_non_loopback,
+                    json,
+                    &mut update_handle,
+                )
+                .await?;
             }
             AnonAction::Claim {
                 route_id,
@@ -3161,7 +3178,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ..Default::default()
             };
             let _logger = Logger::new(log_config)?;
-            run_tunnel_lifecycle_command(action, target, json).await?;
+            run_tunnel_lifecycle_command(action, target, json, &mut update_handle).await?;
         }
     }
 
@@ -3307,11 +3324,12 @@ async fn run_tunnel_lifecycle_command(
     action: Option<TunnelAction>,
     default_target: TunnelTargetArgs,
     json: bool,
+    update_handle: &mut Option<JoinHandle<Option<String>>>,
 ) -> Result<()> {
     match action {
-        None => run_tunnel_activation(default_target.resolve(), json).await,
+        None => run_tunnel_activation(default_target.resolve(), json, update_handle).await,
         Some(TunnelAction::Start(target)) | Some(TunnelAction::Activate(target)) => {
-            run_tunnel_activation(default_target.merge(target).resolve(), json).await
+            run_tunnel_activation(default_target.merge(target).resolve(), json, update_handle).await
         }
         Some(TunnelAction::Prepare(target)) => {
             let target = default_target.merge(target).resolve();
@@ -3479,7 +3497,11 @@ async fn run_tunnel_lifecycle_command(
     }
 }
 
-async fn run_tunnel_activation(target: TunnelTarget, json: bool) -> Result<()> {
+async fn run_tunnel_activation(
+    target: TunnelTarget,
+    json: bool,
+    update_handle: &mut Option<JoinHandle<Option<String>>>,
+) -> Result<()> {
     validate_tunnel_target(&target)?;
     let local_target_url = local_tunnel_target_url(&target.host, target.port);
     let target_policy =
@@ -3531,6 +3553,7 @@ async fn run_tunnel_activation(target: TunnelTarget, json: bool) -> Result<()> {
             Some(reconnect_tx),
             Some(event_tx),
             Some(logo::spawn_logo_animation()),
+            update_handle,
         )
         .await;
         restore_terminal(&mut terminal)?;
@@ -3545,6 +3568,7 @@ async fn run_anonymous_tunnel_activation(
     ttl: u64,
     allow_non_loopback: bool,
     json: bool,
+    update_handle: &mut Option<JoinHandle<Option<String>>>,
 ) -> Result<()> {
     let target = TunnelTarget {
         port,
@@ -3652,6 +3676,7 @@ async fn run_anonymous_tunnel_activation(
             Some(reconnect_tx),
             Some(event_tx),
             Some(logo::spawn_logo_animation()),
+            update_handle,
         )
         .await;
         restore_terminal(&mut terminal)?;
@@ -5096,6 +5121,7 @@ async fn run_app<B: ratatui::backend::Backend + Send>(
     tunnel_reconnect_tx: Option<mpsc::UnboundedSender<()>>,
     tunnel_event_tx: Option<mpsc::Sender<TunnelEvent>>,
     mut logo_rx: Option<watch::Receiver<String>>,
+    update_handle: &mut Option<JoinHandle<Option<String>>>,
 ) -> Result<()>
 where
     <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
@@ -5104,6 +5130,14 @@ where
     let _cleanup = TerminalCleanup;
 
     loop {
+        if update_handle.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = update_handle.take()
+            && let Ok(Some(new_version)) = handle.await
+        {
+            updater::persist_check_result(Some(&new_version));
+            app.available_update = Some(new_version);
+        }
+
         if let Some(logo_rx) = logo_rx.as_mut() {
             let should_update_logo =
                 app.logo_frame.is_none() || logo_rx.has_changed().unwrap_or(false);

@@ -1,0 +1,27 @@
+---
+source: src/ui.rs
+expression: snapshot
+---
+
+ ┌ Tunnel Connection ──────────────────────────┐┌ Statistics ─────────────────┐
+ │ENDPOINT  orders-prod-v7zd                   ││TOTAL    0                   │
+ │TARGET    http://localhost:8080/webhook      ││SUCCESS  0                   │
+ │STATUS    ● Connected                        ││FAILED   0                   │
+ └─────────────────────────────────────────────┘└─────────────────────────────┘
+ ┌ Live Requests ─────────────────────────────────────────────────────────────┐
+ │                           Waiting for webhooks...                          │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ └────────────────────────────────────────────────────────────────────────────┘
+ [WARN] UPDATE AVAILABLE   1.7.0 → 1.8.0   Run `hooklistener update`
+ Listen (0)  ↑↓ Select | Enter Details | / Search | Q Quit       API connected

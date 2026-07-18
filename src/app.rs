@@ -471,6 +471,9 @@ pub struct App {
     pub tunnel_status_message: Option<FeedbackMessage>,
     pub status_message: Option<FeedbackMessage>,
 
+    // Persistent update notice
+    pub available_update: Option<String>,
+
     // Accessible display mode strips all foreground and background colors after rendering.
     pub monochrome: bool,
 
@@ -539,6 +542,7 @@ impl App {
             tunnel_pinned_only: false,
             tunnel_status_message: None,
             status_message: None,
+            available_update: None,
             monochrome: false,
             search_active: false,
             search_query: String::new(),
@@ -3394,5 +3398,15 @@ mod tests {
         });
         app.tick();
         assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn available_update_persists_after_tick() {
+        let mut app = App::with_config(make_config());
+        app.available_update = Some("1.8.0".to_string());
+
+        app.tick();
+
+        assert_eq!(app.available_update.as_deref(), Some("1.8.0"));
     }
 }

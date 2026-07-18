@@ -13,12 +13,13 @@ use ratatui::{
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    let footer_height = if app.available_update.is_some() { 2 } else { 1 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Min(0),    // Main content
-            Constraint::Length(1), // Status bar
+            Constraint::Min(0),                // Main content
+            Constraint::Length(footer_height), // Update notice and status bar
         ])
         .split(frame.area());
 
@@ -41,8 +42,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     }
 
-    // Draw status bar
-    draw_status_bar(frame, app, chunks[1]);
+    if app.available_update.is_some() && chunks[1].height >= 2 {
+        let footer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(chunks[1]);
+        draw_update_warning(frame, app, footer[0]);
+        draw_status_bar(frame, app, footer[1]);
+    } else {
+        draw_status_bar(frame, app, chunks[1]);
+    }
 
     if app.monochrome {
         for cell in &mut frame.buffer_mut().content {
@@ -69,6 +78,26 @@ fn feedback_label(kind: FeedbackKind) -> &'static str {
         FeedbackKind::Warning => "WARN",
         FeedbackKind::Error => "ERR",
     }
+}
+
+fn draw_update_warning(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(new_version) = app.available_update.as_deref() else {
+        return;
+    };
+    let text = format!(
+        "[{}] UPDATE AVAILABLE   {} → {}   Run `hooklistener update`",
+        feedback_label(FeedbackKind::Warning),
+        env!("CARGO_PKG_VERSION"),
+        new_version
+    );
+    let warning = Paragraph::new(Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(feedback_color(FeedbackKind::Warning))
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    frame.render_widget(warning, area);
 }
 
 fn listening_history_title(app: &App) -> String {
@@ -3324,6 +3353,16 @@ mod tests {
     }
 
     #[test]
+    fn tunneling_update_warning_80x24_snapshot() {
+        let mut app = app_with_tunnel_rows();
+        app.available_update = Some("1.8.0".to_string());
+
+        let snapshot = render_app_to_text(&app, 80, 24);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
     fn tunneling_inherits_terminal_background() {
         let buffer = render_tunnel_80x24_to_buffer();
 
@@ -3667,6 +3706,44 @@ mod tests {
         let snapshot = render_app_to_text(&app, 80, 24);
 
         insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn listening_update_warning_80x24_snapshot() {
+        let mut app = App::with_config(valid_test_config());
+        app.state = AppState::Listening;
+        app.listening_connected = true;
+        app.listening_endpoint = "orders-prod-v7zd".to_string();
+        app.listening_target = "http://localhost:8080/webhook".to_string();
+        app.available_update = Some("1.8.0".to_string());
+
+        let snapshot = render_app_to_text(&app, 80, 24);
+
+        insta::assert_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn monochrome_update_warning_keeps_warning_text() {
+        let mut app = base_tunnel_app();
+        app.available_update = Some("1.8.0".to_string());
+        app.monochrome = true;
+
+        let rendered = render_app_to_text(&app, 80, 24);
+
+        assert!(rendered.contains(&format!(
+            "[WARN] UPDATE AVAILABLE   {} → 1.8.0   Run `hooklistener update`",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+
+    #[test]
+    fn update_warning_preserves_status_bar_when_only_one_footer_row_fits() {
+        let mut app = base_tunnel_app();
+        app.available_update = Some("1.8.0".to_string());
+
+        let rendered = render_app_to_text(&app, 80, 3);
+
+        assert!(rendered.contains("Tunnel (0)"));
     }
 
     #[test]
