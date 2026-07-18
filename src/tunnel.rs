@@ -1933,6 +1933,14 @@ pub struct TunnelForwarder {
     replay_buffered: bool,
     presentation_drops: Arc<AtomicUsize>,
     resume_session_id: Arc<Mutex<Option<String>>>,
+    anonymous_route: Option<AnonymousRouteCredential>,
+}
+
+#[derive(Clone)]
+pub struct AnonymousRouteCredential {
+    route_id: String,
+    route_token: String,
+    initial_ticket: Arc<Mutex<Option<api::RelayTicket>>>,
 }
 
 impl TunnelForwarder {
@@ -1962,7 +1970,22 @@ impl TunnelForwarder {
             replay_buffered,
             presentation_drops: Arc::new(AtomicUsize::new(0)),
             resume_session_id: Arc::new(Mutex::new(None)),
+            anonymous_route: None,
         }
+    }
+
+    pub fn with_anonymous_route(
+        mut self,
+        route_id: String,
+        route_token: String,
+        initial_ticket: Option<api::RelayTicket>,
+    ) -> Self {
+        self.anonymous_route = Some(AnonymousRouteCredential {
+            route_id,
+            route_token,
+            initial_ticket: Arc::new(Mutex::new(initial_ticket)),
+        });
+        self
     }
 
     fn emit_presentation(&self, event: TunnelEvent) {
@@ -1984,6 +2007,10 @@ impl TunnelForwarder {
     }
 
     async fn resume_token(&self, access_token: &str) -> Result<Option<String>> {
+        if self.anonymous_route.is_some() {
+            return Ok(None);
+        }
+
         let session_id = self
             .resume_session_id
             .lock()
@@ -2017,12 +2044,32 @@ impl TunnelForwarder {
         // Exchange the long-lived HTTP credential for a one-time, scoped handshake ticket.
         let access_token = self.access_token_rx.borrow().clone();
         let resume_token = self.resume_token(&access_token).await?;
-        let plan = serde_json::json!({
-            "mode": DIRECT_RESPONSE_MODE,
-            "route": {"organization_id": &self.org_id, "slug": &self.slug},
-            "target": self.target.plan(),
-        });
-        let relay_ticket = api::issue_relay_ticket(&access_token, &self.base_url, &plan).await?;
+        let relay_ticket = if let Some(anonymous_route) = &self.anonymous_route {
+            let initial_ticket = anonymous_route
+                .initial_ticket
+                .lock()
+                .map_err(|_| anyhow!("Anonymous tunnel credential state is unavailable"))?
+                .take();
+
+            match initial_ticket {
+                Some(ticket) => ticket,
+                None => {
+                    ApiClient::unauthenticated_at(self.base_url.clone())?
+                        .issue_anonymous_tunnel_ticket(
+                            &anonymous_route.route_id,
+                            &anonymous_route.route_token,
+                        )
+                        .await?
+                }
+            }
+        } else {
+            let plan = serde_json::json!({
+                "mode": DIRECT_RESPONSE_MODE,
+                "route": {"organization_id": &self.org_id, "slug": &self.slug},
+                "target": self.target.plan(),
+            });
+            api::issue_relay_ticket(&access_token, &self.base_url, &plan).await?
+        };
         if relay_ticket.scope != "relay:tunnel" {
             return Err(anyhow!(
                 "Relay handshake rejected: ticket returned an incompatible scope"
