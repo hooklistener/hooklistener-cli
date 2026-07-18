@@ -1,0 +1,46 @@
+name: Tunnel Phase 1 Conformance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  platform-conformance:
+    name: Authenticated lifecycle (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-latest
+          - platform: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate bounded relay and lifecycle contracts
+        run: cargo test --locked tunnel
+      - name: Run authenticated human and JSON flows
+        env:
+          HOOKLISTENER_CONFORMANCE_OUTPUT: ${{ runner.temp }}/phase1-${{ matrix.platform }}.json
+          HOOKLISTENER_CONFORMANCE_PLATFORM: ${{ matrix.platform }}
+        run: cargo test --locked --test tunnel_phase1_conformance -- --nocapture
+      - name: Upload platform receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-${{ matrix.platform }}
+          path: ${{ runner.temp }}/phase1-${{ matrix.platform }}.json
+          if-no-files-found: error
+          retention-days: 30
