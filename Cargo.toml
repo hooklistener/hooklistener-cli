@@ -51,6 +51,9 @@ insta = "1.47"
 mockito = "1.7"
 tempfile = "3.27"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [[bin]]
 name = "hooklistener"
 path = "src/main.rs"

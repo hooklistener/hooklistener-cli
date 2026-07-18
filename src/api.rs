@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const RELAY_TICKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TOKEN_REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -681,14 +682,17 @@ pub fn default_base_url() -> String {
 }
 
 /// Refresh an expired CLI access token using a refresh token (no auth needed).
-pub async fn refresh_access_token(refresh_token: &str) -> Result<TokenRefreshResponse> {
-    let base_url = default_base_url();
+pub async fn refresh_access_token(
+    refresh_token: &str,
+    base_url: &str,
+) -> Result<TokenRefreshResponse> {
     let url = format!("{}/api/v1/auth/refresh", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "refresh_token": refresh_token });
 
     let client = Client::new();
     let response = client
         .post(&url)
+        .timeout(TOKEN_REFRESH_REQUEST_TIMEOUT)
         .json(&body)
         .send()
         .await
