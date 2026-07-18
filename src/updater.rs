@@ -110,9 +110,15 @@ pub fn spawn_version_check(config: &Config) -> Option<JoinHandle<Option<String>>
 }
 
 async fn check_latest_version() -> Result<Option<String>, UpdateError> {
+    check_latest_version_from("https://api.github.com").await
+}
+
+async fn check_latest_version_from(base_url: &str) -> Result<Option<String>, UpdateError> {
     let url = format!(
-        "https://api.github.com/repos/{}/{}/releases/latest",
-        GITHUB_REPO_OWNER, GITHUB_REPO_NAME
+        "{}/repos/{}/{}/releases/latest",
+        base_url.trim_end_matches('/'),
+        GITHUB_REPO_OWNER,
+        GITHUB_REPO_NAME
     );
 
     let client = reqwest::Client::builder()
@@ -284,6 +290,98 @@ async fn run_binary_self_update(json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RELEASE_PATH: &str = "/repos/hooklistener/hooklistener-cli/releases/latest";
+
+    async fn mock_release(status: usize, body: &str) -> (mockito::ServerGuard, mockito::Mock) {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", RELEASE_PATH)
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        (server, mock)
+    }
+
+    #[tokio::test]
+    async fn check_latest_version_returns_newer_release() {
+        let (server, mock) = mock_release(200, r#"{"tag_name":"v999.0.0"}"#).await;
+
+        let result = check_latest_version_from(&server.url()).await;
+
+        assert_eq!(result.unwrap(), Some("999.0.0".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn check_latest_version_returns_none_for_equal_release() {
+        let body = format!(r#"{{"tag_name":"v{CURRENT_VERSION}"}}"#);
+        let (server, mock) = mock_release(200, &body).await;
+
+        let result = check_latest_version_from(&server.url()).await;
+
+        assert_eq!(result.unwrap(), None);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn check_latest_version_returns_none_for_older_release() {
+        let (server, mock) = mock_release(200, r#"{"tag_name":"v0.0.1"}"#).await;
+
+        let result = check_latest_version_from(&server.url()).await;
+
+        assert_eq!(result.unwrap(), None);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn check_latest_version_returns_typed_error_for_non_success_status() {
+        let (server, mock) = mock_release(503, r#"{"message":"unavailable"}"#).await;
+
+        let result = check_latest_version_from(&server.url()).await;
+
+        assert!(matches!(
+            result,
+            Err(UpdateError::CheckFailed(message)) if message.contains("503 Service Unavailable")
+        ));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn check_latest_version_returns_typed_error_for_malformed_json() {
+        let (server, mock) = mock_release(200, "not JSON").await;
+
+        let result = check_latest_version_from(&server.url()).await;
+
+        assert!(matches!(result, Err(UpdateError::CheckFailed(_))));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn recent_newer_cached_version_is_returned_without_network_check() {
+        let config = Config {
+            last_update_check: Some(Utc::now()),
+            latest_known_version: Some("999.0.0".to_string()),
+            ..Config::default()
+        };
+
+        let result = spawn_version_check(&config).unwrap().await.unwrap();
+
+        assert_eq!(result, Some("999.0.0".to_string()));
+    }
+
+    #[test]
+    fn recent_non_newer_cached_version_skips_check() {
+        let config = Config {
+            last_update_check: Some(Utc::now()),
+            latest_known_version: Some(CURRENT_VERSION.to_string()),
+            ..Config::default()
+        };
+
+        assert!(spawn_version_check(&config).is_none());
+    }
 
     #[test]
     fn test_is_newer() {

@@ -82,6 +82,26 @@ fn assert_success(output: &Output) -> String {
     stdout
 }
 
+fn assert_json_error(output: &Output, exit: i32, code: &str) -> Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(exit),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(!stdout.contains(ACCESS_TOKEN));
+    assert!(!stderr.contains(ACCESS_TOKEN));
+    assert!(stderr.is_empty());
+    let value: Value = serde_json::from_str(stdout.trim()).expect("JSON error");
+    assert_eq!(value["$schema"], "hooklistener.cli.error/1");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], code);
+    value
+}
+
 fn assert_json_receipt(stdout: &str, operation: &str) -> Value {
     let receipt: Value = serde_json::from_str(stdout.trim()).expect("one valid NDJSON receipt");
     assert_eq!(receipt["$schema"], "hooklistener.tunnel.receipt/1");
@@ -188,5 +208,162 @@ async fn authenticated_human_and_json_lifecycle_flows_emit_platform_evidence() {
 
     if let Some(path) = std::env::var_os("HOOKLISTENER_CONFORMANCE_OUTPUT") {
         write_platform_receipt(Path::new(&path));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subprocess_error_exit_contracts_are_stable_and_redacted() {
+    let mut server = Server::new_async().await;
+    let api = server
+        .mock("GET", "/api/v1/endpoints")
+        .match_header("authorization", format!("Bearer {ACCESS_TOKEN}").as_str())
+        .match_header("x-organization-id", ORGANIZATION_ID)
+        .with_status(503)
+        .with_body("temporary failure")
+        .expect(1)
+        .create_async()
+        .await;
+    let home = TestHome::new();
+    let error = assert_json_error(
+        &home.command(&server.url(), &["--json", "endpoint", "list"]),
+        1,
+        "command_failed",
+    );
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("HTTP 503")
+    );
+    api.assert_async().await;
+
+    let incompatible = server.mock("GET", "/api/v1/tunnel/contract")
+        .with_status(200).with_header("content-type", "application/json")
+        .with_body(r#"{"data":{"id":"lifecycle","version":"2.0.0","schema":{"major":2,"minor":0},"receipts":{},"events":{},"resources":{},"lifecycle":{},"exit_codes":{}}}"#)
+        .expect(1).create_async().await;
+    let error = assert_json_error(
+        &home.command(&server.url(), &["--json", "tunnel", "list"]),
+        3,
+        "incompatible_schema",
+    );
+    assert_eq!(error["error"]["details"]["actual_major"], 2);
+    incompatible.assert_async().await;
+
+    assert_json_error(
+        &home.command("http://unused.invalid", &["--json", "login"]),
+        1,
+        "unsupported_output_mode",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_events_cursor_exits_four_with_resync_details() {
+    let mut server = Server::new_async().await;
+    let contract = server.mock("GET", "/api/v1/tunnel/contract")
+        .with_status(200).with_header("content-type", "application/json")
+        .with_body(r#"{"data":{"id":"lifecycle","version":"1.0.0","schema":{"major":1,"minor":0},"receipts":{},"events":{},"resources":{},"lifecycle":{},"exit_codes":{}}}"#)
+        .expect(1).create_async().await;
+    let events = server.mock("GET", "/api/v1/tunnel/events")
+        .match_query(Matcher::AllOf(vec![Matcher::UrlEncoded("cursor".into(), "expired".into()), Matcher::UrlEncoded("limit".into(), "50".into())]))
+        .with_status(410).with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"cursor_expired","message":"expired","earliest_cursor":"earliest","resync":{"sessions":"/api/v1/tunnel/sessions"}}}"#)
+        .expect(1).create_async().await;
+    let error = assert_json_error(
+        &TestHome::new().command(
+            &server.url(),
+            &["--json", "tunnel", "events", "--cursor", "expired"],
+        ),
+        4,
+        "cursor_expired",
+    );
+    assert_eq!(error["error"]["details"]["earliest_cursor"], "earliest");
+    contract.assert_async().await;
+    events.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn destructive_endpoint_dispatches_no_request_until_yes_then_exactly_one() {
+    let mut server = Server::new_async().await;
+    let delete = server
+        .mock("DELETE", "/api/v1/endpoints/ep_123")
+        .match_header("authorization", format!("Bearer {ACCESS_TOKEN}").as_str())
+        .match_header("x-organization-id", ORGANIZATION_ID)
+        .with_status(204)
+        .expect(1)
+        .create_async()
+        .await;
+    let home = TestHome::new();
+    assert_json_error(
+        &home.command(&server.url(), &["--json", "endpoint", "delete", "ep_123"]),
+        1,
+        "confirmation_required",
+    );
+    let stdout = assert_success(&home.command(
+        &server.url(),
+        &["--json", "--yes", "endpoint", "delete", "ep_123"],
+    ));
+    let result: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(result["status"], "deleted");
+    assert_eq!(result["organization_id"], ORGANIZATION_ID);
+    delete.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn endpoint_create_dispatches_scoped_body_with_human_and_json_output() {
+    let mut server = Server::new_async().await;
+    let create = server.mock("POST", "/api/v1/endpoints")
+        .match_header("authorization", format!("Bearer {ACCESS_TOKEN}").as_str())
+        .match_header("x-organization-id", ORGANIZATION_ID)
+        .match_body(Matcher::Json(json!({"debug_endpoint":{"name":"Orders","slug":"orders"}})))
+        .with_status(200).with_header("content-type", "application/json")
+        .with_body(r#"{"data":{"id":"ep_123","name":"Orders","slug":"orders","status":"active","webhook_url":"https://example.test/orders"}}"#)
+        .expect(2).create_async().await;
+    let home = TestHome::new();
+    let human = assert_success(&home.command(
+        &server.url(),
+        &["endpoint", "create", "Orders", "--slug", "orders"],
+    ));
+    assert!(human.contains("ENDPOINT CREATED") && human.contains("ep_123"));
+    let stdout = assert_success(&home.command(
+        &server.url(),
+        &["--json", "endpoint", "create", "Orders", "--slug", "orders"],
+    ));
+    let result: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(result["organization_id"], ORGANIZATION_ID);
+    assert_eq!(result["endpoint"]["id"], "ep_123");
+    create.assert_async().await;
+}
+
+#[test]
+fn every_top_level_command_exposes_help_without_loading_runtime_state() {
+    let home = TestHome::new();
+    for command in [
+        "login",
+        "logout",
+        "listen",
+        "tunnel",
+        "endpoint",
+        "cases",
+        "static-tunnel",
+        "anon",
+        "share",
+        "monitor",
+        "org",
+        "config",
+        "diagnostics",
+        "clean-logs",
+        "completions",
+        "update",
+    ] {
+        let output = home.command("http://unused.invalid", &[command, "--help"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{command} --help failed\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(stdout.contains("Usage:"), "missing usage for {command}");
+        assert!(!stdout.contains(ACCESS_TOKEN));
+        assert!(!stderr.contains(ACCESS_TOKEN));
     }
 }

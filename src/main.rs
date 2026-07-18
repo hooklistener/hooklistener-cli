@@ -29,6 +29,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use reqwest::Url;
+use std::future::Future;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -1747,6 +1748,32 @@ fn print_json_line<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerCompletion<T> {
+    Stream(T),
+    Shutdown,
+}
+
+async fn supervise_json_worker<T, S: Future<Output = T>, Q: Future<Output = Result<()>>>(
+    worker: JoinHandle<()>,
+    stream: S,
+    shutdown: Q,
+) -> Result<WorkerCompletion<T>> {
+    tokio::pin!(stream);
+    tokio::pin!(shutdown);
+    let result = tokio::select! {
+        value = &mut stream => WorkerCompletion::Stream(value),
+        signal = &mut shutdown => { signal?; WorkerCompletion::Shutdown }
+    };
+    worker.abort();
+    if let Err(error) = worker.await
+        && !error.is_cancelled()
+    {
+        return Err(error.into());
+    }
+    Ok(result)
+}
+
 async fn resolve_listen_endpoint(
     access_token: &str,
     organization_id: Option<String>,
@@ -1840,7 +1867,7 @@ async fn run_listen_json(
         event_tx,
     );
 
-    tokio::spawn(async move {
+    let worker = tokio::spawn(async move {
         if let Err(e) = tunnel_client
             .connect_with_reconnect(tunnel::ReconnectConfig::default())
             .await
@@ -1849,7 +1876,16 @@ async fn run_listen_json(
         }
     });
 
-    stream_listen_json_events(event_rx, &endpoint_slug, &target_url, endpoint.as_ref()).await
+    match supervise_json_worker(
+        worker,
+        stream_listen_json_events(event_rx, &endpoint_slug, &target_url, endpoint.as_ref()),
+        std::future::pending(),
+    )
+    .await?
+    {
+        WorkerCompletion::Stream(result) => result,
+        WorkerCompletion::Shutdown => unreachable!("shutdown is handled by the event stream"),
+    }
 }
 
 async fn stream_tunnel_json_events(
@@ -1923,7 +1959,7 @@ async fn run_tunnel_json(
     ))?;
 
     let (event_tx, event_rx) = mpsc::channel(tunnel::PRESENTATION_QUEUE_CAPACITY);
-    tokio::spawn(run_tunnel_forwarder_connection(
+    let worker = tokio::spawn(run_tunnel_forwarder_connection(
         access_token_rx,
         host.clone(),
         port,
@@ -1935,14 +1971,22 @@ async fn run_tunnel_json(
         anonymous_route,
     ));
 
-    stream_tunnel_json_events(
-        event_rx,
-        &host,
-        port,
-        organization_id.as_deref(),
-        slug.as_deref(),
+    match supervise_json_worker(
+        worker,
+        stream_tunnel_json_events(
+            event_rx,
+            &host,
+            port,
+            organization_id.as_deref(),
+            slug.as_deref(),
+        ),
+        std::future::pending(),
     )
-    .await
+    .await?
+    {
+        WorkerCompletion::Stream(result) => result,
+        WorkerCompletion::Shutdown => unreachable!("shutdown is handled by the event stream"),
+    }
 }
 
 const SESSION_TOKEN_VALIDITY_DAYS: i64 = 60;
@@ -3991,15 +4035,33 @@ fn refreshed_access_token_rx(
     token_rx
 }
 
-async fn refresh_access_token_loop(mut config: config::Config, token_tx: watch::Sender<String>) {
+async fn refresh_access_token_loop(config: config::Config, token_tx: watch::Sender<String>) {
+    let base_url = api::default_base_url();
+    refresh_access_token_loop_with(config, token_tx, &base_url).await;
+}
+
+async fn refresh_access_token_loop_with(
+    mut config: config::Config,
+    token_tx: watch::Sender<String>,
+    base_url: &str,
+) {
     loop {
-        if config.refresh_token.is_none() || !config.is_refresh_token_valid() {
+        if token_tx.is_closed()
+            || config.refresh_token.is_none()
+            || !config.is_refresh_token_valid()
+        {
             return;
         }
 
-        sleep(access_token_refresh_delay(&config)).await;
+        if sleep_or_token_receiver_closed(&token_tx, access_token_refresh_delay(&config)).await {
+            return;
+        }
 
-        match refresh_access_token_from_config(&mut config).await {
+        let refresh_result = tokio::select! {
+            _ = token_tx.closed() => return,
+            result = refresh_access_token_from_config_with(&mut config, base_url, None) => result,
+        };
+        match refresh_result {
             Ok(access_token) => {
                 if token_tx.send(access_token).is_err() {
                     return;
@@ -4007,9 +4069,26 @@ async fn refresh_access_token_loop(mut config: config::Config, token_tx: watch::
             }
             Err(err) => {
                 error!(error = %err, "Failed to refresh CLI access token");
-                sleep(Duration::from_secs(ACCESS_TOKEN_REFRESH_RETRY_SECONDS)).await;
+                if sleep_or_token_receiver_closed(
+                    &token_tx,
+                    Duration::from_secs(ACCESS_TOKEN_REFRESH_RETRY_SECONDS),
+                )
+                .await
+                {
+                    return;
+                }
             }
         }
+    }
+}
+
+async fn sleep_or_token_receiver_closed(
+    token_tx: &watch::Sender<String>,
+    duration: Duration,
+) -> bool {
+    tokio::select! {
+        _ = token_tx.closed() => true,
+        _ = sleep(duration) => false,
     }
 }
 
@@ -4053,6 +4132,14 @@ async fn ensure_valid_token(config: &mut config::Config) -> Result<String> {
 }
 
 async fn refresh_access_token_from_config(config: &mut config::Config) -> Result<String> {
+    refresh_access_token_from_config_with(config, &api::default_base_url(), None).await
+}
+
+async fn refresh_access_token_from_config_with(
+    config: &mut config::Config,
+    base_url: &str,
+    save_path: Option<&std::path::Path>,
+) -> Result<String> {
     let refresh_token = config
         .refresh_token
         .clone()
@@ -4062,16 +4149,30 @@ async fn refresh_access_token_from_config(config: &mut config::Config) -> Result
         return Err(anyhow!("Refresh token expired"));
     }
 
-    let response = api::refresh_access_token(&refresh_token).await?;
+    let response = api::refresh_access_token(&refresh_token, base_url).await?;
     let expires_at = Utc::now() + ChronoDuration::seconds(response.expires_in as i64);
 
-    config.set_tokens(
+    let mut updated = config::Config {
+        access_token: config.access_token.clone(),
+        token_expires_at: config.token_expires_at,
+        refresh_token: config.refresh_token.clone(),
+        refresh_token_expires_at: config.refresh_token_expires_at,
+        selected_organization_id: config.selected_organization_id.clone(),
+        last_update_check: config.last_update_check,
+        latest_known_version: config.latest_known_version.clone(),
+    };
+    updated.set_tokens(
         response.access_token.clone(),
         expires_at,
         Some(refresh_token),
         config.refresh_token_expires_at,
     );
-    config.save()?;
+    if let Some(path) = save_path {
+        updated.save_to(path)?;
+    } else {
+        updated.save()?;
+    }
+    *config = updated;
 
     Ok(response.access_token)
 }
@@ -5510,11 +5611,42 @@ fn display_error(err: &anyhow::Error, json: bool) {
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
+    let mut cleanup = TerminalInitCleanup::raw_mode_enabled();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    cleanup.alternate_screen = true;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
+    cleanup.disarm();
     Ok(terminal)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TerminalInitCleanup {
+    raw_mode: bool,
+    alternate_screen: bool,
+}
+impl TerminalInitCleanup {
+    fn raw_mode_enabled() -> Self {
+        Self {
+            raw_mode: true,
+            alternate_screen: false,
+        }
+    }
+    fn disarm(&mut self) {
+        self.raw_mode = false;
+        self.alternate_screen = false;
+    }
+}
+impl Drop for TerminalInitCleanup {
+    fn drop(&mut self) {
+        if self.alternate_screen {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        }
+        if self.raw_mode {
+            let _ = disable_raw_mode();
+        }
+    }
 }
 
 struct TerminalCleanup;
@@ -5607,6 +5739,159 @@ mod tests {
             selected_organization_id: selected_org.map(String::from),
             ..config::Config::default()
         }
+    }
+
+    fn refreshable_config() -> config::Config {
+        config::Config {
+            access_token: Some("old-token".into()),
+            token_expires_at: Some(Utc::now() + ChronoDuration::minutes(5)),
+            refresh_token: Some("refresh-token".into()),
+            refresh_token_expires_at: Some(Utc::now() + ChronoDuration::hours(1)),
+            ..config::Config::default()
+        }
+    }
+
+    #[test]
+    fn access_token_refresh_delay_applies_skew_and_clamps_expired_tokens() {
+        let mut config = refreshable_config();
+        config.token_expires_at = Some(Utc::now() + ChronoDuration::seconds(90));
+        let delay = access_token_refresh_delay(&config);
+        assert!((29..=30).contains(&delay.as_secs()));
+
+        config.token_expires_at = Some(Utc::now() - ChronoDuration::seconds(1));
+        assert_eq!(access_token_refresh_delay(&config), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn refresh_loop_terminates_when_receiver_is_closed() {
+        let config = refreshable_config();
+        let (tx, rx) = watch::channel("old-token".to_string());
+        let refresh_loop = tokio::spawn(refresh_access_token_loop(config, tx));
+        tokio::task::yield_now().await;
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), refresh_loop)
+            .await
+            .expect("loop should interrupt its refresh sleep")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_loop_cancels_hanging_request_when_receiver_is_closed() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            let _connection = connection;
+            std::future::pending::<()>().await;
+        });
+        let mut config = refreshable_config();
+        config.token_expires_at = Some(Utc::now() - ChronoDuration::seconds(1));
+        let (tx, rx) = watch::channel("old-token".to_string());
+        let refresh_loop = tokio::spawn(async move {
+            refresh_access_token_loop_with(config, tx, &base_url).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("refresh request should reach server")
+            .unwrap();
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(5), refresh_loop)
+            .await
+            .expect("loop should cancel its in-flight refresh request")
+            .unwrap();
+        server.abort();
+        server.await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn json_worker_is_cancelled_and_awaited_on_injected_shutdown() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                let _ = self.0.take().expect("sender").send(());
+            }
+        }
+        let worker = tokio::spawn(async move {
+            let _guard = NotifyDrop(Some(dropped_tx));
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let result = supervise_json_worker(
+            worker,
+            std::future::pending::<()>(),
+            std::future::ready(Ok(())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, WorkerCompletion::Shutdown);
+        dropped_rx.await.expect("worker drop notification");
+    }
+
+    #[test]
+    fn terminal_initialization_cleanup_state_can_be_disarmed_without_terminal_io() {
+        let mut cleanup = TerminalInitCleanup::raw_mode_enabled();
+        assert!(cleanup.raw_mode);
+        cleanup.alternate_screen = true;
+        cleanup.disarm();
+        assert_eq!(cleanup, TerminalInitCleanup::default());
+    }
+
+    #[tokio::test]
+    async fn refresh_persists_before_returning_new_token() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(200)
+            .with_body(r#"{"access_token":"new-token","expires_in":3600}"#)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = refreshable_config();
+        let token = refresh_access_token_from_config_with(&mut config, &server.url(), Some(&path))
+            .await
+            .unwrap();
+        mock.assert_async().await;
+        let saved = config::Config::load_from(&path).unwrap();
+        assert_eq!(
+            (token.as_str(), saved.access_token.as_deref()),
+            ("new-token", Some("new-token"))
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_refresh_token_does_not_call_server() {
+        let mut config = refreshable_config();
+        config.refresh_token_expires_at = Some(Utc::now() - ChronoDuration::seconds(1));
+        let err = refresh_access_token_from_config_with(&mut config, "http://unused", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Refresh token expired"));
+    }
+
+    #[tokio::test]
+    async fn save_failure_does_not_publish_or_mutate_new_token() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(200)
+            .with_body(r#"{"access_token":"must-not-publish","expires_in":3600}"#)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = refreshable_config();
+        let err =
+            refresh_access_token_from_config_with(&mut config, &server.url(), Some(dir.path()))
+                .await
+                .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(config.access_token.as_deref(), Some("old-token"));
     }
 
     fn parsed_tunnel_target(args: &[&str]) -> TunnelTarget {
