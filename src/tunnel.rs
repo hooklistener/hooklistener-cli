@@ -1,3 +1,4 @@
+use crate::api::ApiClient;
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use brotli::Decompressor as BrotliDecoder;
@@ -8,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 use std::time::{Duration, SystemTime};
@@ -1118,12 +1119,18 @@ fn tunnel_join_payload(
     local_port: u16,
     organization_id: Option<&str>,
     slug: Option<&str>,
+    resume_token: Option<&str>,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "mode": DIRECT_RESPONSE_MODE,
         "protocol_version": TUNNEL_PROTOCOL_VERSION,
         "local_port": local_port,
     });
+
+    if let Some(resume_token) = resume_token {
+        payload["resume_token"] = serde_json::Value::String(resume_token.to_string());
+        return payload;
+    }
 
     if let Some(organization_id) = organization_id {
         payload["organization_id"] = serde_json::Value::String(organization_id.to_string());
@@ -1937,6 +1944,7 @@ pub struct TunnelForwarder {
     event_tx: mpsc::Sender<TunnelEvent>,
     replay_buffered: bool,
     presentation_drops: Arc<AtomicUsize>,
+    resume_session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl TunnelForwarder {
@@ -1965,6 +1973,7 @@ impl TunnelForwarder {
             event_tx,
             replay_buffered,
             presentation_drops: Arc::new(AtomicUsize::new(0)),
+            resume_session_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1986,6 +1995,28 @@ impl TunnelForwarder {
         }
     }
 
+    async fn resume_token(&self, access_token: &str) -> Result<Option<String>> {
+        let session_id = self
+            .resume_session_id
+            .lock()
+            .map_err(|_| anyhow!("Tunnel resume state is unavailable"))?
+            .clone();
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let organization_id = self
+            .org_id
+            .clone()
+            .ok_or_else(|| anyhow!("Tunnel resume requires an organization"))?;
+        let client = ApiClient::with_base_url(
+            access_token.to_string(),
+            self.base_url.clone(),
+            Some(organization_id),
+        )?;
+        let descriptor = client.reconnect_tunnel_session(&session_id).await?;
+        Ok(Some(descriptor.resume_token))
+    }
+
     pub async fn connect_and_forward(&self) -> Result<()> {
         info!(
             local_host = %self.local_host,
@@ -1997,6 +2028,7 @@ impl TunnelForwarder {
 
         // Exchange the long-lived HTTP credential for a one-time, scoped handshake ticket.
         let access_token = self.access_token_rx.borrow().clone();
+        let resume_token = self.resume_token(&access_token).await?;
         let plan = serde_json::json!({
             "mode": DIRECT_RESPONSE_MODE,
             "route": {"organization_id": &self.org_id, "slug": &self.slug},
@@ -2051,9 +2083,12 @@ impl TunnelForwarder {
             self.local_port,
             self.org_id.as_deref(),
             self.slug.as_deref(),
+            resume_token.as_deref(),
         );
 
-        if let Some(slug) = &self.slug {
+        if resume_token.is_some() {
+            info!("Resuming canonical tunnel session");
+        } else if let Some(slug) = &self.slug {
             info!(slug = %slug, "Requesting static tunnel");
         }
 
@@ -2090,7 +2125,7 @@ impl TunnelForwarder {
                             && let Some(status) = msg.payload.get("status")
                         {
                             if status == "ok" {
-                                // Extract subdomain, tunnel_id, and static flag from response
+                                // Extract the negotiated contract and canonical session identity.
                                 let Some(response) = msg.payload.get("response") else {
                                     let error = anyhow!("Tunnel join response was missing");
                                     let _ = self
@@ -2131,6 +2166,21 @@ impl TunnelForwarder {
                                         .await;
                                     return Err(error);
                                 }
+
+                                let session_id = response
+                                    .get("session_id")
+                                    .and_then(|id| id.as_str())
+                                    .ok_or_else(|| {
+                                        anyhow!(
+                                            "Tunnel service did not return a canonical session id"
+                                        )
+                                    })?
+                                    .to_string();
+                                *self
+                                    .resume_session_id
+                                    .lock()
+                                    .map_err(|_| anyhow!("Tunnel resume state is unavailable"))? =
+                                    Some(session_id);
 
                                 let subdomain = response
                                     .get("subdomain")
@@ -3117,6 +3167,8 @@ impl TunnelForwarder {
                         return result;
                     }
 
+                    warn!(error = %err_msg, "Tunnel connection attempt failed; retrying");
+
                     if start.elapsed() > Duration::from_secs(5) {
                         attempt = 0;
                     }
@@ -3236,7 +3288,7 @@ mod tests {
     fn test_join_payloads_select_explicit_activation_modes() {
         assert_eq!(listen_join_payload()["mode"], CAPTURE_FORWARD_MODE);
 
-        let tunnel_payload = tunnel_join_payload(3000, Some("org-1"), Some("payments"));
+        let tunnel_payload = tunnel_join_payload(3000, Some("org-1"), Some("payments"), None);
         assert_eq!(tunnel_payload["mode"], DIRECT_RESPONSE_MODE);
         assert_eq!(tunnel_payload["protocol_version"], TUNNEL_PROTOCOL_VERSION);
         assert_eq!(tunnel_payload["local_port"], 3000);
@@ -3450,6 +3502,25 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn test_tunnel_join_payload_resumes_without_reactivating_route_inputs() {
+        let fresh = tunnel_join_payload(3000, Some("org-123"), Some("billing"), None);
+        assert_eq!(fresh["organization_id"], "org-123");
+        assert_eq!(fresh["slug"], "billing");
+        assert!(fresh.get("resume_token").is_none());
+
+        let resumed = tunnel_join_payload(
+            4000,
+            Some("org-123"),
+            Some("billing"),
+            Some("short-lived-token"),
+        );
+        assert_eq!(resumed["local_port"], 4000);
+        assert_eq!(resumed["resume_token"], "short-lived-token");
+        assert!(resumed.get("organization_id").is_none());
+        assert!(resumed.get("slug").is_none());
     }
 
     #[test]
@@ -3812,6 +3883,45 @@ mod tests {
         forwarder.emit_presentation(TunnelEvent::Disconnected);
 
         assert_eq!(forwarder.presentation_drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn test_resume_token_uses_configured_api_base_url() {
+        let mut server = mockito::Server::new_async().await;
+        let reconnect = server
+            .mock("POST", "/api/v1/tunnel/sessions/session-123/reconnect")
+            .match_header("authorization", "Bearer test-token")
+            .match_header("x-organization-id", "org-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"session":{"id":"session-123","organization_id":"org-123","status":"active","fence":1,"created_at":"2026-07-14T20:00:00Z","updated_at":"2026-07-14T20:00:01Z","route":null},"topic":"tunnel:connect","resume_token":"short-lived-resume-token","resume_token_expires_in":300,"cursor":"opaque","ownership":"lost"}}"#,
+            )
+            .create_async()
+            .await;
+        let (_token_tx, token_rx) = watch::channel("test-token".to_string());
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let target = TargetPolicy::resolve("http://127.0.0.1:3000", false, false)
+            .await
+            .unwrap();
+        let mut forwarder = TunnelForwarder::new(
+            token_rx,
+            "127.0.0.1".to_string(),
+            3000,
+            target,
+            Some("org-123".to_string()),
+            None,
+            event_tx,
+            false,
+        );
+        forwarder.base_url = server.url();
+        *forwarder.resume_session_id.lock().unwrap() = Some("session-123".to_string());
+
+        assert_eq!(
+            forwarder.resume_token("test-token").await.unwrap(),
+            Some("short-lived-resume-token".to_string())
+        );
+        reconnect.assert_async().await;
     }
 
     #[tokio::test]

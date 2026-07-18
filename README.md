@@ -81,6 +81,23 @@ reported by the service as having an unknown outcome.
 Machine-readable tunnel receipts redact authorization, cookies, API keys, tokens, and secret
 header values. Debug logs omit the access-token query parameter from WebSocket endpoints.
 
+### Operate tunnel lifecycle state
+
+Tunnel sessions, captures, delivery attempts, and events are cloud-authoritative. They remain inspectable and stoppable after the CLI process that started them exits:
+
+```bash
+hooklistener tunnel prepare --port 3000
+hooklistener tunnel start --port 3000
+hooklistener tunnel list
+hooklistener tunnel status <session-id>
+hooklistener tunnel events --cursor <cursor> --follow
+hooklistener tunnel capture <capture-id>
+hooklistener tunnel attempt <attempt-id>
+hooklistener tunnel stop <session-id> --reason "deployment complete"
+```
+
+`hooklistener tunnel --port 3000` remains an alias for `tunnel start`. Every lifecycle command negotiates the authenticated tunnel contract first; an incompatible schema major fails before relay activation.
+
 ## Work with captured requests
 
 Select an organization once for account-backed commands:
@@ -143,19 +160,22 @@ Long-running `listen --json` and `tunnel --json` commands emit newline-delimited
 ```bash
 hooklistener --json listen <endpoint-slug>
 hooklistener --json tunnel --port 3000
+hooklistener --json tunnel events --cursor <cursor> --follow
 ```
 
 Tunnel delivery is independent from terminal rendering. If a slow or stalled consumer fills the presentation queue, the CLI continues reading requests and returning local responses, then emits a recoverable `stream_gap` event with the number of presentation events omitted. Treat the displayed request history as incomplete after a gap; delivery itself is unaffected.
 
 The relay runtime admits at most 8 local requests and 64 MiB of retained request bodies at once. Inbound streams, buffered local responses, and the serialized WebSocket writer have separate count and byte ceilings. Requests rejected before the local connection begins report `known_not_executed`; cancellations or failures after forwarding begins report `outcome_unknown`.
 
+Tunnel lifecycle receipts use `hooklistener.tunnel.receipt/1`; durable events use `hooklistener.tunnel.event/1` and include an event ID, journal position, sequence, opaque resume cursor, and canonical resource links. `--json` is noninteractive and writes only NDJSON to stdout. Persist event cursors and, after a `cursor_expired` error, rehydrate from the supplied resource links before resuming at the earliest cursor. If no earliest cursor is supplied, resync the resources and request a fresh cursor.
+
 Runtime errors use a consistent envelope:
 
 ```json
-{"error":{"causes":[],"code":"command_failed","hint":null,"message":"..."},"ok":false}
+{"$schema":"hooklistener.cli.error/1","schema_version":1,"type":"error","error":{"causes":[],"code":"command_failed","hint":null,"message":"..."},"ok":false}
 ```
 
-Exit status `0` means success, `1` means a runtime failure, and `2` means command-line parsing failed. Destructive commands in scripts require `--yes`. `login` and `completions` do not support JSON output.
+Exit status `0` means success, `1` means a runtime failure, `2` means command-line parsing failed, `3` means the tunnel schema major is incompatible, and `4` means an event cursor expired. Destructive commands in scripts require `--yes`. `login` and `completions` do not support JSON output.
 
 ## Terminal behavior
 

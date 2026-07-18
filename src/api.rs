@@ -1,4 +1,7 @@
-use crate::models::{ForwardResponse, WebhookRequest};
+use crate::{
+    errors::TunnelLifecycleError,
+    models::{ForwardResponse, WebhookRequest},
+};
 use anyhow::{Context, Result, anyhow};
 use reqwest::{
     Client, Response, Url,
@@ -10,6 +13,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const RELAY_TICKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn deserialize_map_or_default<'de, D>(
     deserializer: D,
@@ -338,6 +343,146 @@ pub struct StaticTunnelCreateResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelLifecycleContract {
+    pub id: String,
+    pub version: String,
+    pub schema: TunnelSchemaVersion,
+    pub receipts: Value,
+    pub events: Value,
+    pub resources: Value,
+    pub lifecycle: Value,
+    pub exit_codes: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelSchemaVersion {
+    pub major: u64,
+    pub minor: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelRouteResource {
+    pub id: String,
+    pub slug: String,
+    pub kind: String,
+    pub mode: String,
+    pub status: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelSessionResource {
+    pub id: String,
+    pub organization_id: String,
+    pub status: String,
+    pub fence: u64,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    #[serde(default)]
+    pub opened_at: Option<String>,
+    #[serde(default)]
+    pub closed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub route: Option<TunnelRouteResource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelCaptureResource {
+    pub id: String,
+    pub organization_id: String,
+    pub route_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    pub origin: String,
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub request_content_length: Option<u64>,
+    pub request_body_captured: bool,
+    #[serde(default)]
+    pub provider_response_status: Option<u16>,
+    pub captured_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelAttemptResource {
+    pub id: String,
+    pub organization_id: String,
+    pub capture_id: String,
+    pub session_id: String,
+    pub attempt_number: u64,
+    pub fence: u64,
+    pub status: String,
+    pub deadline_at: String,
+    #[serde(default)]
+    pub forward_started_at: Option<String>,
+    #[serde(default)]
+    pub response_observed_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelLifecycleEvent {
+    pub id: String,
+    pub position: u64,
+    pub cursor: String,
+    pub organization_id: String,
+    pub capture_id: String,
+    #[serde(default)]
+    pub delivery_id: Option<String>,
+    pub sequence: u64,
+    #[serde(default)]
+    pub fence: Option<u64>,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    #[serde(default)]
+    pub metadata: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelCollection<T> {
+    pub data: Vec<T>,
+    pub meta: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelEventPage {
+    pub data: Vec<TunnelLifecycleEvent>,
+    pub meta: TunnelEventPageMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelEventPageMeta {
+    pub cursor: String,
+    pub has_more: bool,
+    pub retention_days: u64,
+    pub resync: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelReconnectDescriptor {
+    pub session: TunnelSessionResource,
+    pub topic: String,
+    pub resume_token: String,
+    pub resume_token_expires_in: u64,
+    pub cursor: String,
+    pub ownership: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageResponse {
     #[serde(default)]
     pub message: Option<String>,
@@ -607,6 +752,14 @@ impl ApiClient {
         access_token: String,
         organization_id: Option<String>,
     ) -> Result<Self> {
+        Self::with_base_url(access_token, default_base_url(), organization_id)
+    }
+
+    pub fn with_base_url(
+        access_token: String,
+        base_url: String,
+        organization_id: Option<String>,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
         let auth = format!("Bearer {}", access_token);
         headers.insert(
@@ -623,24 +776,15 @@ impl ApiClient {
 
         let client = Client::builder()
             .default_headers(headers)
+            .connect_timeout(API_CONNECT_TIMEOUT)
+            .timeout(API_REQUEST_TIMEOUT)
             .build()
             .context("Failed to build API client")?;
 
         Ok(Self {
             client,
-            base_url: Some(default_base_url()),
+            base_url: Some(base_url),
         })
-    }
-
-    #[cfg(test)]
-    pub fn with_base_url(
-        access_token: String,
-        base_url: String,
-        organization_id: Option<String>,
-    ) -> Result<Self> {
-        let mut client = Self::with_organization(access_token, organization_id)?;
-        client.base_url = Some(base_url);
-        Ok(client)
     }
 
     fn api_url(&self, path: &str) -> Result<String> {
@@ -667,6 +811,88 @@ impl ApiClient {
         }
 
         serde_json::from_str(&text).with_context(|| format!("Failed to parse {} response", context))
+    }
+
+    async fn parse_tunnel_response<T: DeserializeOwned>(
+        &self,
+        response: Response,
+        context: &str,
+    ) -> Result<T> {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            return serde_json::from_str(&text)
+                .with_context(|| format!("Failed to parse {context} response"));
+        }
+
+        let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let error = body.get("error").unwrap_or(&Value::Null);
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("tunnel_api_error");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(context);
+
+        if code == "cursor_expired" {
+            return Err(TunnelLifecycleError::CursorExpired {
+                earliest_cursor: error
+                    .get("earliest_cursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                resync: error.get("resync").cloned().unwrap_or(Value::Null),
+            }
+            .into());
+        }
+
+        Err(TunnelLifecycleError::Api {
+            status: status.as_u16(),
+            code: code.to_string(),
+            message: message.to_string(),
+        }
+        .into())
+    }
+
+    async fn get_tunnel_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, Option<String>)],
+        context: &str,
+    ) -> Result<T> {
+        let mut url = Url::parse(&self.api_url(path)?)?;
+        if query.iter().any(|(_, value)| value.is_some()) {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                if let Some(value) = value {
+                    pairs.append_pair(key, value);
+                }
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to {context}"))?;
+        self.parse_tunnel_response(response, context).await
+    }
+
+    async fn post_tunnel_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+        context: &str,
+    ) -> Result<T> {
+        let response = self
+            .client
+            .post(self.api_url(path)?)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to {context}"))?;
+        self.parse_tunnel_response(response, context).await
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str, context: &str) -> Result<T> {
@@ -911,6 +1137,108 @@ impl ApiClient {
             organization_id, slug_id
         );
         self.delete_json(&path, "delete static tunnel").await
+    }
+
+    pub async fn tunnel_lifecycle_contract(&self) -> Result<TunnelLifecycleContract> {
+        let response: DataResponse<TunnelLifecycleContract> = self
+            .get_tunnel_json("/api/v1/tunnel/contract", &[], "read tunnel contract")
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn list_tunnel_sessions(
+        &self,
+        limit: u16,
+        status: Option<&str>,
+    ) -> Result<TunnelCollection<TunnelSessionResource>> {
+        self.get_tunnel_json(
+            "/api/v1/tunnel/sessions",
+            &[
+                ("limit", Some(limit.to_string())),
+                ("status", status.map(str::to_string)),
+            ],
+            "list tunnel sessions",
+        )
+        .await
+    }
+
+    pub async fn get_tunnel_session(&self, id: &str) -> Result<TunnelSessionResource> {
+        let response: DataResponse<TunnelSessionResource> = self
+            .get_tunnel_json(
+                &format!("/api/v1/tunnel/sessions/{id}"),
+                &[],
+                "read tunnel session",
+            )
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn stop_tunnel_session(
+        &self,
+        id: &str,
+        reason: Option<&str>,
+    ) -> Result<TunnelSessionResource> {
+        let response: DataResponse<TunnelSessionResource> = self
+            .post_tunnel_json(
+                &format!("/api/v1/tunnel/sessions/{id}/close"),
+                &serde_json::json!({"reason": reason}),
+                "stop tunnel session",
+            )
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn reconnect_tunnel_session(&self, id: &str) -> Result<TunnelReconnectDescriptor> {
+        let response: DataResponse<TunnelReconnectDescriptor> = self
+            .post_tunnel_json(
+                &format!("/api/v1/tunnel/sessions/{id}/reconnect"),
+                &serde_json::json!({}),
+                "prepare tunnel session reconnect",
+            )
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn list_tunnel_events(
+        &self,
+        cursor: Option<&str>,
+        limit: u16,
+        capture_id: Option<&str>,
+        attempt_id: Option<&str>,
+    ) -> Result<TunnelEventPage> {
+        self.get_tunnel_json(
+            "/api/v1/tunnel/events",
+            &[
+                ("cursor", cursor.map(str::to_string)),
+                ("limit", Some(limit.to_string())),
+                ("capture_id", capture_id.map(str::to_string)),
+                ("delivery_id", attempt_id.map(str::to_string)),
+            ],
+            "read tunnel events",
+        )
+        .await
+    }
+
+    pub async fn get_tunnel_capture(&self, id: &str) -> Result<TunnelCaptureResource> {
+        let response: DataResponse<TunnelCaptureResource> = self
+            .get_tunnel_json(
+                &format!("/api/v1/tunnel/captures/{id}"),
+                &[],
+                "read tunnel capture",
+            )
+            .await?;
+        Ok(response.data)
+    }
+
+    pub async fn get_tunnel_attempt(&self, id: &str) -> Result<TunnelAttemptResource> {
+        let response: DataResponse<TunnelAttemptResource> = self
+            .get_tunnel_json(
+                &format!("/api/v1/tunnel/deliveries/{id}"),
+                &[],
+                "read tunnel delivery attempt",
+            )
+            .await?;
+        Ok(response.data)
     }
 
     // ── Uptime Monitor methods ──────────────────────────────────────────────
@@ -1382,5 +1710,131 @@ mod tests {
         );
         assert_eq!(result.passed_count, 1);
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_contract_and_resources_use_authenticated_cloud_state() {
+        let mut server = mockito::Server::new_async().await;
+        let contract_mock = server
+            .mock("GET", "/api/v1/tunnel/contract")
+            .match_header("authorization", "Bearer test-token")
+            .match_header("x-organization-id", "org-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"hooklistener.tunnel.lifecycle","version":"1.0.0","schema":{"major":1,"minor":0},"receipts":{},"events":{},"resources":{},"lifecycle":{},"exit_codes":{}}}"#,
+            )
+            .create_async()
+            .await;
+        let session_mock = server
+            .mock("GET", "/api/v1/tunnel/sessions/session-123")
+            .match_header("authorization", "Bearer test-token")
+            .match_header("x-organization-id", "org-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"session-123","organization_id":"org-123","status":"active","fence":1,"created_at":"2026-07-14T20:00:00Z","updated_at":"2026-07-14T20:00:01Z","route":null}}"#,
+            )
+            .create_async()
+            .await;
+        let reconnect_mock = server
+            .mock("POST", "/api/v1/tunnel/sessions/session-123/reconnect")
+            .match_header("authorization", "Bearer test-token")
+            .match_header("x-organization-id", "org-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"session":{"id":"session-123","organization_id":"org-123","status":"active","fence":1,"created_at":"2026-07-14T20:00:00Z","updated_at":"2026-07-14T20:00:01Z","route":null},"topic":"tunnel:connect","resume_token":"secret-resume-token","resume_token_expires_in":300,"cursor":"opaque","ownership":"lost"}}"#,
+            )
+            .create_async()
+            .await;
+        let client = ApiClient::with_base_url(
+            "test-token".to_string(),
+            server.url(),
+            Some("org-123".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.tunnel_lifecycle_contract().await.unwrap().version,
+            "1.0.0"
+        );
+        assert_eq!(
+            client
+                .get_tunnel_session("session-123")
+                .await
+                .unwrap()
+                .status,
+            "active"
+        );
+        let reconnect = client
+            .reconnect_tunnel_session("session-123")
+            .await
+            .unwrap();
+        assert_eq!(reconnect.cursor, "opaque");
+        assert_eq!(reconnect.resume_token, "secret-resume-token");
+        contract_mock.assert_async().await;
+        session_mock.assert_async().await;
+        reconnect_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_cursor_expiry_is_a_typed_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/tunnel/events")
+            .match_query(mockito::Matcher::Any)
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":{"code":"cursor_expired","message":"expired","earliest_cursor":"earliest","resync":{"sessions":"/api/v1/tunnel/sessions"}}}"#,
+            )
+            .create_async()
+            .await;
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+
+        let error = client
+            .list_tunnel_events(Some("expired"), 50, None, None)
+            .await
+            .unwrap_err();
+        let lifecycle = error.downcast_ref::<TunnelLifecycleError>().unwrap();
+        assert!(matches!(
+            lifecycle,
+            TunnelLifecycleError::CursorExpired {
+                earliest_cursor: Some(cursor),
+                ..
+            } if cursor == "earliest"
+        ));
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_tunnel_capture_projection_drops_unrecognized_sensitive_fields() {
+        let capture: TunnelCaptureResource = serde_json::from_value(serde_json::json!({
+            "id": "capture-123",
+            "organization_id": "org-123",
+            "route_id": "route-123",
+            "session_id": "session-123",
+            "endpoint_id": null,
+            "origin": "tunnel",
+            "method": "POST",
+            "path": "/billing",
+            "request_content_length": 6,
+            "request_body_captured": true,
+            "provider_response_status": 200,
+            "captured_at": "2026-07-14T20:00:00Z",
+            "created_at": "2026-07-14T20:00:00Z",
+            "updated_at": "2026-07-14T20:00:01Z",
+            "request_headers": {"authorization": "Bearer secret"},
+            "request_body": "secret",
+            "object_storage_key": "private/key"
+        }))
+        .unwrap();
+
+        let output = serde_json::to_string(&capture).unwrap();
+        assert!(!output.contains("authorization"));
+        assert!(!output.contains("Bearer secret"));
+        assert!(!output.contains("private/key"));
     }
 }
