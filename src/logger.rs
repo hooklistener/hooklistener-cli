@@ -1,7 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
 use std::cmp::Reverse;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -45,21 +46,22 @@ impl Logger {
     pub fn new(config: LogConfig) -> Result<Self> {
         let session_id = Uuid::new_v4();
 
-        // Create log directory if it doesn't exist
-        fs::create_dir_all(&config.directory)?;
+        Self::ensure_private_directory(&config.directory)?;
+        #[cfg(unix)]
+        Self::harden_existing_log_files(&config.directory)?;
 
         // Clean up old log files
         let _ = Self::cleanup_old_logs(&config.directory, config.max_log_files)?;
 
         let log_file_path = config.directory.join(format!(
-            "hooklistener-{}.log",
-            Utc::now().format("%Y%m%d-%H%M%S")
+            "hooklistener-{}-{session_id}.log",
+            Utc::now().format("%Y%m%d-%H%M%S"),
         ));
 
-        // Create file appender
-        let file_appender =
-            tracing_appender::rolling::never(&config.directory, log_file_path.file_name().unwrap());
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        // Supplying the already-opened file prevents tracing-appender from creating it
+        // with process-umask-dependent permissions.
+        let log_file = Self::open_private_file(&log_file_path)?;
+        let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
 
         // Create filter
         let filter =
@@ -168,19 +170,14 @@ impl Logger {
             "Creating diagnostic bundle"
         );
 
-        // Create a directory for the diagnostic bundle
-        let bundle_dir = bundle_path.join(format!(
-            "hooklistener-diagnostics-{}",
-            Utc::now().format("%Y%m%d-%H%M%S")
-        ));
-        fs::create_dir_all(&bundle_dir)?;
+        let bundle_dir = Self::create_unique_bundle_directory(bundle_path)?;
 
         // Write this first so a useful bundle remains even when optional inputs are corrupt.
         let system_info = self.collect_system_info();
         let system_info_path = bundle_dir.join("system_info.json");
-        fs::write(
-            system_info_path,
-            serde_json::to_string_pretty(&system_info)?,
+        Self::write_private_file(
+            &system_info_path,
+            serde_json::to_string_pretty(&system_info)?.as_bytes(),
         )?;
 
         let config_path = crate::config::Config::config_path()?;
@@ -207,7 +204,7 @@ impl Logger {
 
         if log_dir.exists() {
             let log_bundle_dir = bundle_dir.join("logs");
-            fs::create_dir_all(&log_bundle_dir)?;
+            Self::create_private_directory(&log_bundle_dir)?;
             if let Err(error) = Self::copy_log_files(&log_dir, &log_bundle_dir, &tokens) {
                 warn!(error = %error, "Unable to enumerate diagnostic logs");
             }
@@ -216,7 +213,9 @@ impl Logger {
         // Copy sanitized config
         if let Some(sanitized_config) = sanitized_config {
             let config_bundle_path = bundle_dir.join("config.json");
-            if let Err(error) = fs::write(config_bundle_path, sanitized_config) {
+            if let Err(error) =
+                Self::write_private_file(&config_bundle_path, sanitized_config.as_bytes())
+            {
                 warn!(error = %error, "Unable to write sanitized diagnostic config");
             }
         }
@@ -227,6 +226,113 @@ impl Logger {
             "Diagnostic bundle created successfully"
         );
 
+        Ok(())
+    }
+
+    fn ensure_private_directory(path: &Path) -> Result<()> {
+        fs::create_dir_all(path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // Apply permissions through the opened directory descriptor so a later path
+            // replacement cannot redirect the chmod operation.
+            let directory = File::open(path)?;
+            if !directory.metadata()?.is_dir() {
+                anyhow::bail!("{} is not a directory", path.display());
+            }
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+
+        Ok(())
+    }
+
+    fn create_private_directory(path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(path)?;
+            let directory = File::open(path)?;
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+
+        #[cfg(not(unix))]
+        fs::create_dir(path)?;
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn harden_existing_log_files(log_dir: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        for entry in fs::read_dir(log_dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if !entry.file_type()?.is_file()
+                || !file_name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("hooklistener-"))
+                || Path::new(&file_name)
+                    .extension()
+                    .is_none_or(|extension| extension != "log")
+            {
+                continue;
+            }
+
+            // DirEntry::file_type does not follow symlinks. The directory is already
+            // owner-only, and chmod is applied through the opened file descriptor.
+            let file = File::open(entry.path())?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+
+        Ok(())
+    }
+
+    fn create_unique_bundle_directory(bundle_path: &Path) -> Result<PathBuf> {
+        const MAX_ATTEMPTS: usize = 8;
+
+        fs::create_dir_all(bundle_path)?;
+        for _ in 0..MAX_ATTEMPTS {
+            let bundle_dir = bundle_path.join(format!(
+                "hooklistener-diagnostics-{}-{}",
+                Utc::now().format("%Y%m%d-%H%M%S"),
+                Uuid::new_v4()
+            ));
+            match Self::create_private_directory(&bundle_dir) {
+                Ok(()) => return Ok(bundle_dir),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        anyhow::bail!("Could not allocate a unique diagnostic bundle directory")
+    }
+
+    fn open_private_file(path: &Path) -> std::io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            options.mode(0o600);
+            let file = options.open(path)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            Ok(file)
+        }
+
+        #[cfg(not(unix))]
+        options.open(path)
+    }
+
+    fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+        let mut file = Self::open_private_file(path)?;
+        file.write_all(contents)?;
         Ok(())
     }
 
@@ -243,7 +349,7 @@ impl Logger {
             let Some(file_name) = path.file_name() else {
                 continue;
             };
-            if !path.is_file()
+            if !entry.file_type()?.is_file()
                 || !file_name
                     .to_str()
                     .is_some_and(|name| name.starts_with("hooklistener-"))
@@ -271,15 +377,7 @@ impl Logger {
             contents = Self::replace_bytes(&contents, token, b"[REDACTED]");
         }
 
-        let temp = dest.with_file_name(format!(
-            ".{}.{}.tmp",
-            dest.file_name().unwrap_or_default().to_string_lossy(),
-            Uuid::new_v4()
-        ));
-        if let Err(error) = fs::write(&temp, contents).and_then(|()| fs::rename(&temp, dest)) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
+        Self::write_private_file(dest, &contents)?;
         Ok(())
     }
 
@@ -299,16 +397,37 @@ impl Logger {
     }
 
     fn read_config_for_bundle(config_path: &Path) -> Result<(Option<String>, Vec<Vec<u8>>)> {
-        let content = fs::read_to_string(config_path)?;
+        let content = Self::read_regular_file(config_path)?;
         let config: serde_json::Value = serde_json::from_str(&content)?;
         serde_json::from_value::<crate::config::Config>(config.clone())
             .map_err(|_| anyhow::anyhow!("Config unavailable or invalid"))?;
-        let tokens = ["access_token", "refresh_token"]
-            .into_iter()
-            .filter_map(|key| config.get(key)?.as_str())
-            .map(|token| token.as_bytes().to_vec())
-            .collect();
-        Ok((Some(Self::sanitize_config(config)?), tokens))
+        let (sanitized, tokens) = Self::sanitize_config_with_secrets(config)?;
+        Ok((Some(sanitized), tokens))
+    }
+
+    fn read_regular_file(path: &Path) -> Result<String> {
+        let mut file = File::open(path)?;
+        let opened_metadata = file.metadata()?;
+        let current_metadata = fs::symlink_metadata(path)?;
+
+        if !opened_metadata.is_file() || !current_metadata.file_type().is_file() {
+            anyhow::bail!("Diagnostic config must be a regular file and must not be a symlink");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if opened_metadata.dev() != current_metadata.dev()
+                || opened_metadata.ino() != current_metadata.ino()
+            {
+                anyhow::bail!("Diagnostic config changed while it was being opened");
+            }
+        }
+
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
     }
 
     #[cfg(test)]
@@ -318,20 +437,95 @@ impl Logger {
         Self::sanitize_config(config)
     }
 
+    #[cfg(test)]
     fn sanitize_config(mut config: serde_json::Value) -> Result<String> {
-        // Remove sensitive data
-        if let Some(obj) = config.as_object_mut() {
-            obj.remove("access_token");
-            obj.remove("refresh_token");
-            if let Some(token_expires) = obj.get_mut("token_expires_at") {
-                *token_expires = serde_json::Value::String("[REDACTED]".to_string());
-            }
-            if let Some(token_expires) = obj.get_mut("refresh_token_expires_at") {
-                *token_expires = serde_json::Value::String("[REDACTED]".to_string());
-            }
-        }
+        let mut secrets = Vec::new();
+        Self::redact_config_value(&mut config, &mut secrets);
 
         Ok(serde_json::to_string_pretty(&config)?)
+    }
+
+    fn sanitize_config_with_secrets(
+        mut config: serde_json::Value,
+    ) -> Result<(String, Vec<Vec<u8>>)> {
+        let mut secrets = Vec::new();
+        Self::redact_config_value(&mut config, &mut secrets);
+        Ok((serde_json::to_string_pretty(&config)?, secrets))
+    }
+
+    fn redact_config_value(value: &mut serde_json::Value, secrets: &mut Vec<Vec<u8>>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                let keys: Vec<_> = object.keys().cloned().collect();
+                for key in keys {
+                    if Self::is_token_expiry_key(&key) {
+                        if let Some(value) = object.get_mut(&key) {
+                            *value = serde_json::Value::String("[REDACTED]".to_string());
+                        }
+                    } else if Self::is_secret_config_key(&key) {
+                        if let Some(secret) = object.remove(&key) {
+                            Self::collect_secret_values(&secret, secrets);
+                        }
+                    } else if let Some(value) = object.get_mut(&key) {
+                        Self::redact_config_value(value, secrets);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    Self::redact_config_value(value, secrets);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_secret_values(value: &serde_json::Value, secrets: &mut Vec<Vec<u8>>) {
+        match value {
+            serde_json::Value::String(secret) if !secret.is_empty() => {
+                secrets.push(secret.as_bytes().to_vec());
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    Self::collect_secret_values(value, secrets);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                for value in object.values() {
+                    Self::collect_secret_values(value, secrets);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn normalized_config_key(key: &str) -> String {
+        key.to_ascii_lowercase().replace(['-', ' '], "_")
+    }
+
+    fn is_token_expiry_key(key: &str) -> bool {
+        let key = Self::normalized_config_key(key);
+        key.contains("token") && (key.contains("expires") || key.contains("expiration"))
+    }
+
+    fn is_secret_config_key(key: &str) -> bool {
+        let key = Self::normalized_config_key(key);
+        key == "token"
+            || key == "tokens"
+            || key.ends_with("token")
+            || key.ends_with("_tokens")
+            || key.starts_with("access_token")
+            || key.starts_with("refresh_token")
+            || key.starts_with("session_token")
+            || key.starts_with("auth_token")
+            || key.starts_with("bearer_token")
+            || key.starts_with("id_token")
+            || key == "secret"
+            || key.ends_with("_secret")
+            || key == "password"
+            || key.ends_with("_password")
+            || key == "api_key"
+            || key.ends_with("_api_key")
     }
 
     fn collect_system_info(&self) -> serde_json::Value {
@@ -473,6 +667,65 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_config_recursively_removes_future_secret_fields() {
+        let config = serde_json::json!({
+            "refreshToken": "refresh-secret",
+            "refreshTokenExpiration": "2030-01-01T00:00:00Z",
+            "nested": [{
+                "session_token": "session-secret",
+                "client_secret": "client-secret",
+                "api_key": "api-key-secret",
+                "token_type": "Bearer"
+            }],
+            "theme": "dark"
+        });
+
+        let sanitized = Logger::sanitize_config(config).unwrap();
+        let sanitized: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+
+        assert_eq!(
+            sanitized,
+            serde_json::json!({
+                "refreshTokenExpiration": "[REDACTED]",
+                "nested": [{ "token_type": "Bearer" }],
+                "theme": "dark"
+            })
+        );
+    }
+
+    #[test]
+    fn read_config_for_bundle_collects_all_removed_secrets_for_log_redaction() {
+        use std::collections::BTreeSet;
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+                "access_token": "access-secret",
+                "refresh_token": "refresh-secret",
+                "nested": { "api_token": "api-secret" }
+            }"#,
+        )
+        .unwrap();
+
+        let (_, secrets) = Logger::read_config_for_bundle(&config_path).unwrap();
+        let secrets: BTreeSet<_> = secrets
+            .into_iter()
+            .map(|secret| String::from_utf8(secret).unwrap())
+            .collect();
+
+        assert_eq!(
+            secrets,
+            BTreeSet::from([
+                "access-secret".to_string(),
+                "api-secret".to_string(),
+                "refresh-secret".to_string(),
+            ])
+        );
+    }
+
+    #[test]
     fn read_config_for_bundle_rejects_wrong_json_shape_without_exposing_content() {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("config.json");
@@ -484,6 +737,30 @@ mod tests {
             .to_string();
 
         assert_eq!(error, "Config unavailable or invalid");
+        assert!(!error.contains(secret));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_for_bundle_rejects_symlink_without_exposing_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.json");
+        let config_path = dir.path().join("config.json");
+        let secret = "symlink-target-secret";
+        fs::write(
+            &target,
+            format!(r#"{{"access_token":"{secret}","leaked":"target contents"}}"#),
+        )
+        .unwrap();
+        symlink(&target, &config_path).unwrap();
+
+        let error = Logger::read_config_for_bundle(&config_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("must not be a symlink"));
         assert!(!error.contains(secret));
     }
 
@@ -591,6 +868,155 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_directory_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let logs = dir.path().join("logs");
+        fs::create_dir(&logs).unwrap();
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o755)).unwrap();
+
+        Logger::ensure_private_directory(&logs).unwrap();
+
+        assert_eq!(
+            fs::metadata(logs).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_private_file_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("private.log");
+
+        drop(Logger::open_private_file(&path).unwrap());
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_existing_log_files_updates_regular_files_without_following_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("hooklistener-existing.log");
+        let victim = dir.path().join("victim");
+        let linked_log = dir.path().join("hooklistener-linked.log");
+        fs::write(&log, "log").unwrap();
+        fs::write(&victim, "victim").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&victim, linked_log).unwrap();
+
+        Logger::harden_existing_log_files(dir.path()).unwrap();
+
+        assert_eq!(
+            (
+                fs::metadata(log).unwrap().permissions().mode() & 0o777,
+                fs::metadata(victim).unwrap().permissions().mode() & 0o777,
+            ),
+            (0o600, 0o644)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_refuses_preexisting_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        let destination = dir.path().join("destination");
+        fs::write(&victim, "unchanged").unwrap();
+        symlink(&victim, &destination).unwrap();
+
+        let error = Logger::write_private_file(&destination, b"replacement").unwrap_err();
+
+        assert_eq!(
+            (
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                fs::read_to_string(victim).unwrap(),
+            ),
+            (
+                Some(std::io::ErrorKind::AlreadyExists),
+                "unchanged".to_string()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_unique_bundle_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+
+        let bundle = Logger::create_unique_bundle_directory(dir.path()).unwrap();
+
+        assert_eq!(
+            fs::metadata(bundle).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn create_unique_bundle_directory_uses_distinct_randomized_names() {
+        let dir = TempDir::new().unwrap();
+
+        let first = Logger::create_unique_bundle_directory(dir.path()).unwrap();
+        let second = Logger::create_unique_bundle_directory(dir.path()).unwrap();
+
+        assert_ne!(first.file_name(), second.file_name());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_redacted_log_creates_owner_only_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.log");
+        let destination = dir.path().join("destination.log");
+        fs::write(&source, "contents").unwrap();
+
+        Logger::copy_redacted_log(&source, &destination, &[]).unwrap();
+
+        assert_eq!(
+            fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_log_files_skips_symlinked_sources() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().join("logs");
+        let bundle_dir = dir.path().join("bundle");
+        fs::create_dir(&log_dir).unwrap();
+        fs::create_dir(&bundle_dir).unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "private contents").unwrap();
+        symlink(&victim, log_dir.join("hooklistener-linked.log")).unwrap();
+
+        Logger::copy_log_files(&log_dir, &bundle_dir, &[]).unwrap();
+
+        assert_eq!(fs::read_dir(bundle_dir).unwrap().count(), 0);
+    }
+
     #[test]
     fn invalid_config_cannot_be_copied_and_does_not_prevent_log_processing() {
         let dir = TempDir::new().unwrap();
@@ -612,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_log_rename_removes_temporary_output() {
+    fn copy_redacted_log_refuses_existing_destination_without_temporary_output() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source.log");
         let destination = dir.path().join("destination.log");

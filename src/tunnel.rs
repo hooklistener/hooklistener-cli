@@ -30,8 +30,9 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 
-// A 256 MiB body expands to about 342 MiB as unpadded base64. The remaining
-// space covers the Phoenix envelope and the advertised response-header limit.
+// Protocol v2 historically permits an envelope large enough for a 256 MiB body
+// encoded as base64. Keep that wire-format ceiling for compatibility, while the
+// local admission and buffering limits below remain deliberately much smaller.
 const TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 402_653_184;
 const TUNNEL_PROTOCOL_VERSION: u64 = 2;
 const TUNNEL_MAX_FRAME_BYTES: usize = 65_536;
@@ -42,27 +43,32 @@ const LEGACY_MAX_RESPONSE_HEADER_BYTES: usize = 1_048_576;
 const MAX_RAW_BODY_BYTES: usize = 1_048_576;
 const UI_BODY_PREVIEW_BYTES: usize = 65_536;
 const REDACTED_SECRET: &str = "[REDACTED]";
+const LOCAL_MAX_TUNNEL_BODY_BYTES: usize = 16 * 1024 * 1024;
+const LOCAL_MAX_RESPONSE_HEADER_BYTES: usize = 1024 * 1024;
 const LOCAL_WORK_MAX_COUNT: usize = 8;
-const LOCAL_WORK_MAX_BYTES: usize = 256 * 1024 * 1024;
+const LOCAL_WORK_MAX_BYTES: usize = LOCAL_MAX_TUNNEL_BODY_BYTES;
 const INBOUND_STREAM_MAX_COUNT: usize = 16;
-const INBOUND_STREAM_MAX_BYTES: usize = TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES;
-const RESPONSE_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
+const INBOUND_STREAM_MAX_BYTES: usize = 32 * 1024 * 1024;
+const RESPONSE_BUFFER_MAX_BYTES: usize = LOCAL_MAX_TUNNEL_BODY_BYTES;
+const _: () = assert!(INBOUND_STREAM_MAX_BYTES < TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES);
 const OUTBOUND_CONTROL_MAX_COUNT: usize = 256;
 const OUTBOUND_RESPONSE_MAX_COUNT: usize = 256;
 const OUTBOUND_MAX_BYTES: usize = 4 * 1024 * 1024;
+const LOG_TEXT_MAX_BYTES: usize = 4 * 1024;
 pub const PRESENTATION_QUEUE_CAPACITY: usize = 100;
 const PRESENTATION_MAX_EVENT_BYTES: usize = 256 * 1024;
 
 fn bounded_budget_permits(bytes: usize, capacity: usize) -> Option<u32> {
-    bytes.max(1).min(capacity).try_into().ok()
+    if bytes > capacity {
+        return None;
+    }
+
+    bytes.max(1).try_into().ok()
 }
 
 fn inbound_stream_fits_budget(reserved_bytes: usize, stream_bytes: usize) -> bool {
-    if stream_bytes > INBOUND_STREAM_MAX_BYTES {
-        reserved_bytes == 0
-    } else {
-        reserved_bytes.saturating_add(stream_bytes) <= INBOUND_STREAM_MAX_BYTES
-    }
+    stream_bytes <= INBOUND_STREAM_MAX_BYTES
+        && reserved_bytes.saturating_add(stream_bytes) <= INBOUND_STREAM_MAX_BYTES
 }
 
 const DELIVERY_QUEUED: u8 = 0;
@@ -182,7 +188,6 @@ struct ResponseBufferReservation {
     budget: ResponseBufferBudget,
     permits: Vec<OwnedSemaphorePermit>,
     reserved_bytes: usize,
-    exclusive: bool,
 }
 
 impl ResponseBufferBudget {
@@ -197,7 +202,6 @@ impl ResponseBufferBudget {
             budget: self.clone(),
             permits: Vec::new(),
             reserved_bytes: 0,
-            exclusive: false,
         };
 
         reservation
@@ -218,13 +222,14 @@ impl ResponseBufferBudget {
 
 impl ResponseBufferReservation {
     fn try_grow_to(&mut self, total_bytes: usize) -> bool {
-        if self.exclusive || total_bytes <= self.reserved_bytes {
+        if total_bytes > RESPONSE_BUFFER_MAX_BYTES {
+            return false;
+        }
+        if total_bytes <= self.reserved_bytes {
             return true;
         }
 
-        let previous_permits = self.reserved_bytes.min(RESPONSE_BUFFER_MAX_BYTES);
-        let target_permits = total_bytes.min(RESPONSE_BUFFER_MAX_BYTES);
-        let additional_permits = target_permits.saturating_sub(previous_permits);
+        let additional_permits = total_bytes.saturating_sub(self.reserved_bytes);
 
         if additional_permits > 0 {
             let Some(permit) = self.budget.try_acquire(additional_permits) else {
@@ -234,7 +239,6 @@ impl ResponseBufferReservation {
         }
 
         self.reserved_bytes = total_bytes;
-        self.exclusive = total_bytes > RESPONSE_BUFFER_MAX_BYTES;
         true
     }
 }
@@ -405,13 +409,18 @@ impl TunnelLimits {
     fn from_join_response(response: &serde_json::Value) -> Self {
         let limits = response.get("limits");
         let advertised_body_limit = json_limit(limits, "max_body_bytes");
+        let body_limit = advertised_body_limit
+            .unwrap_or(LEGACY_MAX_REQUEST_BODY_BYTES)
+            .min(LOCAL_MAX_TUNNEL_BODY_BYTES);
 
         Self {
-            max_request_body_bytes: advertised_body_limit.unwrap_or(LEGACY_MAX_REQUEST_BODY_BYTES),
+            max_request_body_bytes: body_limit,
             max_response_body_bytes: advertised_body_limit
-                .unwrap_or(LEGACY_MAX_RESPONSE_BODY_BYTES),
+                .unwrap_or(LEGACY_MAX_RESPONSE_BODY_BYTES)
+                .min(LOCAL_MAX_TUNNEL_BODY_BYTES),
             max_response_header_bytes: json_limit(limits, "max_response_header_bytes")
-                .unwrap_or(LEGACY_MAX_RESPONSE_HEADER_BYTES),
+                .unwrap_or(LEGACY_MAX_RESPONSE_HEADER_BYTES)
+                .min(LOCAL_MAX_RESPONSE_HEADER_BYTES),
             ordered_response_headers: limits
                 .and_then(|limits| limits.get("response_headers_format"))
                 .and_then(|format| format.as_str())
@@ -437,6 +446,47 @@ fn json_value_to_string(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         _ => v.to_string(),
     }
+}
+
+fn decode_request_body_limited(
+    body_encoding: &str,
+    raw_body: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let body = match body_encoding {
+        "raw" => {
+            if raw_body.len() > max_bytes {
+                return Err(anyhow!(
+                    "Tunnel request body exceeds advertised limit ({} > {} bytes)",
+                    raw_body.len(),
+                    max_bytes
+                ));
+            }
+            raw_body.as_bytes().to_vec()
+        }
+        "base64" => {
+            let max_encoded_bytes = base64::encoded_len(max_bytes, false).unwrap_or(usize::MAX);
+            if raw_body.len() > max_encoded_bytes {
+                return Err(anyhow!(
+                    "Tunnel request body exceeds advertised limit (encoded body is too large)"
+                ));
+            }
+            URL_SAFE_NO_PAD
+                .decode(raw_body)
+                .context("Tunnel request contains invalid base64url body data")?
+        }
+        encoding => return Err(anyhow!("Unsupported tunnel body encoding: {encoding}")),
+    };
+
+    if body.len() > max_bytes {
+        return Err(anyhow!(
+            "Tunnel request body exceeds advertised limit ({} > {} bytes)",
+            body.len(),
+            max_bytes
+        ));
+    }
+
+    Ok(body)
 }
 
 fn should_forward_request_header(key: &str) -> bool {
@@ -507,6 +557,39 @@ fn response_header_bytes(headers: &reqwest::header::HeaderMap) -> usize {
     headers.iter().fold(0usize, |total, (name, value)| {
         total.saturating_add(name.as_str().len() + value.as_bytes().len() + 4)
     })
+}
+
+async fn read_response_body_limited(
+    response: &mut reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|length| length > max_bytes as u64) {
+        return Err(anyhow!(
+            "Local response body exceeds tunnel limit (max {max_bytes} bytes)"
+        ));
+    }
+
+    let initial_capacity = content_length
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(TUNNEL_MAX_FRAME_BYTES);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| anyhow!("Failed to read local response: {}", error.without_url()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(anyhow!(
+                "Local response body exceeds tunnel limit (max {max_bytes} bytes)"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -793,6 +876,31 @@ fn bounded_presentation_text(value: &str) -> String {
     }
     format!("{}… [truncated]", &value[..end])
 }
+
+fn bounded_control_neutral_log_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len().min(LOG_TEXT_MAX_BYTES));
+    let mut truncated = false;
+
+    for character in value.chars() {
+        let rendered = if character.is_control() {
+            character.escape_default().collect::<String>()
+        } else {
+            character.to_string()
+        };
+
+        if output.len().saturating_add(rendered.len()) > LOG_TEXT_MAX_BYTES - 3 {
+            truncated = true;
+            break;
+        }
+        output.push_str(&rendered);
+    }
+
+    if truncated {
+        output.push_str("...");
+    }
+    output
+}
+
 fn with_forward_id(mut payload: serde_json::Value, forward_id: Option<&str>) -> serde_json::Value {
     if let Some(forward_id) = forward_id {
         payload["forward_id"] = serde_json::Value::String(forward_id.to_string());
@@ -922,10 +1030,11 @@ impl TunnelStreamAssembler {
                 return Err(anyhow!("Tunnel stream ended before all bytes arrived"));
             }
 
-            return Ok(Some(
-                serde_json::from_slice(&self.data)
-                    .context("Tunnel stream contains invalid JSON")?,
-            ));
+            let serialized_payload = std::mem::take(&mut self.data);
+            let payload = serde_json::from_slice(&serialized_payload)
+                .context("Tunnel stream contains invalid JSON")?;
+            drop(serialized_payload);
+            return Ok(Some(payload));
         }
 
         if self.data.len() == self.total_bytes {
@@ -1133,9 +1242,12 @@ fn tunnel_join_payload(
 fn validate_join_mode(response: &serde_json::Value, expected: &str) -> Result<()> {
     match response.get("mode").and_then(|mode| mode.as_str()) {
         Some(mode) if mode == expected => Ok(()),
-        Some(mode) => Err(anyhow!(
-            "Channel join failed: Server activated incompatible mode '{mode}' (expected '{expected}'); no requests were forwarded"
-        )),
+        Some(mode) => {
+            let mode = bounded_control_neutral_log_text(mode);
+            Err(anyhow!(
+                "Channel join failed: Server activated incompatible mode '{mode}' (expected '{expected}'); no requests were forwarded"
+            ))
+        }
         None => Err(anyhow!(
             "Channel join failed: Server did not confirm activation mode '{expected}'; upgrade the Hooklistener service before retrying"
         )),
@@ -1374,6 +1486,7 @@ impl TunnelClient {
 
     /// Connect to WebSocket and start listening for webhook events
     pub async fn connect_and_listen(&self) -> Result<()> {
+        api::validate_websocket_base_url(&self.base_url)?;
         info!(
             endpoint = %self.endpoint_slug,
             target = %self.target.display_url(),
@@ -1518,9 +1631,10 @@ impl TunnelClient {
                                     .and_then(|r| r.get("reason"))
                                     .and_then(|r| r.as_str())
                                     .unwrap_or("Unknown error");
+                                let reason = bounded_control_neutral_log_text(reason);
                                 let _ = self
                                     .event_tx
-                                    .send(TunnelEvent::ConnectionError(reason.to_string()))
+                                    .send(TunnelEvent::ConnectionError(reason.clone()))
                                     .await;
                                 return Err(anyhow!("Channel join failed: {}", reason));
                             }
@@ -1530,7 +1644,8 @@ impl TunnelClient {
                         write.send(Message::Pong(data)).await?;
                     }
                     Ok(Message::Close(frame)) => {
-                        return Err(anyhow!("WebSocket closed during join: {:?}", frame));
+                        let frame = bounded_control_neutral_log_text(&format!("{frame:?}"));
+                        return Err(anyhow!("WebSocket closed during join: {frame}"));
                     }
                     Err(e) => return Err(anyhow!("WebSocket error during join: {}", e)),
                     _ => {}
@@ -1571,11 +1686,13 @@ impl TunnelClient {
                 Ok(Some(msg)) => match msg {
                     Ok(Message::Text(text)) => {
                         if let Err(e) = self.handle_message(&text, &mut write).await {
-                            error!("Error handling message: {}", e);
+                            let error = bounded_control_neutral_log_text(&e.to_string());
+                            error!(error = %error, "Error handling message");
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        info!("WebSocket closed: {:?}", frame);
+                        let frame = bounded_control_neutral_log_text(&format!("{frame:?}"));
+                        info!(frame = %frame, "WebSocket closed");
                         let _ = self
                             .event_tx
                             .send(TunnelEvent::ConnectionError(
@@ -1628,10 +1745,12 @@ impl TunnelClient {
 
     async fn handle_message(&self, text: &str, write: &mut WsWrite) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
+        let log_topic = bounded_control_neutral_log_text(&msg.topic);
+        let log_event = bounded_control_neutral_log_text(&msg.event);
 
         debug!(
-            topic = %msg.topic,
-            event = %msg.event,
+            topic = %log_topic,
+            event = %log_event,
             "Received message"
         );
 
@@ -1681,8 +1800,7 @@ impl TunnelClient {
                             self.forward_webhook(request, write).await?;
                         }
                         Err(e) => {
-                            let err_msg =
-                                format!("Invalid webhook payload: {}. Data: {}", e, request_data);
+                            let err_msg = format!("Invalid webhook payload: {e}");
                             error!("{}", err_msg);
                             let _ = self
                                 .event_tx
@@ -1694,7 +1812,7 @@ impl TunnelClient {
                 }
             }
             _ => {
-                debug!("Unhandled event: {}", msg.event);
+                debug!(event = %log_event, "Unhandled event");
             }
         }
 
@@ -1753,11 +1871,50 @@ impl TunnelClient {
         // Send request
         let start_time = std::time::Instant::now();
         match req_builder.send().await {
-            Ok(response) => {
+            Ok(mut response) => {
                 let status = response.status();
                 let status_code = status.as_u16();
                 let response_headers = response_headers_to_map(response.headers());
-                let response_bytes = response.bytes().await.unwrap_or_default();
+                let response_bytes =
+                    match read_response_body_limited(&mut response, LEGACY_MAX_RESPONSE_BODY_BYTES)
+                        .await
+                    {
+                        Ok(response_bytes) => response_bytes,
+                        Err(error) => {
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            let error_message = error.to_string();
+
+                            error!(
+                                request_id = %request.id,
+                                error = %error_message,
+                                "Failed to read local response"
+                            );
+
+                            let _ = self
+                                .event_tx
+                                .send(TunnelEvent::ForwardError {
+                                    request_id: request.id.clone(),
+                                    target_url: target_with_query.to_string(),
+                                    error: error_message.clone(),
+                                    duration_ms,
+                                })
+                                .await;
+
+                            let payload = with_forward_id(
+                                serde_json::json!({
+                                    "request_id": &request.id,
+                                    "status": "error",
+                                    "proxied_to": target_with_query.as_str(),
+                                    "error": error_message,
+                                    "duration_ms": duration_ms,
+                                }),
+                                request.forward_id.as_deref(),
+                            );
+
+                            self.send_request_ack(write, payload).await?;
+                            return Ok(());
+                        }
+                    };
                 let (response_body, response_body_encoding) = encode_response_body(&response_bytes);
                 let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -1797,7 +1954,7 @@ impl TunnelClient {
             Err(e) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
 
-                let error_message = e.to_string();
+                let error_message = e.without_url().to_string();
 
                 error!(
                     request_id = %request.id,
@@ -1868,7 +2025,8 @@ impl TunnelClient {
                 }
                 Err(ref e) => {
                     let err_msg = e.to_string();
-                    warn!(error = %err_msg, "Tunnel connection attempt failed");
+                    let log_error = bounded_control_neutral_log_text(&err_msg);
+                    warn!(error = %log_error, "Tunnel connection attempt failed");
                     if is_fatal_error(&err_msg) {
                         let _ = self
                             .event_tx
@@ -2033,6 +2191,7 @@ impl TunnelForwarder {
     }
 
     pub async fn connect_and_forward(&self) -> Result<()> {
+        api::validate_api_base_url(&self.base_url)?;
         info!(
             local_host = %self.local_host,
             local_port = %self.local_port,
@@ -2233,9 +2392,11 @@ impl TunnelForwarder {
                                     .unwrap_or(false);
 
                                 let tunnel_type = if is_static { "static" } else { "ephemeral" };
+                                let log_subdomain = bounded_control_neutral_log_text(&subdomain);
+                                let log_tunnel_id = bounded_control_neutral_log_text(&tunnel_id);
                                 info!(
-                                    subdomain = %subdomain,
-                                    tunnel_id = %tunnel_id,
+                                    subdomain = %log_subdomain,
+                                    tunnel_id = %log_tunnel_id,
                                     tunnel_type = %tunnel_type,
                                     max_request_body_bytes = tunnel_limits.max_request_body_bytes,
                                     max_response_body_bytes = tunnel_limits.max_response_body_bytes,
@@ -2261,9 +2422,10 @@ impl TunnelForwarder {
                                     .and_then(|r| r.get("reason"))
                                     .and_then(|r| r.as_str())
                                     .unwrap_or("Unknown error");
+                                let reason = bounded_control_neutral_log_text(reason);
                                 let _ = self
                                     .event_tx
-                                    .send(TunnelEvent::ConnectionError(reason.to_string()))
+                                    .send(TunnelEvent::ConnectionError(reason.clone()))
                                     .await;
                                 return Err(anyhow!("Tunnel join failed: {}", reason));
                             }
@@ -2273,7 +2435,8 @@ impl TunnelForwarder {
                         write.send(Message::Pong(data)).await?;
                     }
                     Ok(Message::Close(frame)) => {
-                        return Err(anyhow!("WebSocket closed during join: {:?}", frame));
+                        let frame = bounded_control_neutral_log_text(&format!("{frame:?}"));
+                        return Err(anyhow!("WebSocket closed during join: {frame}"));
                     }
                     Err(e) => return Err(anyhow!("WebSocket error during join: {}", e)),
                     _ => {}
@@ -2323,11 +2486,13 @@ impl TunnelForwarder {
                             )
                             .await
                         {
-                            error!("Error handling tunnel message: {}", e);
+                            let error = bounded_control_neutral_log_text(&e.to_string());
+                            error!(error = %error, "Error handling tunnel message");
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        info!("Tunnel WebSocket closed: {:?}", frame);
+                        let frame = bounded_control_neutral_log_text(&format!("{frame:?}"));
+                        info!(frame = %frame, "Tunnel WebSocket closed");
                         self.emit_presentation(TunnelEvent::Disconnected);
                         break;
                     }
@@ -2390,10 +2555,12 @@ impl TunnelForwarder {
         runtime: &mut RelayRuntime,
     ) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
+        let log_topic = bounded_control_neutral_log_text(&msg.topic);
+        let log_event = bounded_control_neutral_log_text(&msg.event);
 
         debug!(
-            topic = %msg.topic,
-            event = %msg.event,
+            topic = %log_topic,
+            event = %log_event,
             "Received tunnel message"
         );
 
@@ -2458,7 +2625,9 @@ impl TunnelForwarder {
                                     "invalid_stream_frame",
                                 ))
                                 .await?;
-                            warn!(stream_id, error = %error, "Rejected invalid tunnel frame");
+                            let log_stream_id = bounded_control_neutral_log_text(&stream_id);
+                            let error = bounded_control_neutral_log_text(&error.to_string());
+                            warn!(stream_id = %log_stream_id, error = %error, "Rejected invalid tunnel frame");
                             return Ok(());
                         }
                     },
@@ -2494,10 +2663,12 @@ impl TunnelForwarder {
                     runtime.inbound_reserved_bytes = runtime
                         .inbound_reserved_bytes
                         .saturating_sub(assembler.total_bytes);
+                    let deadline_unix_ms = assembler.deadline_unix_ms;
+                    drop(assembler);
 
                     let delivery = match self.parse_local_delivery(
                         &payload,
-                        assembler.deadline_unix_ms,
+                        deadline_unix_ms,
                         tunnel_limits,
                     ) {
                         Ok(delivery) => delivery,
@@ -2505,19 +2676,26 @@ impl TunnelForwarder {
                             let request_id = payload
                                 .get("request_id")
                                 .and_then(serde_json::Value::as_str)
-                                .unwrap_or(&stream_id);
+                                .unwrap_or(&stream_id)
+                                .to_string();
+                            let error = error.to_string();
+                            drop(payload);
                             writer
                                 .control(delivery_error_message(
                                     tunnel_topic,
-                                    request_id,
+                                    &request_id,
                                     "invalid_relay_request",
                                     "known_not_executed",
-                                    &error.to_string(),
+                                    &error,
                                 ))
                                 .await?;
                             return Ok(());
                         }
                     };
+                    // Parsing clones the validated metadata and decodes the body into
+                    // LocalDelivery, so the larger serialized JSON representation is
+                    // no longer needed while the request waits for local capacity.
+                    drop(payload);
 
                     if runtime.active_deliveries.contains_key(&delivery.request_id) {
                         writer
@@ -2616,7 +2794,8 @@ impl TunnelForwarder {
                     .get("code")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("stream_error");
-                warn!(code, "Tunnel stream failed");
+                let code = bounded_control_neutral_log_text(code);
+                warn!(code = %code, "Tunnel stream failed");
             }
             "buffered_summary" => {
                 let count = msg
@@ -2712,7 +2891,8 @@ impl TunnelForwarder {
                             .to_string();
 
                         if reason != "buffer_empty" {
-                            warn!(reason = %reason, "Buffered replay request rejected");
+                            let log_reason = bounded_control_neutral_log_text(&reason);
+                            warn!(reason = %log_reason, "Buffered replay request rejected");
                             let _ = self
                                 .event_tx
                                 .send(TunnelEvent::BufferedReplayFailed {
@@ -2732,7 +2912,7 @@ impl TunnelForwarder {
                 }
             }
             _ => {
-                debug!("Unhandled tunnel event: {}", msg.event);
+                debug!(event = %log_event, "Unhandled tunnel event");
             }
         }
 
@@ -2766,21 +2946,11 @@ impl TunnelForwarder {
             .get("body")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let body = match body_encoding {
-            "raw" => raw_body.as_bytes().to_vec(),
-            "base64" => URL_SAFE_NO_PAD
-                .decode(raw_body)
-                .context("Tunnel request contains invalid base64url body data")?,
-            encoding => return Err(anyhow!("Unsupported tunnel body encoding: {encoding}")),
-        };
-
-        if body.len() > tunnel_limits.max_request_body_bytes {
-            return Err(anyhow!(
-                "Tunnel request body exceeds advertised limit ({} > {} bytes)",
-                body.len(),
-                tunnel_limits.max_request_body_bytes
-            ));
-        }
+        let body = decode_request_body_limited(
+            body_encoding,
+            raw_body,
+            tunnel_limits.max_request_body_bytes,
+        )?;
 
         Ok(LocalDelivery {
             request_id,
@@ -2965,11 +3135,6 @@ impl TunnelForwarder {
                         .await;
                 }
 
-                let initial_capacity = response_content_length
-                    .unwrap_or(0)
-                    .min(tunnel_limits.max_response_body_bytes);
-                let mut response_bytes = Vec::with_capacity(initial_capacity);
-
                 let Some(mut response_reservation) =
                     response_budget.try_reserve(response_content_length)
                 else {
@@ -2986,6 +3151,11 @@ impl TunnelForwarder {
                         )
                         .await;
                 };
+
+                let initial_capacity = response_content_length
+                    .unwrap_or(0)
+                    .min(TUNNEL_MAX_FRAME_BYTES);
+                let mut response_bytes = Vec::with_capacity(initial_capacity);
 
                 loop {
                     match response.chunk().await {
@@ -3033,7 +3203,8 @@ impl TunnelForwarder {
                         }
                         Ok(None) => break,
                         Err(error) => {
-                            let error_msg = format!("Failed to read local response: {error}");
+                            let error_msg =
+                                format!("Failed to read local response: {}", error.without_url());
 
                             return self
                                 .report_tunnel_failure(
@@ -3048,8 +3219,13 @@ impl TunnelForwarder {
                     }
                 }
 
+                drop(response);
                 let response_body_preview = body_preview(&response_bytes, &response_headers);
+                drop(response_headers);
+                let presentation_response_headers =
+                    bounded_presentation_headers(response_header_pairs.iter().cloned());
                 let (response_body, body_encoding) = encode_response_body(&response_bytes);
+                drop(response_bytes);
                 let duration_ms = start_time.elapsed().as_millis() as u64;
 
                 info!(
@@ -3060,7 +3236,7 @@ impl TunnelForwarder {
                     "Request forwarded successfully"
                 );
 
-                if let Err(error) = self
+                let response_result = self
                     .send_framed_tunnel_response(
                         &writer,
                         &tunnel_topic,
@@ -3069,13 +3245,15 @@ impl TunnelForwarder {
                         serde_json::json!({
                             "request_id": request_id.clone(),
                             "status": status,
-                            "headers": response_header_pairs.clone(),
+                            "headers": response_header_pairs,
                             "body": response_body,
                             "body_encoding": body_encoding,
                         }),
                     )
-                    .await
-                {
+                    .await;
+                drop(response_reservation);
+
+                if let Err(error) = response_result {
                     return self
                         .report_tunnel_failure(
                             &request_id,
@@ -3092,13 +3270,13 @@ impl TunnelForwarder {
                     request_id,
                     status,
                     duration_ms,
-                    response_headers: bounded_presentation_headers(response_header_pairs),
+                    response_headers: presentation_response_headers,
                     response_body: response_body_preview,
                 });
             }
             Err(error) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
-                let error_msg = format!("Failed to forward request: {error}");
+                let error_msg = format!("Failed to forward request: {}", error.without_url());
 
                 error!(
                     request_id = %request_id,
@@ -3132,6 +3310,7 @@ impl TunnelForwarder {
     ) -> Result<()> {
         let mut stream =
             OutboundTunnelStream::new(request_id, "response", deadline_unix_ms, &payload)?;
+        drop(payload);
 
         writer.response(stream.start_message(tunnel_topic)).await?;
 
@@ -3194,7 +3373,8 @@ impl TunnelForwarder {
                 }
                 Err(ref e) => {
                     let err_msg = e.to_string();
-                    warn!(error = %err_msg, "Tunnel connection attempt failed");
+                    let log_error = bounded_control_neutral_log_text(&err_msg);
+                    warn!(error = %log_error, "Tunnel connection attempt failed");
                     if is_fatal_error(&err_msg) {
                         let _ = self
                             .event_tx
@@ -3203,7 +3383,7 @@ impl TunnelForwarder {
                         return result;
                     }
 
-                    warn!(error = %err_msg, "Tunnel connection attempt failed; retrying");
+                    warn!(error = %log_error, "Tunnel connection attempt failed; retrying");
 
                     if start.elapsed() > Duration::from_secs(5) {
                         attempt = 0;
@@ -3415,6 +3595,50 @@ mod tests {
         assert_eq!(config.max_frame_size, Some(TUNNEL_MAX_FRAME_BYTES));
     }
 
+    #[tokio::test]
+    async fn test_read_response_body_limited_rejects_large_content_length() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/large")
+            .with_body("too large")
+            .create_async()
+            .await;
+        let mut response = reqwest::Client::new()
+            .get(format!("{}/large", server.url()))
+            .send()
+            .await
+            .unwrap();
+
+        let error = read_response_body_limited(&mut response, 4)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("max 4 bytes"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_read_response_body_limited_rejects_large_chunked_body() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/chunked")
+            .with_chunked_body(|writer| writer.write_all(b"too large"))
+            .create_async()
+            .await;
+        let mut response = reqwest::Client::new()
+            .get(format!("{}/chunked", server.url()))
+            .send()
+            .await
+            .unwrap();
+
+        let error = read_response_body_limited(&mut response, 4)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("max 4 bytes"));
+        mock.assert_async().await;
+    }
+
     #[test]
     fn test_framed_stream_round_trips_with_one_bounded_frame_in_flight() {
         let payload = serde_json::json!({
@@ -3439,6 +3663,7 @@ mod tests {
 
         assert_eq!(decoded.unwrap(), payload);
         assert_eq!(peak_in_flight, 1);
+        assert!(inbound.data.is_empty());
     }
 
     #[test]
@@ -3564,7 +3789,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tunnel_limits_use_join_response_contract() {
+    fn test_tunnel_limits_clamp_join_response_contract_to_local_maxima() {
         let response = serde_json::json!({
             "limits": {
                 "max_body_bytes": 268_435_456,
@@ -3575,16 +3800,52 @@ mod tests {
 
         let limits = TunnelLimits::from_join_response(&response);
 
-        assert_eq!(limits.max_request_body_bytes, 268_435_456);
-        assert_eq!(limits.max_response_body_bytes, 268_435_456);
-        assert_eq!(limits.max_response_header_bytes, 16_777_216);
+        assert_eq!(limits.max_request_body_bytes, LOCAL_MAX_TUNNEL_BODY_BYTES);
+        assert_eq!(limits.max_response_body_bytes, LOCAL_MAX_TUNNEL_BODY_BYTES);
+        assert_eq!(
+            limits.max_response_header_bytes,
+            LOCAL_MAX_RESPONSE_HEADER_BYTES
+        );
         assert!(limits.ordered_response_headers);
+    }
+
+    #[test]
+    fn test_tunnel_limits_clamp_untrusted_body_limit_to_local_maximum() {
+        let response = serde_json::json!({
+            "limits": {
+                "max_body_bytes": u64::MAX,
+                "max_response_header_bytes": u64::MAX
+            }
+        });
+
+        let limits = TunnelLimits::from_join_response(&response);
+
+        assert_eq!(
+            (
+                limits.max_request_body_bytes,
+                limits.max_response_body_bytes
+            ),
+            (LOCAL_MAX_TUNNEL_BODY_BYTES, LOCAL_MAX_TUNNEL_BODY_BYTES)
+        );
+        assert_eq!(
+            limits.max_response_header_bytes,
+            LOCAL_MAX_RESPONSE_HEADER_BYTES
+        );
     }
 
     #[test]
     fn test_tunnel_limits_keep_legacy_response_header_shape_by_default() {
         let limits = TunnelLimits::from_join_response(&serde_json::json!({}));
 
+        assert_eq!(limits.max_request_body_bytes, LEGACY_MAX_REQUEST_BODY_BYTES);
+        assert_eq!(
+            limits.max_response_body_bytes,
+            LEGACY_MAX_RESPONSE_BODY_BYTES
+        );
+        assert_eq!(
+            limits.max_response_header_bytes,
+            LEGACY_MAX_RESPONSE_HEADER_BYTES
+        );
         assert!(!limits.ordered_response_headers);
     }
 
@@ -3754,17 +4015,32 @@ mod tests {
     }
 
     #[test]
-    fn test_local_work_budget_bounds_concurrent_ten_megabyte_deliveries() {
+    fn test_log_text_is_control_neutral_and_bounded() {
+        let input = format!(
+            "relay\u{1b}]52;c;owned\u{7}\n{}",
+            "a".repeat(LOG_TEXT_MAX_BYTES)
+        );
+
+        let sanitized = bounded_control_neutral_log_text(&input);
+
+        assert!(sanitized.len() <= LOG_TEXT_MAX_BYTES);
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(sanitized.contains("\\u{1b}"));
+        assert!(sanitized.contains("\\n"));
+        assert!(sanitized.ends_with("..."));
+    }
+
+    #[test]
+    fn test_local_work_budget_prevents_concurrent_ten_megabyte_deliveries() {
         let budget = LocalWorkBudget::new();
         let ten_mib = 10 * 1024 * 1024;
-        let permits = (0..LOCAL_WORK_MAX_COUNT)
-            .map(|_| budget.try_acquire(ten_mib).unwrap())
-            .collect::<Vec<_>>();
+        let permit = budget.try_acquire(ten_mib).unwrap();
 
-        assert_eq!(budget.available_count(), 0);
+        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 1);
+        assert_eq!(budget.available_bytes(), 6 * 1024 * 1024);
         assert!(budget.try_acquire(ten_mib).is_none());
 
-        drop(permits);
+        drop(permit);
         assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT);
         assert_eq!(budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
     }
@@ -3812,31 +4088,24 @@ mod tests {
     }
 
     #[test]
-    fn test_local_work_budget_allows_one_oversized_delivery_exclusively() {
+    fn test_local_work_budget_rejects_oversized_delivery() {
         let budget = LocalWorkBudget::new();
-        let permit = budget.try_acquire(LOCAL_WORK_MAX_BYTES * 2).unwrap();
 
-        assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT - 1);
-        assert_eq!(budget.available_bytes(), 0);
-        assert!(budget.try_acquire(1).is_none());
-
-        drop(permit);
+        assert!(budget.try_acquire(LOCAL_WORK_MAX_BYTES + 1).is_none());
         assert_eq!(budget.available_count(), LOCAL_WORK_MAX_COUNT);
         assert_eq!(budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
     }
 
     #[test]
-    fn test_response_buffer_budget_bounds_concurrent_ten_megabyte_responses() {
+    fn test_response_buffer_budget_prevents_concurrent_ten_megabyte_responses() {
         let budget = ResponseBufferBudget::new();
         let ten_mib = 10 * 1024 * 1024;
-        let permits = (0..25)
-            .map(|_| budget.try_reserve(Some(ten_mib)).unwrap())
-            .collect::<Vec<_>>();
+        let reservation = budget.try_reserve(Some(ten_mib)).unwrap();
 
         assert_eq!(budget.available_bytes(), 6 * 1024 * 1024);
         assert!(budget.try_reserve(Some(ten_mib)).is_none());
 
-        drop(permits);
+        drop(reservation);
         assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
     }
 
@@ -3853,40 +4122,40 @@ mod tests {
     }
 
     #[test]
-    fn test_response_buffer_budget_allows_one_oversized_response_exclusively() {
+    fn test_response_buffer_budget_rejects_oversized_response() {
         let budget = ResponseBufferBudget::new();
-        let permit = budget
-            .try_reserve(Some(RESPONSE_BUFFER_MAX_BYTES * 2))
-            .unwrap();
 
-        assert_eq!(budget.available_bytes(), 0);
-        assert!(budget.try_reserve(Some(1)).is_none());
-
-        drop(permit);
+        assert!(
+            budget
+                .try_reserve(Some(RESPONSE_BUFFER_MAX_BYTES + 1))
+                .is_none()
+        );
         assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
     }
 
     #[test]
-    fn test_unknown_response_length_can_upgrade_to_exclusive_reservation() {
+    fn test_unknown_response_length_cannot_grow_past_budget() {
         let budget = ResponseBufferBudget::new();
         let mut reservation = budget.try_reserve(None).unwrap();
 
         assert!(reservation.try_grow_to(RESPONSE_BUFFER_MAX_BYTES / 2));
-        assert!(reservation.try_grow_to(RESPONSE_BUFFER_MAX_BYTES * 2));
-        assert_eq!(budget.available_bytes(), 0);
-        assert!(budget.try_reserve(Some(1)).is_none());
+        assert!(!reservation.try_grow_to(RESPONSE_BUFFER_MAX_BYTES + 1));
+        assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES / 2);
 
         drop(reservation);
         assert_eq!(budget.available_bytes(), RESPONSE_BUFFER_MAX_BYTES);
     }
 
     #[test]
-    fn test_inbound_stream_budget_allows_one_oversized_stream_exclusively() {
-        let oversized = INBOUND_STREAM_MAX_BYTES * 2;
+    fn test_inbound_stream_budget_rejects_oversized_stream() {
+        let oversized = INBOUND_STREAM_MAX_BYTES.saturating_add(1);
+        let encoded_body_bytes = base64::encoded_len(LOCAL_MAX_TUNNEL_BODY_BYTES, false).unwrap();
 
-        assert!(inbound_stream_fits_budget(0, oversized));
-        assert!(!inbound_stream_fits_budget(1, oversized));
-        assert!(!inbound_stream_fits_budget(oversized, 1));
+        assert_eq!(INBOUND_STREAM_MAX_BYTES, 32 * 1024 * 1024);
+        assert!(
+            encoded_body_bytes.saturating_add(TUNNEL_MAX_FRAME_BYTES) < INBOUND_STREAM_MAX_BYTES
+        );
+        assert!(!inbound_stream_fits_budget(0, oversized));
         assert!(inbound_stream_fits_budget(INBOUND_STREAM_MAX_BYTES - 1, 1));
     }
 
@@ -4700,5 +4969,21 @@ mod tests {
         let encoded = URL_SAFE_NO_PAD.encode(original);
         let decoded = URL_SAFE_NO_PAD.decode(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_decode_request_body_limited_rejects_oversized_raw_body_before_copying() {
+        let error = decode_request_body_limited("raw", "12345", 4).unwrap_err();
+
+        assert!(error.to_string().contains("5 > 4 bytes"));
+    }
+
+    #[test]
+    fn test_decode_request_body_limited_rejects_oversized_base64_before_decoding() {
+        let encoded = URL_SAFE_NO_PAD.encode(b"12345");
+
+        let error = decode_request_body_limited("base64", &encoded, 4).unwrap_err();
+
+        assert!(error.to_string().contains("encoded body is too large"));
     }
 }

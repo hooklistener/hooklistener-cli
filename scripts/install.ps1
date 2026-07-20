@@ -49,13 +49,33 @@ function Get-ExpectedChecksum {
         [string]$ArchiveName
     )
 
-    $Content = Get-Content $ChecksumsPath
-    foreach ($Line in $Content) {
-        if ($Line -match "^([a-fA-F0-9]{64})\s+.*$([regex]::Escape($ArchiveName))$") {
-            return $Matches[1]
+    $Entries = @()
+    foreach ($Line in Get-Content $ChecksumsPath) {
+        if ($Line -notmatch '^(\S+)[ \t]+(\*?)(\S+)[ \t]*$') {
+            continue
         }
+
+        $Checksum = $Matches[1]
+        $ListedName = $Matches[3]
+        if ($ListedName -cne $ArchiveName) {
+            continue
+        }
+
+        if ($Checksum -cnotmatch '^[a-fA-F0-9]{64}$') {
+            throw "Checksum manifest contains an invalid SHA256 digest for $ArchiveName"
+        }
+
+        $Entries += $Checksum.ToLowerInvariant()
     }
-    return $null
+
+    if ($Entries.Count -eq 0) {
+        throw "Checksum manifest is missing an entry for $ArchiveName"
+    }
+    if ($Entries.Count -ne 1) {
+        throw "Checksum manifest has duplicate entries for $ArchiveName"
+    }
+
+    return $Entries[0]
 }
 
 function Verify-Checksum {
@@ -64,11 +84,14 @@ function Verify-Checksum {
         [string]$ExpectedChecksum
     )
 
-    $ActualChecksum = (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash.ToLower()
-    $ExpectedLower = $ExpectedChecksum.ToLower()
+    if ($ExpectedChecksum -cnotmatch '^[a-f0-9]{64}$') {
+        throw "Expected checksum is not a valid SHA256 digest"
+    }
 
-    if ($ActualChecksum -ne $ExpectedLower) {
-        Write-Error-Custom "Checksum verification failed!`nExpected: $ExpectedLower`nActual: $ActualChecksum"
+    $ActualChecksum = (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    if ($ActualChecksum -cne $ExpectedChecksum) {
+        Write-Error-Custom "Checksum verification failed!`nExpected: $ExpectedChecksum`nActual: $ActualChecksum"
     }
 
     Write-Success "Checksum verified"
@@ -127,11 +150,7 @@ function Install-HooklistenerCli {
         # Verify checksum
         Write-Info "Verifying checksum..."
         $ExpectedChecksum = Get-ExpectedChecksum -ChecksumsPath $ChecksumsPath -ArchiveName $ArchiveName
-        if ($ExpectedChecksum) {
-            Verify-Checksum -FilePath $ArchivePath -ExpectedChecksum $ExpectedChecksum
-        } else {
-            Write-Warn "Could not find checksum for $ArchiveName, skipping verification"
-        }
+        Verify-Checksum -FilePath $ArchivePath -ExpectedChecksum $ExpectedChecksum
 
         # Extract archive
         Write-Info "Extracting archive..."

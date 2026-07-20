@@ -1,21 +1,261 @@
 use crate::{
     errors::TunnelLifecycleError,
     models::{ForwardResponse, WebhookRequest},
+    target_policy::TargetPolicy,
 };
 use anyhow::{Context, Result, anyhow};
 use reqwest::{
-    Client, Response, Url,
+    Client, Response, StatusCode, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const RELAY_TICKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const REPLAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REPLAY_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const MAX_SERVER_ERROR_DETAIL_BYTES: usize = 256;
+pub(crate) const ALLOW_INSECURE_DEV_SERVER_ENV: &str = "HOOKLISTENER_ALLOW_INSECURE_DEV_SERVER";
+
+static ALLOW_INSECURE_DEV_SERVER: AtomicBool = AtomicBool::new(false);
+static INSECURE_DEV_SERVER_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ServerUrlKind {
+    Api,
+    WebSocket,
+    Relay,
+}
+
+impl ServerUrlKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Api => "API",
+            Self::WebSocket => "WebSocket",
+            Self::Relay => "relay",
+        }
+    }
+
+    fn supported_schemes(self) -> &'static str {
+        match self {
+            Self::Api => "https",
+            Self::WebSocket => "wss",
+            Self::Relay => "https or wss",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ServerUrlSecurity {
+    Tls,
+    LoopbackCleartext,
+    ExplicitDevCleartext,
+}
+
+pub(crate) fn configure_server_url_security(allow_insecure_dev_server: bool) {
+    let env_opt_in = std::env::var(ALLOW_INSECURE_DEV_SERVER_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    ALLOW_INSECURE_DEV_SERVER.store(allow_insecure_dev_server || env_opt_in, Ordering::Relaxed);
+}
+
+fn server_url_is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']).trim_end_matches('.');
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+pub(crate) fn validate_server_url(
+    value: &str,
+    kind: ServerUrlKind,
+    allow_insecure_dev_server: bool,
+) -> Result<ServerUrlSecurity> {
+    let url = Url::parse(value).map_err(|_| {
+        anyhow!(
+            "Invalid Hooklistener {} URL. Use {}.",
+            kind.label(),
+            kind.supported_schemes()
+        )
+    })?;
+    if url.host_str().is_none() {
+        return Err(anyhow!(
+            "Invalid Hooklistener {} URL: a host is required.",
+            kind.label()
+        ));
+    }
+
+    match (kind, url.scheme()) {
+        (ServerUrlKind::Api, "https")
+        | (ServerUrlKind::WebSocket, "wss")
+        | (ServerUrlKind::Relay, "https" | "wss") => return Ok(ServerUrlSecurity::Tls),
+        (ServerUrlKind::Api, "http")
+        | (ServerUrlKind::WebSocket, "ws")
+        | (ServerUrlKind::Relay, "http" | "ws") => {}
+        (_, scheme) => {
+            return Err(anyhow!(
+                "Unsupported Hooklistener {} URL scheme '{}'. Use {}.",
+                kind.label(),
+                scheme,
+                kind.supported_schemes()
+            ));
+        }
+    }
+
+    if server_url_is_loopback(&url) {
+        return Ok(ServerUrlSecurity::LoopbackCleartext);
+    }
+    if allow_insecure_dev_server {
+        return Ok(ServerUrlSecurity::ExplicitDevCleartext);
+    }
+
+    Err(anyhow!(
+        "Cleartext Hooklistener {} URLs are blocked for non-loopback hosts. Use {}, or opt in for isolated development with --allow-insecure-dev-server or {}=1.",
+        kind.label(),
+        kind.supported_schemes(),
+        ALLOW_INSECURE_DEV_SERVER_ENV
+    ))
+}
+
+fn validate_configured_server_url(value: &str, kind: ServerUrlKind) -> Result<()> {
+    let security = validate_server_url(
+        value,
+        kind,
+        ALLOW_INSECURE_DEV_SERVER.load(Ordering::Relaxed),
+    )?;
+    if security == ServerUrlSecurity::ExplicitDevCleartext
+        && !INSECURE_DEV_SERVER_WARNING_EMITTED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "WARNING: cleartext Hooklistener {} transport is enabled for development; credentials and relay tickets can be intercepted.",
+            kind.label()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_api_base_url(value: &str) -> Result<()> {
+    validate_configured_server_url(value, ServerUrlKind::Api)
+}
+
+pub(crate) fn validate_websocket_base_url(value: &str) -> Result<()> {
+    validate_configured_server_url(value, ServerUrlKind::WebSocket)
+}
+
+pub(crate) fn validate_relay_base_url(value: &str) -> Result<()> {
+    validate_configured_server_url(value, ServerUrlKind::Relay)
+}
+
+fn relay_http_base_url(value: &str) -> Result<String> {
+    validate_relay_base_url(value)?;
+    let mut url = Url::parse(value).context("Invalid Hooklistener relay URL")?;
+    let http_scheme = match url.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        "https" => "https",
+        "http" => "http",
+        _ => return Err(anyhow!("Unsupported Hooklistener relay URL scheme")),
+    };
+    url.set_scheme(http_scheme)
+        .map_err(|_| anyhow!("Failed to normalize Hooklistener relay URL"))?;
+    Ok(url.to_string())
+}
+
+fn bounded_control_neutral_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len().min(MAX_SERVER_ERROR_DETAIL_BYTES));
+    let mut truncated = false;
+
+    for character in value.chars() {
+        let rendered = if character.is_control() {
+            character.escape_default().collect::<String>()
+        } else {
+            character.to_string()
+        };
+        if output.len().saturating_add(rendered.len()) > MAX_SERVER_ERROR_DETAIL_BYTES - 3 {
+            truncated = true;
+            break;
+        }
+        output.push_str(&rendered);
+    }
+    if truncated {
+        output.push_str("...");
+    }
+    output
+}
+
+fn structured_server_error_detail(body: &str) -> Option<String> {
+    let payload = serde_json::from_str::<Value>(body).ok()?;
+    let error = payload.get("error").unwrap_or(&payload);
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("code").and_then(Value::as_str));
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .or_else(|| payload.get("message").and_then(Value::as_str));
+
+    let detail = match (code, message) {
+        (Some(code), Some(message)) => format!("code={code}; message={message}"),
+        (Some(code), None) => format!("code={code}"),
+        (None, Some(message)) => format!("message={message}"),
+        (None, None) => return None,
+    };
+    Some(bounded_control_neutral_text(&detail))
+}
+
+fn server_response_error(context: &str, status: StatusCode, body: &str) -> anyhow::Error {
+    match structured_server_error_detail(body) {
+        Some(detail) => anyhow!("{context} (HTTP {status}; {detail})"),
+        None => anyhow!("{context} (HTTP {status})"),
+    }
+}
+
+async fn read_replay_response_body(response: &mut Response) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REPLAY_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(anyhow!(
+            "Replay response body exceeded {MAX_REPLAY_RESPONSE_BODY_BYTES} bytes"
+        ));
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(MAX_REPLAY_RESPONSE_BODY_BYTES);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        anyhow!(
+            "Failed to read replay response: {}",
+            bounded_control_neutral_text(&error.without_url().to_string())
+        )
+    })? {
+        if chunk.len() > MAX_REPLAY_RESPONSE_BODY_BYTES.saturating_sub(body.len()) {
+            return Err(anyhow!(
+                "Replay response body exceeded {MAX_REPLAY_RESPONSE_BODY_BYTES} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
 
 fn deserialize_map_or_default<'de, D>(
     deserializer: D,
@@ -676,9 +916,11 @@ pub struct ApiClient {
     base_url: Option<String>,
 }
 
-pub fn default_base_url() -> String {
-    std::env::var("HOOKLISTENER_API_URL")
-        .unwrap_or_else(|_| "https://app.hooklistener.com".to_string())
+pub fn default_base_url() -> Result<String> {
+    let base_url = std::env::var("HOOKLISTENER_API_URL")
+        .unwrap_or_else(|_| "https://app.hooklistener.com".to_string());
+    validate_api_base_url(&base_url)?;
+    Ok(base_url)
 }
 
 /// Refresh an expired CLI access token using a refresh token (no auth needed).
@@ -686,6 +928,7 @@ pub async fn refresh_access_token(
     refresh_token: &str,
     base_url: &str,
 ) -> Result<TokenRefreshResponse> {
+    validate_api_base_url(base_url)?;
     let url = format!("{}/api/v1/auth/refresh", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "refresh_token": refresh_token });
 
@@ -701,7 +944,7 @@ pub async fn refresh_access_token(
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(anyhow!("Token refresh failed (HTTP {}): {}", status, text));
+        return Err(server_response_error("Token refresh failed", status, &text));
     }
 
     serde_json::from_str(&text).context("Failed to parse refresh response")
@@ -709,7 +952,7 @@ pub async fn refresh_access_token(
 
 /// Revoke a CLI refresh token server-side (best-effort, no auth needed).
 pub async fn revoke_refresh_token(refresh_token: &str) -> Result<()> {
-    let base_url = default_base_url();
+    let base_url = default_base_url()?;
     let url = format!("{}/api/v1/auth/revoke", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "refresh_token": refresh_token });
 
@@ -724,9 +967,7 @@ pub async fn issue_relay_ticket(
     base_url: &str,
     plan: &Value,
 ) -> Result<RelayTicket> {
-    let http_base = base_url
-        .replacen("wss://", "https://", 1)
-        .replacen("ws://", "http://", 1);
+    let http_base = relay_http_base_url(base_url)?;
     let url = format!(
         "{}/api/v1/tunnel/relay-tickets",
         http_base.trim_end_matches('/')
@@ -751,7 +992,7 @@ pub async fn issue_relay_ticket(
         } else {
             "Relay handshake ticket request failed"
         };
-        return Err(anyhow!("{} (HTTP {}): {}", failure, status, text));
+        return Err(server_response_error(failure, status, &text));
     }
 
     serde_json::from_str::<RelayTicketEnvelope>(&text)
@@ -760,26 +1001,29 @@ pub async fn issue_relay_ticket(
 }
 
 impl ApiClient {
-    pub fn for_forwarding() -> Self {
-        Self {
-            client: Client::new(),
+    pub fn for_forwarding() -> Result<Self> {
+        let client = Client::builder()
+            .timeout(REPLAY_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .context("Failed to build replay client")?;
+        Ok(Self {
+            client,
             base_url: None,
-        }
+        })
     }
 
     /// Create a client with no authentication (for anonymous endpoints).
     pub fn unauthenticated() -> Result<Self> {
-        Self::unauthenticated_at(default_base_url())
+        Self::unauthenticated_at(default_base_url()?)
     }
 
     pub fn unauthenticated_at(base_url: String) -> Result<Self> {
+        let base_url = relay_http_base_url(&base_url)?;
         Ok(Self {
             client: Client::new(),
-            base_url: Some(
-                base_url
-                    .replacen("wss://", "https://", 1)
-                    .replacen("ws://", "http://", 1),
-            ),
+            base_url: Some(base_url),
         })
     }
 
@@ -787,7 +1031,7 @@ impl ApiClient {
         access_token: String,
         organization_id: Option<String>,
     ) -> Result<Self> {
-        Self::with_base_url(access_token, default_base_url(), organization_id)
+        Self::with_base_url(access_token, default_base_url()?, organization_id)
     }
 
     pub fn with_base_url(
@@ -795,6 +1039,7 @@ impl ApiClient {
         base_url: String,
         organization_id: Option<String>,
     ) -> Result<Self> {
+        validate_api_base_url(&base_url)?;
         let mut headers = HeaderMap::new();
         let auth = format!("Bearer {}", access_token);
         headers.insert(
@@ -850,7 +1095,11 @@ impl ApiClient {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("{} failed (HTTP {}): {}", context, status, text));
+            return Err(server_response_error(
+                &format!("{context} failed"),
+                status,
+                &text,
+            ));
         }
 
         serde_json::from_str(&text).with_context(|| format!("Failed to parse {} response", context))
@@ -878,6 +1127,8 @@ impl ApiClient {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or(context);
+        let code = bounded_control_neutral_text(code);
+        let message = bounded_control_neutral_text(message);
 
         if code == "cursor_expired" {
             return Err(TunnelLifecycleError::CursorExpired {
@@ -892,8 +1143,8 @@ impl ApiClient {
 
         Err(TunnelLifecycleError::Api {
             status: status.as_u16(),
-            code: code.to_string(),
-            message: message.to_string(),
+            code,
+            message,
         }
         .into())
     }
@@ -1009,7 +1260,11 @@ impl ApiClient {
         }
 
         let text = response.text().await.unwrap_or_default();
-        Err(anyhow!("{} failed (HTTP {}): {}", context, status, text))
+        Err(server_response_error(
+            &format!("{context} failed"),
+            status,
+            &text,
+        ))
     }
 
     pub async fn list_organizations(&self) -> Result<Vec<Organization>> {
@@ -1502,6 +1757,8 @@ impl ApiClient {
         target_url: &str,
     ) -> Result<ForwardResponse> {
         let start_time = Instant::now();
+        let target = TargetPolicy::resolve(target_url, false, false).await?;
+        let replay_client = target.http_client_with_timeout(REPLAY_REQUEST_TIMEOUT)?;
 
         // Build the forwarding request
         let method = match original_request.method.as_str() {
@@ -1515,15 +1772,15 @@ impl ApiClient {
             _ => reqwest::Method::GET,
         };
 
-        // Build URL with query parameters
-        let mut url = target_url.parse::<Url>()?;
+        // Keep the caller's target path while adding the captured request's query.
+        let mut url = target.request_url("", None)?;
         if !original_request.query_params.is_empty() {
             for (key, value) in &original_request.query_params {
                 url.query_pairs_mut().append_pair(key, &value.to_string());
             }
         }
 
-        let mut request_builder = self.client.request(method, url);
+        let mut request_builder = replay_client.request(method, url);
 
         // Add headers (excluding host-related ones)
         for (key, value) in &original_request.headers {
@@ -1553,7 +1810,7 @@ impl ApiClient {
 
         // Execute the request
         match request_builder.send().await {
-            Ok(response) => {
+            Ok(mut response) => {
                 let status_code = response.status().as_u16();
 
                 // Extract response headers
@@ -1566,11 +1823,11 @@ impl ApiClient {
 
                 // Decode a bounded, content-aware preview for display. The tunnel path
                 // separately preserves original response bytes for the public caller.
-                let body = match response.bytes().await {
+                let body = match read_replay_response_body(&mut response).await {
                     Ok(bytes) => {
                         crate::tunnel::body_preview(&bytes, &response_headers).unwrap_or_default()
                     }
-                    Err(_) => "(Failed to read response body)".to_string(),
+                    Err(error) => format!("({error})"),
                 };
 
                 let duration = start_time.elapsed();
@@ -1585,7 +1842,7 @@ impl ApiClient {
                     duration_ms: duration.as_millis() as u64,
                 })
             }
-            Err(e) => {
+            Err(error) => {
                 let duration = start_time.elapsed();
 
                 Ok(ForwardResponse {
@@ -1593,7 +1850,9 @@ impl ApiClient {
                     status_code: None,
                     headers: HashMap::new(),
                     body: String::new(),
-                    error_message: Some(e.to_string()),
+                    error_message: Some(bounded_control_neutral_text(
+                        &error.without_url().to_string(),
+                    )),
                     target_url: target_url.to_string(),
                     duration_ms: duration.as_millis() as u64,
                 })
@@ -1607,6 +1866,144 @@ mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
+
+    fn replay_test_request(method: &str) -> WebhookRequest {
+        WebhookRequest {
+            id: "req-replay".to_string(),
+            timestamp: 0,
+            remote_addr: "127.0.0.1".to_string(),
+            headers: HashMap::new(),
+            content_length: 0,
+            method: method.to_string(),
+            url: "/webhook".to_string(),
+            path: Some("/webhook".to_string()),
+            query_params: HashMap::new(),
+            created_at: "2024-01-01".to_string(),
+            body_preview: None,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn server_url_validation_accepts_tls_api_and_websocket_urls() {
+        let urls = [
+            ("https://app.hooklistener.com", ServerUrlKind::Api),
+            ("wss://api.hooklistener.com", ServerUrlKind::WebSocket),
+        ];
+
+        assert!(urls.into_iter().all(|(url, kind)| matches!(
+            validate_server_url(url, kind, false),
+            Ok(ServerUrlSecurity::Tls)
+        )));
+    }
+
+    #[test]
+    fn server_url_validation_accepts_loopback_cleartext_without_opt_in() {
+        let urls = [
+            ("http://localhost:4000", ServerUrlKind::Api),
+            ("ws://127.0.0.1:4000", ServerUrlKind::WebSocket),
+            ("ws://[::1]:4000", ServerUrlKind::WebSocket),
+        ];
+
+        assert!(urls.into_iter().all(|(url, kind)| matches!(
+            validate_server_url(url, kind, false),
+            Ok(ServerUrlSecurity::LoopbackCleartext)
+        )));
+    }
+
+    #[test]
+    fn server_url_validation_rejects_remote_cleartext_api_without_opt_in() {
+        let error =
+            validate_server_url("http://dev.example.com", ServerUrlKind::Api, false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Cleartext Hooklistener API URLs are blocked")
+        );
+    }
+
+    #[test]
+    fn server_url_validation_rejects_remote_cleartext_websocket_without_opt_in() {
+        let error = validate_server_url("ws://dev.example.com", ServerUrlKind::WebSocket, false)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Cleartext Hooklistener WebSocket URLs are blocked")
+        );
+    }
+
+    #[test]
+    fn server_url_validation_accepts_remote_cleartext_with_explicit_dev_opt_in() {
+        let urls = [
+            ("http://dev.example.com", ServerUrlKind::Api),
+            ("ws://dev.example.com", ServerUrlKind::WebSocket),
+        ];
+
+        assert!(urls.into_iter().all(|(url, kind)| matches!(
+            validate_server_url(url, kind, true),
+            Ok(ServerUrlSecurity::ExplicitDevCleartext)
+        )));
+    }
+
+    #[test]
+    fn server_url_validation_rejects_unsupported_scheme() {
+        let error =
+            validate_server_url("ftp://dev.example.com", ServerUrlKind::Api, true).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported Hooklistener API URL scheme 'ftp'")
+        );
+    }
+
+    #[test]
+    fn server_url_validation_rejects_malformed_url() {
+        let error = validate_server_url("not a URL", ServerUrlKind::Api, false).unwrap_err();
+
+        assert!(error.to_string().contains("Invalid Hooklistener API URL"));
+    }
+
+    #[test]
+    fn server_response_error_omits_unstructured_response_body() {
+        let error = server_response_error(
+            "Request failed",
+            StatusCode::BAD_GATEWAY,
+            "<html>secret\u{1b}]52;c;payload\u{7}</html>",
+        );
+
+        assert_eq!(error.to_string(), "Request failed (HTTP 502 Bad Gateway)");
+    }
+
+    #[test]
+    fn structured_server_error_detail_neutralizes_controls() {
+        let body = serde_json::json!({
+            "error": {
+                "code": "denied\nforged",
+                "message": "bad\u{1b}[31mrequest\r"
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            structured_server_error_detail(&body).as_deref(),
+            Some(r"code=denied\nforged; message=bad\u{1b}[31mrequest\r")
+        );
+    }
+
+    #[test]
+    fn structured_server_error_detail_is_bounded() {
+        let body = serde_json::json!({
+            "error": {"message": "x".repeat(MAX_SERVER_ERROR_DETAIL_BYTES * 2)}
+        })
+        .to_string();
+        let detail = structured_server_error_detail(&body).unwrap();
+
+        assert!(detail.len() <= MAX_SERVER_ERROR_DETAIL_BYTES);
+    }
 
     #[tokio::test]
     async fn relay_ticket_exchange_uses_authorization_header_and_parses_safe_receipt() {
@@ -1887,6 +2284,101 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_non_loopback_target_before_sending() {
+        let client = ApiClient::for_forwarding().unwrap();
+        let request = replay_test_request("GET");
+
+        let error = client
+            .forward_request(&request, "http://169.254.169.254/latest/meta-data")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("target_non_loopback_requires_scope")
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_does_not_follow_redirects() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/start")
+            .with_status(302)
+            .with_header("location", "/unexpected")
+            .create_async()
+            .await;
+        let unexpected = server
+            .mock("GET", "/unexpected")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let client = ApiClient::for_forwarding().unwrap();
+
+        let response = client
+            .forward_request(
+                &replay_test_request("GET"),
+                &format!("{}/start", server.url()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!((response.success, response.status_code), (true, Some(302)));
+        redirect.assert_async().await;
+        unexpected.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn replay_bounds_response_body_buffering() {
+        let mut server = mockito::Server::new_async().await;
+        let oversized_body = vec![b'x'; MAX_REPLAY_RESPONSE_BODY_BYTES + 1];
+        let response_mock = server
+            .mock("GET", "/large")
+            .with_status(200)
+            .with_body(oversized_body)
+            .create_async()
+            .await;
+        let client = ApiClient::for_forwarding().unwrap();
+
+        let response = client
+            .forward_request(
+                &replay_test_request("GET"),
+                &format!("{}/large", server.url()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.body,
+            format!("(Replay response body exceeded {MAX_REPLAY_RESPONSE_BODY_BYTES} bytes)")
+        );
+        response_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn replay_connection_error_does_not_include_target_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let sensitive_path = "sensitive-replay-target";
+        let target = format!("http://127.0.0.1:{port}/{sensitive_path}");
+        let client = ApiClient::for_forwarding().unwrap();
+
+        let response = client
+            .forward_request(&replay_test_request("POST"), &target)
+            .await
+            .unwrap();
+        let error = response.error_message.unwrap();
+
+        assert!(
+            !error.contains(sensitive_path),
+            "error exposed URL: {error}"
+        );
     }
 
     #[tokio::test]

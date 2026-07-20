@@ -64,7 +64,9 @@ jobs:
           mkdir -p target/dist
 
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            7z a "target/dist/${binary_name}-${{ matrix.target }}.zip" "target/${{ matrix.target }}/release/${binary_name}"
+            pushd "target/${{ matrix.target }}/release"
+            7z a "../../dist/${binary_name}-${{ matrix.target }}.zip" "${binary_name}"
+            popd
           else
             tar -czf "target/dist/${binary_name}-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "${binary_name}"
           fi
@@ -175,10 +177,26 @@ jobs:
 
       - name: Extract checksums
         id: checksums
+        shell: bash
         run: |
-          ARM64_SHA=$(grep "aarch64-apple-darwin" SHA256SUMS.txt | awk '{print $1}')
-          X86_64_SHA=$(grep "x86_64-apple-darwin" SHA256SUMS.txt | awk '{print $1}')
-          LINUX_SHA=$(grep "x86_64-unknown-linux-gnu" SHA256SUMS.txt | awk '{print $1}')
+          set -euo pipefail
+
+          extract_checksum() {
+            local asset_name="$1"
+            local checksum
+            checksum=$(awk -v asset_name="$asset_name" '$2 == asset_name { print $1 }' SHA256SUMS.txt)
+
+            if [[ ! "$checksum" =~ ^[a-f0-9]{64}$ ]]; then
+              echo "::error::Expected exactly one valid SHA-256 entry for ${asset_name}" >&2
+              return 1
+            fi
+
+            printf '%s\n' "$checksum"
+          }
+
+          ARM64_SHA=$(extract_checksum "hooklistener-aarch64-apple-darwin.tar.gz")
+          X86_64_SHA=$(extract_checksum "hooklistener-x86_64-apple-darwin.tar.gz")
+          LINUX_SHA=$(extract_checksum "hooklistener-x86_64-unknown-linux-gnu.tar.gz")
 
           echo "arm64=$ARM64_SHA" >> $GITHUB_OUTPUT
           echo "x86_64=$X86_64_SHA" >> $GITHUB_OUTPUT

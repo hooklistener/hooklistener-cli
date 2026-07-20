@@ -14,6 +14,8 @@ const GITHUB_REPO_OWNER: &str = "hooklistener";
 const GITHUB_REPO_NAME: &str = "hooklistener-cli";
 const CHECK_INTERVAL_HOURS: i64 = 24;
 const REQUEST_TIMEOUT_SECS: u64 = 5;
+const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
+const MAX_CHECKSUM_MANIFEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 enum InstallMethod {
@@ -69,6 +71,21 @@ impl InstallMethod {
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
+    #[serde(default)]
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug)]
+struct PreparedBinaryUpdate {
+    release_tag: String,
+    archive_name: String,
+    checksum: String,
 }
 
 fn normalize_version(tag: &str) -> &str {
@@ -114,37 +131,9 @@ async fn check_latest_version() -> Result<Option<String>, UpdateError> {
 }
 
 async fn check_latest_version_from(base_url: &str) -> Result<Option<String>, UpdateError> {
-    let url = format!(
-        "{}/repos/{}/{}/releases/latest",
-        base_url.trim_end_matches('/'),
-        GITHUB_REPO_OWNER,
-        GITHUB_REPO_NAME
-    );
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .user_agent(format!("hooklistener-cli/{}", CURRENT_VERSION))
-        .build()
-        .map_err(|e| UpdateError::CheckFailed(e.to_string()))?;
-
-    let response = client
-        .get(&url)
-        .send()
+    let release = fetch_latest_release_from(base_url)
         .await
-        .map_err(|e| UpdateError::CheckFailed(e.to_string()))?;
-
-    if !response.status().is_success() {
-        return Err(UpdateError::CheckFailed(format!(
-            "GitHub API returned {}",
-            response.status()
-        )));
-    }
-
-    let release: GitHubRelease = response
-        .json()
-        .await
-        .map_err(|e| UpdateError::CheckFailed(e.to_string()))?;
-
+        .map_err(UpdateError::CheckFailed)?;
     let remote_version = normalize_version(&release.tag_name).to_string();
 
     if is_newer(&remote_version, CURRENT_VERSION) {
@@ -152,6 +141,189 @@ async fn check_latest_version_from(base_url: &str) -> Result<Option<String>, Upd
     } else {
         Ok(None)
     }
+}
+
+fn github_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .user_agent(format!("hooklistener-cli/{CURRENT_VERSION}"))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.url().scheme() == "https" {
+                attempt.follow()
+            } else {
+                attempt.error("refusing a non-HTTPS release redirect")
+            }
+        }))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+async fn fetch_latest_release_from(base_url: &str) -> Result<GitHubRelease, String> {
+    let url = format!(
+        "{}/repos/{}/{}/releases/latest",
+        base_url.trim_end_matches('/'),
+        GITHUB_REPO_OWNER,
+        GITHUB_REPO_NAME
+    );
+
+    let client = github_client()?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("GitHub API returned {}", response.status()));
+    }
+
+    response.json().await.map_err(|error| error.to_string())
+}
+
+fn current_archive_name() -> String {
+    let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
+    format!(
+        "hooklistener{}-{}.{}",
+        std::env::consts::EXE_SUFFIX,
+        self_update::get_target(),
+        extension
+    )
+}
+
+fn find_unique_asset<'a>(
+    release: &'a GitHubRelease,
+    asset_name: &str,
+) -> Result<&'a GitHubAsset, String> {
+    let mut matching_assets = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name == asset_name);
+    let asset = matching_assets
+        .next()
+        .ok_or_else(|| format!("release is missing required asset {asset_name}"))?;
+
+    if matching_assets.next().is_some() {
+        return Err(format!(
+            "release contains duplicate assets named {asset_name}"
+        ));
+    }
+
+    Ok(asset)
+}
+
+fn parse_checksum_manifest(manifest: &str, archive_name: &str) -> Result<String, String> {
+    let mut expected_checksum = None;
+
+    for line in manifest.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(checksum) = fields.next() else {
+            continue;
+        };
+        let Some(listed_name) = fields.next() else {
+            continue;
+        };
+        let listed_name = listed_name.strip_prefix('*').unwrap_or(listed_name);
+
+        if listed_name != archive_name {
+            continue;
+        }
+
+        if fields.next().is_some()
+            || checksum.len() != 64
+            || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "checksum manifest has a malformed entry for {archive_name}"
+            ));
+        }
+
+        if expected_checksum.is_some() {
+            return Err(format!(
+                "checksum manifest has duplicate entries for {archive_name}"
+            ));
+        }
+
+        expected_checksum = Some(checksum.to_ascii_lowercase());
+    }
+
+    expected_checksum
+        .ok_or_else(|| format!("checksum manifest is missing an entry for {archive_name}"))
+}
+
+async fn download_checksum_manifest(url: &str) -> Result<String, String> {
+    let parsed_url =
+        reqwest::Url::parse(url).map_err(|error| format!("invalid checksum asset URL: {error}"))?;
+    if parsed_url.scheme() != "https" {
+        return Err("checksum asset URL must use HTTPS".to_string());
+    }
+
+    let client = github_client()?;
+    let mut response = client
+        .get(parsed_url)
+        .send()
+        .await
+        .map_err(|error| format!("failed to download checksum manifest: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "checksum manifest download returned {}",
+            response.status()
+        ));
+    }
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CHECKSUM_MANIFEST_BYTES as u64)
+    {
+        return Err("checksum manifest exceeds the size limit".to_string());
+    }
+
+    let mut manifest_bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("failed to read checksum manifest: {error}"))?
+    {
+        if manifest_bytes.len().saturating_add(chunk.len()) > MAX_CHECKSUM_MANIFEST_BYTES {
+            return Err("checksum manifest exceeds the size limit".to_string());
+        }
+        manifest_bytes.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(manifest_bytes)
+        .map_err(|_| "checksum manifest is not valid UTF-8".to_string())
+}
+
+async fn prepare_binary_update() -> Result<Option<PreparedBinaryUpdate>, UpdateError> {
+    let release = fetch_latest_release_from("https://api.github.com")
+        .await
+        .map_err(UpdateError::UpdateFailed)?;
+    let version = normalize_version(&release.tag_name).to_string();
+    let update_available = self_update::version::bump_is_greater(CURRENT_VERSION, &version)
+        .map_err(|error| {
+            UpdateError::UpdateFailed(format!("release has an invalid version: {error}"))
+        })?;
+
+    if !update_available {
+        return Ok(None);
+    }
+
+    let archive_name = current_archive_name();
+    find_unique_asset(&release, &archive_name).map_err(UpdateError::UpdateFailed)?;
+    let checksums_asset =
+        find_unique_asset(&release, CHECKSUMS_ASSET_NAME).map_err(UpdateError::UpdateFailed)?;
+    let manifest = download_checksum_manifest(&checksums_asset.browser_download_url)
+        .await
+        .map_err(UpdateError::UpdateFailed)?;
+    let checksum =
+        parse_checksum_manifest(&manifest, &archive_name).map_err(UpdateError::UpdateFailed)?;
+
+    Ok(Some(PreparedBinaryUpdate {
+        release_tag: release.tag_name,
+        archive_name,
+        checksum,
+    }))
 }
 
 /// Persist the version check result to config. Silently ignores save errors.
@@ -233,22 +405,42 @@ async fn run_binary_self_update(json: bool) -> Result<()> {
         );
     }
 
-    let status = tokio::task::spawn_blocking(move || {
-        self_update::backends::github::Update::configure()
-            .repo_owner(GITHUB_REPO_OWNER)
-            .repo_name(GITHUB_REPO_NAME)
-            .bin_name("hooklistener")
-            .show_download_progress(!json)
-            .show_output(!json)
-            .no_confirm(json)
-            .current_version(CURRENT_VERSION)
-            .build()
-            .map_err(|e| UpdateError::UpdateFailed(e.to_string()))?
-            .update()
-            .map_err(|e| UpdateError::UpdateFailed(e.to_string()))
-    })
-    .await
-    .map_err(|e| UpdateError::UpdateFailed(e.to_string()))??;
+    let status = match prepare_binary_update().await? {
+        None => self_update::VersionStatus::UpToDate(CURRENT_VERSION.to_string()),
+        Some(prepared) => {
+            let PreparedBinaryUpdate {
+                release_tag,
+                archive_name,
+                checksum,
+            } = prepared;
+            let archive_name_for_matcher = archive_name;
+
+            tokio::task::spawn_blocking(move || {
+                self_update::backends::github::Update::configure()
+                    .repo_owner(GITHUB_REPO_OWNER)
+                    .repo_name(GITHUB_REPO_NAME)
+                    .bin_name("hooklistener")
+                    .release_tag(release_tag)
+                    .asset_matcher(move |assets| {
+                        assets
+                            .iter()
+                            .find(|asset| asset.name() == archive_name_for_matcher)
+                            .cloned()
+                    })
+                    .verify_checksum(self_update::Checksum::Sha256(checksum))
+                    .show_download_progress(!json)
+                    .show_output(!json)
+                    .no_confirm(json)
+                    .current_version(CURRENT_VERSION)
+                    .build()
+                    .map_err(|error| UpdateError::UpdateFailed(error.to_string()))?
+                    .update()
+                    .map_err(|error| UpdateError::UpdateFailed(error.to_string()))
+            })
+            .await
+            .map_err(|error| UpdateError::UpdateFailed(error.to_string()))??
+        }
+    };
 
     let new_version = normalize_version(status.version());
 
@@ -357,6 +549,101 @@ mod tests {
 
         assert!(matches!(result, Err(UpdateError::CheckFailed(_))));
         mock.assert_async().await;
+    }
+
+    #[test]
+    fn parse_checksum_manifest_returns_exact_archive_entry() {
+        let archive_name = "hooklistener-x86_64-unknown-linux-gnu.tar.gz";
+        let expected = "a".repeat(64);
+        let manifest = format!(
+            "{}  {}.sig\n{}  {}\n",
+            "b".repeat(64),
+            archive_name,
+            expected.to_uppercase(),
+            archive_name
+        );
+
+        let checksum = parse_checksum_manifest(&manifest, archive_name).unwrap();
+
+        assert_eq!(checksum, expected);
+    }
+
+    #[test]
+    fn parse_checksum_manifest_rejects_missing_archive_entry() {
+        let manifest = format!("{}  another-archive.tar.gz\n", "a".repeat(64));
+
+        let error = parse_checksum_manifest(&manifest, "hooklistener.tar.gz").unwrap_err();
+
+        assert!(
+            error.contains("missing an entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_checksum_manifest_rejects_malformed_digest() {
+        let archive_name = "hooklistener.tar.gz";
+        let manifest = format!("not-a-sha256  {archive_name}\n");
+
+        let error = parse_checksum_manifest(&manifest, archive_name).unwrap_err();
+
+        assert!(
+            error.contains("malformed entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_checksum_manifest_rejects_duplicate_archive_entries() {
+        let archive_name = "hooklistener.tar.gz";
+        let manifest = format!(
+            "{}  {archive_name}\n{}  {archive_name}\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+
+        let error = parse_checksum_manifest(&manifest, archive_name).unwrap_err();
+
+        assert!(
+            error.contains("duplicate entries"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn find_unique_asset_rejects_duplicate_exact_names() {
+        let release = GitHubRelease {
+            tag_name: "v2.0.0".to_string(),
+            assets: vec![
+                GitHubAsset {
+                    name: CHECKSUMS_ASSET_NAME.to_string(),
+                    browser_download_url: "https://example.com/one".to_string(),
+                },
+                GitHubAsset {
+                    name: CHECKSUMS_ASSET_NAME.to_string(),
+                    browser_download_url: "https://example.com/two".to_string(),
+                },
+            ],
+        };
+
+        let error = find_unique_asset(&release, CHECKSUMS_ASSET_NAME).unwrap_err();
+
+        assert!(
+            error.contains("duplicate assets"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_checksum_manifest_rejects_plain_http() {
+        let error = download_checksum_manifest("http://example.com/SHA256SUMS.txt")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.contains("must use HTTPS"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
