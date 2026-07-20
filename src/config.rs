@@ -5,6 +5,11 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::Read;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub access_token: Option<String>,
@@ -27,19 +32,27 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        if path.exists() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Config::default());
             }
-
-            let content = fs::read_to_string(path)?;
-            let config: Config = serde_json::from_str(&content)?;
-            Ok(config)
-        } else {
-            Ok(Config::default())
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(anyhow::anyhow!(
+                "Config path must be a regular file and must not be a symlink"
+            ));
         }
+
+        #[cfg(unix)]
+        let content = read_private_config_file(path)?;
+
+        #[cfg(not(unix))]
+        let content = fs::read_to_string(path)?;
+
+        let config: Config = serde_json::from_str(&content)?;
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -167,6 +180,28 @@ impl Config {
     pub fn clear_all(&mut self) {
         *self = Config::default();
     }
+}
+
+#[cfg(unix)]
+fn read_private_config_file(path: &Path) -> Result<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut file = File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    let current_metadata = fs::symlink_metadata(path)?;
+    if !current_metadata.file_type().is_file()
+        || opened_metadata.dev() != current_metadata.dev()
+        || opened_metadata.ino() != current_metadata.ino()
+    {
+        return Err(anyhow::anyhow!(
+            "Config path changed while it was being opened"
+        ));
+    }
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 #[cfg(windows)]
@@ -596,5 +631,26 @@ mod tests {
 
         let result = Config::load_from(&path);
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_from_refuses_symlink_without_changing_target_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.json");
+        fs::write(&target, "{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let path = config_path_in(&dir);
+        symlink(&target, &path).unwrap();
+
+        let result = Config::load_from(&path);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 }

@@ -27,6 +27,7 @@ Thumbs.db
 *.su
 *.idb
 *.pdb
+hooklistener-diagnostics-*/
 
 # OS specific
 .DS_Store

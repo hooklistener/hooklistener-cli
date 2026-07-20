@@ -80,6 +80,10 @@ struct Cli {
     /// Output logs to stdout in addition to files (for debugging)
     #[arg(long)]
     log_stdout: bool,
+
+    /// Allow a non-loopback cleartext Hooklistener server (development only)
+    #[arg(long, global = true)]
+    allow_insecure_dev_server: bool,
 }
 
 #[derive(Subcommand)]
@@ -99,8 +103,8 @@ enum Commands {
         #[arg(short, long, default_value = "http://localhost:3000")]
         target: String,
 
-        /// WebSocket server URL (defaults to production)
-        #[arg(long)]
+        /// WebSocket server URL; requires wss except for approved development use
+        #[arg(long, value_name = "WSS_URL")]
         ws_url: Option<String>,
 
         /// Allow forwarding to a target that resolves outside loopback
@@ -988,11 +992,13 @@ fn emitted_at() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn effective_listen_ws_url(ws_url: Option<&str>) -> String {
-    ws_url
+fn effective_listen_ws_url(ws_url: Option<&str>) -> Result<String> {
+    let ws_url = ws_url
         .map(str::to_string)
         .or_else(|| std::env::var("HOOKLISTENER_WS_URL").ok())
-        .unwrap_or_else(|| "wss://api.hooklistener.com".to_string())
+        .unwrap_or_else(|| "wss://api.hooklistener.com".to_string());
+    api::validate_websocket_base_url(&ws_url)?;
+    Ok(ws_url)
 }
 
 fn command_event_receipt(
@@ -1152,13 +1158,12 @@ fn endpoint_receipt_parts(
 fn listen_started_receipt(
     endpoint_slug: &str,
     target_url: &str,
-    ws_url: Option<&str>,
+    ws_url: &str,
     endpoint: Option<&api::DebugEndpointSummary>,
 ) -> serde_json::Value {
     let (endpoint_resource_uri, requests_resource_uri, endpoint_value) =
         endpoint_receipt_parts(endpoint_slug, endpoint);
     let session_resource_uri = listen_session_resource_uri(endpoint_slug);
-    let ws_url = effective_listen_ws_url(ws_url);
     let inspect_command = endpoint
         .map(|endpoint| format!("hooklistener endpoint requests {}", endpoint.id))
         .unwrap_or_else(|| "hooklistener endpoint list --json".to_string());
@@ -1627,6 +1632,9 @@ fn print_forward_request_preview(
 ) {
     let method = forward_method(method, request);
     let request_resource_uri = request_resource_uri(request_id);
+    let endpoint_id = sanitize_terminal(endpoint_id, TerminalTextLayout::Inline);
+    let organization_id = sanitize_terminal(organization_id, TerminalTextLayout::Inline);
+    let request_id = sanitize_terminal(request_id, TerminalTextLayout::Inline);
 
     print_status_block(
         OutputStatus::Info,
@@ -1634,10 +1642,19 @@ fn print_forward_request_preview(
         &[
             output_field("DRY RUN", "true"),
             output_field("WOULD CREATE", "debug_request_forward"),
-            output_field("TARGET URL", target_url.underlined()),
-            output_field("METHOD", method.bold()),
+            output_field(
+                "TARGET URL",
+                sanitize_terminal(target_url, TerminalTextLayout::Inline).underlined(),
+            ),
+            output_field(
+                "METHOD",
+                sanitize_terminal(&method, TerminalTextLayout::Inline).bold(),
+            ),
             output_field("REQUEST", request_id.dim()),
-            output_field("RESOURCE", request_resource_uri.dim()),
+            output_field(
+                "RESOURCE",
+                sanitize_terminal(&request_resource_uri, TerminalTextLayout::Inline).dim(),
+            ),
             output_field("ENDPOINT", endpoint_id.dim()),
             output_field("ORGANIZATION", organization_id.dim()),
             output_field(
@@ -1654,18 +1671,45 @@ fn print_forward_request_accepted(
     request_id: &str,
     response: &api::EndpointRequestForwardResponse,
 ) {
+    let forward_resource = forward_resource_uri(&response.forward_id);
+    let poll_command = forward_poll_command(&response.forward_id);
+
     print_status_block(
         OutputStatus::Ok,
         "FORWARD ACCEPTED",
         &[
-            output_field("FORWARD ID", response.forward_id.as_str().bold()),
-            output_field("STATUS", response.status.as_str().bold()),
-            output_field("TARGET URL", response.target_url.as_str().underlined()),
-            output_field("RESOURCE", forward_resource_uri(&response.forward_id).dim()),
-            output_field("POLL", forward_poll_command(&response.forward_id).dim()),
-            output_field("REQUEST", request_id.dim()),
-            output_field("ENDPOINT", endpoint_id.dim()),
-            output_field("ORGANIZATION", organization_id.dim()),
+            output_field(
+                "FORWARD ID",
+                sanitize_terminal(&response.forward_id, TerminalTextLayout::Inline).bold(),
+            ),
+            output_field(
+                "STATUS",
+                sanitize_terminal(&response.status, TerminalTextLayout::Inline).bold(),
+            ),
+            output_field(
+                "TARGET URL",
+                sanitize_terminal(&response.target_url, TerminalTextLayout::Inline).underlined(),
+            ),
+            output_field(
+                "RESOURCE",
+                sanitize_terminal(&forward_resource, TerminalTextLayout::Inline).dim(),
+            ),
+            output_field(
+                "POLL",
+                sanitize_terminal(&poll_command, TerminalTextLayout::Inline).dim(),
+            ),
+            output_field(
+                "REQUEST",
+                sanitize_terminal(request_id, TerminalTextLayout::Inline).dim(),
+            ),
+            output_field(
+                "ENDPOINT",
+                sanitize_terminal(endpoint_id, TerminalTextLayout::Inline).dim(),
+            ),
+            output_field(
+                "ORGANIZATION",
+                sanitize_terminal(organization_id, TerminalTextLayout::Inline).dim(),
+            ),
         ],
     );
 }
@@ -1840,7 +1884,7 @@ async fn run_listen_json(
     access_token_rx: watch::Receiver<String>,
     endpoint_slug: String,
     target_url: String,
-    ws_url: Option<String>,
+    ws_url: String,
     organization_id: Option<String>,
     allow_non_loopback: bool,
     insecure_tls: bool,
@@ -1854,7 +1898,7 @@ async fn run_listen_json(
     print_json_line(&listen_started_receipt(
         &endpoint_slug,
         &target_url,
-        ws_url.as_deref(),
+        &ws_url,
         endpoint.as_ref(),
     ))?;
 
@@ -1863,7 +1907,7 @@ async fn run_listen_json(
         access_token_rx,
         endpoint_slug.clone(),
         target,
-        ws_url,
+        Some(ws_url),
         event_tx,
     );
 
@@ -1994,6 +2038,7 @@ const SESSION_TOKEN_VALIDITY_DAYS: i64 = 60;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    api::configure_server_url_security(cli.allow_insecure_dev_server);
     output::configure(cli.color, cli.json);
     let json = cli.json;
 
@@ -2012,6 +2057,7 @@ async fn run(cli: Cli) -> Result<()> {
         log_level,
         log_dir,
         log_stdout,
+        allow_insecure_dev_server: _,
     } = cli;
 
     let Some(command) = command else {
@@ -2061,6 +2107,7 @@ async fn run(cli: Cli) -> Result<()> {
             allow_non_loopback,
             insecure_tls,
         } => {
+            let ws_url = effective_listen_ws_url(ws_url.as_deref())?;
             // Initialize logging for tunnel
             let log_config = LogConfig {
                 level: log_level.clone(),
@@ -2112,7 +2159,7 @@ async fn run(cli: Cli) -> Result<()> {
                     access_token_rx,
                     endpoint.clone(),
                     target_policy,
-                    ws_url,
+                    Some(ws_url),
                     event_tx,
                 );
 
@@ -3762,8 +3809,14 @@ fn print_tunnel_lifecycle_resource<T: serde::Serialize>(
             &format!("TUNNEL {}", operation.to_uppercase()),
         );
         println!();
-        print_field("RESOURCE", &resource_uri);
-        print_field("ORGANIZATION", organization_id);
+        print_field(
+            "RESOURCE",
+            sanitize_terminal(&resource_uri, TerminalTextLayout::Inline),
+        );
+        print_field(
+            "ORGANIZATION",
+            sanitize_terminal(organization_id, TerminalTextLayout::Inline),
+        );
         print_json(resource)
     }
 }
@@ -3781,22 +3834,35 @@ fn print_tunnel_sessions(sessions: &[api::TunnelSessionResource], organization_i
     let mut table = new_table(&["ID", "Status", "Slug", "Mode", "Updated"]);
     for session in sessions {
         table.add_row(vec![
-            session.id.clone(),
-            session.status.clone(),
+            sanitize_terminal_display(&session.id),
+            sanitize_terminal_display(&session.status),
             session
                 .route
                 .as_ref()
-                .map(|route| route.slug.clone())
+                .map(|route| sanitize_terminal_display(&route.slug))
                 .unwrap_or_else(|| "-".to_string()),
             session
                 .route
                 .as_ref()
-                .map(|route| route.mode.clone())
+                .map(|route| sanitize_terminal_display(&route.mode))
                 .unwrap_or_else(|| "-".to_string()),
-            session.updated_at.clone(),
+            sanitize_terminal_display(&session.updated_at),
         ]);
     }
     println!("{table}");
+}
+
+fn format_tunnel_lifecycle_event(event: &api::TunnelLifecycleEvent) -> String {
+    format!(
+        "{}  {}  capture={}  attempt={}",
+        event.position,
+        sanitize_terminal(&event.event_type, TerminalTextLayout::Inline),
+        sanitize_terminal(&event.capture_id, TerminalTextLayout::Inline),
+        sanitize_terminal(
+            event.delivery_id.as_deref().unwrap_or("-"),
+            TerminalTextLayout::Inline,
+        )
+    )
 }
 
 async fn run_tunnel_lifecycle_events(
@@ -3819,13 +3885,7 @@ async fn run_tunnel_lifecycle_events(
             if json {
                 print_json_line(&tunnel_lifecycle_event_envelope(event))?;
             } else {
-                println!(
-                    "{}  {}  capture={}  attempt={}",
-                    event.position,
-                    event.event_type,
-                    event.capture_id,
-                    event.delivery_id.as_deref().unwrap_or("-")
-                );
+                println!("{}", format_tunnel_lifecycle_event(event));
             }
         }
 
@@ -3906,7 +3966,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
         config.save()?;
     }
 
-    let mut device_flow = auth::DeviceCodeFlow::new(api::default_base_url());
+    let mut device_flow = auth::DeviceCodeFlow::new(api::default_base_url()?);
 
     let user_code = device_flow.initiate_device_flow().await?;
     let display_code = device_flow
@@ -3929,9 +3989,6 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
     let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     let mut spinner_idx: usize = 0;
     let mut stdout = io::stdout();
-
-    let mut poll_interval = tokio::time::interval(Duration::from_secs(5));
-    poll_interval.tick().await; // consume the immediate first tick
 
     loop {
         // Poll the API
@@ -3980,8 +4037,25 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
             }
         }
 
-        // Animate spinner until next poll
+        let poll_delay = device_flow.time_until_next_poll();
+        if poll_delay.is_zero() {
+            continue;
+        }
+        let next_poll = tokio::time::sleep(poll_delay);
+        tokio::pin!(next_poll);
+
+        // Animate spinner until the server-authorized next poll.
         loop {
+            if device_flow
+                .time_remaining()
+                .is_some_and(|remaining| remaining == ChronoDuration::zero())
+            {
+                execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+                return Err(anyhow!(
+                    "Device code expired before authorization completed. Please run `hooklistener login` again."
+                ));
+            }
+
             let spinner = spinner_chars[spinner_idx % spinner_chars.len()];
             spinner_idx = (spinner_idx + 1) % spinner_chars.len();
 
@@ -4004,7 +4078,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
 
             tokio::select! {
                 _ = sleep(Duration::from_millis(80)) => continue,
-                _ = poll_interval.tick() => break,
+                _ = &mut next_poll => break,
             }
         }
     }
@@ -4036,7 +4110,13 @@ fn refreshed_access_token_rx(
 }
 
 async fn refresh_access_token_loop(config: config::Config, token_tx: watch::Sender<String>) {
-    let base_url = api::default_base_url();
+    let base_url = match api::default_base_url() {
+        Ok(base_url) => base_url,
+        Err(error) => {
+            error!(%error, "Access-token refresh disabled by invalid API URL");
+            return;
+        }
+    };
     refresh_access_token_loop_with(config, token_tx, &base_url).await;
 }
 
@@ -4132,7 +4212,8 @@ async fn ensure_valid_token(config: &mut config::Config) -> Result<String> {
 }
 
 async fn refresh_access_token_from_config(config: &mut config::Config) -> Result<String> {
-    refresh_access_token_from_config_with(config, &api::default_base_url(), None).await
+    let base_url = api::default_base_url()?;
+    refresh_access_token_from_config_with(config, &base_url, None).await
 }
 
 async fn refresh_access_token_from_config_with(
@@ -4409,12 +4490,79 @@ fn print_section(label: &str) {
 
 /// Print a dim context line like "ORGANIZATION abc123".
 fn print_context(label: &str, value: &str) {
-    println!("{} {}", output_label(label).dim(), value.dim());
+    println!(
+        "{} {}",
+        output_label(label).dim(),
+        sanitize_terminal(value, TerminalTextLayout::Inline).dim()
+    );
 }
 
 /// Print a pagination footer.
 fn print_pagination(p: &api::Pagination) {
     println!("{}", format_pagination_line(p).dim());
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalTextLayout {
+    Inline,
+    Block,
+}
+
+/// Escape terminal control characters while retaining readable, inert text.
+///
+/// Inline values escape every control character so untrusted input cannot move
+/// the cursor or forge additional output. Block values additionally retain LF
+/// and tab for payload readability; all other C0, DEL, and C1 controls remain
+/// escaped, including ESC, BEL, CR, and the 8-bit OSC/CSI introducers.
+fn sanitize_terminal(value: &str, layout: TerminalTextLayout) -> std::borrow::Cow<'_, str> {
+    let should_escape = |character: char| {
+        character.is_control()
+            && !(layout == TerminalTextLayout::Block && matches!(character, '\n' | '\t'))
+    };
+
+    if !value.chars().any(should_escape) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+
+    let mut sanitized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if should_escape(character) {
+            sanitized.extend(character.escape_default());
+        } else {
+            sanitized.push(character);
+        }
+    }
+    std::borrow::Cow::Owned(sanitized)
+}
+
+fn sanitize_terminal_display(value: impl std::fmt::Display) -> String {
+    let value = value.to_string();
+    sanitize_terminal(&value, TerminalTextLayout::Inline).into_owned()
+}
+
+fn truncate_terminal_inline(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let sanitized = sanitize_terminal(value, TerminalTextLayout::Inline);
+    if sanitized.chars().count() <= max_chars {
+        return sanitized.into_owned();
+    }
+
+    let prefix = sanitized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{prefix}…")
+}
+
+fn format_terminal_body(body: &str) -> String {
+    sanitize_terminal(body, TerminalTextLayout::Block)
+        .split('\n')
+        .map(|line| format!("│ {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Print a key-value map (headers, query params) with a bold section label.
@@ -4428,7 +4576,13 @@ fn print_key_value_map(
     } else {
         print_section(label);
         for (key, value) in map {
-            println!("  {}{}{}", key.as_str().dim(), separator, value);
+            let value = value.to_string();
+            println!(
+                "  {}{}{}",
+                sanitize_terminal(key, TerminalTextLayout::Inline).dim(),
+                separator,
+                sanitize_terminal(&value, TerminalTextLayout::Inline)
+            );
         }
     }
 }
@@ -4438,7 +4592,7 @@ fn print_body_section(label: &str, body: Option<&str>) {
     match body {
         Some(body) if !body.is_empty() => {
             print_section(label);
-            println!("{}", body);
+            println!("{}", format_terminal_body(body));
         }
         _ => print_field(label, "(empty)".dim()),
     }
@@ -4492,24 +4646,42 @@ fn print_endpoints(endpoints: &[api::DebugEndpointSummary]) {
     let mut table = new_table(&["ID", "Slug", "Status", "Webhook URL", "Name"]);
     for endpoint in endpoints {
         table.add_row(vec![
-            &endpoint.id,
-            &endpoint.slug,
-            &endpoint.status,
-            &endpoint.webhook_url,
-            &endpoint.name,
+            sanitize_terminal(&endpoint.id, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&endpoint.slug, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&endpoint.status, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&endpoint.webhook_url, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&endpoint.name, TerminalTextLayout::Inline).into_owned(),
         ]);
     }
     println!("{table}");
 }
 
 fn print_endpoint_detail(endpoint: &api::DebugEndpointSummary) {
-    print_field("ID", &endpoint.id);
-    print_field("SLUG", &endpoint.slug);
-    print_field("STATUS", &endpoint.status);
-    print_field("WEBHOOK URL", endpoint.webhook_url.as_str().underlined());
-    print_field("NAME", &endpoint.name);
+    print_field(
+        "ID",
+        sanitize_terminal(&endpoint.id, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "SLUG",
+        sanitize_terminal(&endpoint.slug, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "STATUS",
+        sanitize_terminal(&endpoint.status, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "WEBHOOK URL",
+        sanitize_terminal(&endpoint.webhook_url, TerminalTextLayout::Inline).underlined(),
+    );
+    print_field(
+        "NAME",
+        sanitize_terminal(&endpoint.name, TerminalTextLayout::Inline),
+    );
     if let Some(created_at) = endpoint.created_at.as_deref() {
-        print_field("CREATED AT", created_at.dim());
+        print_field(
+            "CREATED AT",
+            sanitize_terminal(created_at, TerminalTextLayout::Inline).dim(),
+        );
     }
 }
 
@@ -4525,10 +4697,10 @@ fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
     let mut table = new_table(&["ID", "Method", "URL", "Remote"]);
     for request in &response.data {
         table.add_row(vec![
-            &request.id,
-            &request.method,
-            &request.url,
-            &request.remote_addr,
+            sanitize_terminal(&request.id, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&request.method, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&request.url, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&request.remote_addr, TerminalTextLayout::Inline).into_owned(),
         ]);
     }
     println!("{table}");
@@ -4536,21 +4708,36 @@ fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
 }
 
 fn print_endpoint_request_detail(request: &api::DebugRequestDetail) {
-    print_field("REQUEST ID", &request.id);
-    print_field("METHOD", request.method.as_str().bold());
+    print_field(
+        "REQUEST ID",
+        sanitize_terminal(&request.id, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "METHOD",
+        sanitize_terminal(&request.method, TerminalTextLayout::Inline).bold(),
+    );
     if let Some(path) = request.path.as_deref() {
-        print_field("PATH", path);
+        print_field("PATH", sanitize_terminal(path, TerminalTextLayout::Inline));
     }
-    print_field("URL", &request.url);
+    print_field(
+        "URL",
+        sanitize_terminal(&request.url, TerminalTextLayout::Inline),
+    );
 
     if let Some(status_remote) = request.remote_addr.as_deref() {
-        print_field("REMOTE", status_remote);
+        print_field(
+            "REMOTE",
+            sanitize_terminal(status_remote, TerminalTextLayout::Inline),
+        );
     }
     if let Some(content_length) = request.content_length {
         print_field("CONTENT LEN", content_length);
     }
     if let Some(created_at) = request.created_at.as_deref() {
-        print_field("CREATED AT", created_at.dim());
+        print_field(
+            "CREATED AT",
+            sanitize_terminal(created_at, TerminalTextLayout::Inline).dim(),
+        );
     }
 
     println!();
@@ -4586,15 +4773,19 @@ fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsRespon
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "-".into());
         let target = match forward.error_message.as_deref() {
-            Some(err) => format!("{}\n  [ERR] {err}", forward.target_url),
-            None => forward.target_url.clone(),
+            Some(err) => format!(
+                "{}\n  [ERR] {}",
+                sanitize_terminal(&forward.target_url, TerminalTextLayout::Inline),
+                sanitize_terminal(err, TerminalTextLayout::Inline)
+            ),
+            None => sanitize_terminal(&forward.target_url, TerminalTextLayout::Inline).into_owned(),
         };
         table.add_row(vec![
-            forward.id.as_str(),
-            &forward.method,
-            &status,
-            &duration,
-            &target,
+            sanitize_terminal(&forward.id, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&forward.method, TerminalTextLayout::Inline).into_owned(),
+            status,
+            duration,
+            target,
         ]);
     }
     println!("{table}");
@@ -4602,10 +4793,22 @@ fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsRespon
 }
 
 fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
-    print_field("FORWARD ID", &forward.id);
-    print_field("REQUEST ID", &forward.debug_request_id);
-    print_field("TARGET URL", &forward.target_url);
-    print_field("METHOD", forward.method.as_str().bold());
+    print_field(
+        "FORWARD ID",
+        sanitize_terminal(&forward.id, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "REQUEST ID",
+        sanitize_terminal(&forward.debug_request_id, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "TARGET URL",
+        sanitize_terminal(&forward.target_url, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "METHOD",
+        sanitize_terminal(&forward.method, TerminalTextLayout::Inline).bold(),
+    );
     if let Some(status_code) = forward.status_code {
         print_field("STATUS", style_status_code(status_code));
     } else {
@@ -4615,10 +4818,16 @@ fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
         print_field("DURATION", format!("{duration_ms}ms"));
     }
     if let Some(attempted_at) = forward.attempted_at.as_deref() {
-        print_field("ATTEMPTED AT", attempted_at.dim());
+        print_field(
+            "ATTEMPTED AT",
+            sanitize_terminal(attempted_at, TerminalTextLayout::Inline).dim(),
+        );
     }
     if let Some(error_message) = forward.error_message.as_deref() {
-        print_field("ERROR", error_message);
+        print_field(
+            "ERROR",
+            sanitize_terminal(error_message, TerminalTextLayout::Inline),
+        );
     }
 
     println!();
@@ -4658,17 +4867,41 @@ fn print_case_run_result(result: &api::CaseRunResult) {
     print_status(status, "CASE RUN");
     println!();
     if let Some(run_id) = result.case_suite_run_id.as_deref().or(result.id.as_deref()) {
-        print_field("RUN ID", run_id);
+        print_field(
+            "RUN ID",
+            sanitize_terminal(run_id, TerminalTextLayout::Inline),
+        );
     }
     if let Some(report_url) = result.case_suite_run_url.as_deref() {
-        print_field("REPORT", report_url);
+        print_field(
+            "REPORT",
+            sanitize_terminal(report_url, TerminalTextLayout::Inline),
+        );
     }
-    print_field("RESULT", result.result_status.as_str().bold());
-    print_field("STATUS", &result.status);
-    print_field("ENDPOINT", &result.endpoint_id);
-    print_field("TARGET", case_run_target_label(&result.target));
+    print_field(
+        "RESULT",
+        sanitize_terminal(&result.result_status, TerminalTextLayout::Inline).bold(),
+    );
+    print_field(
+        "STATUS",
+        sanitize_terminal(&result.status, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "ENDPOINT",
+        sanitize_terminal(&result.endpoint_id, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "TARGET",
+        sanitize_terminal(
+            &case_run_target_label(&result.target),
+            TerminalTextLayout::Inline,
+        ),
+    );
     if let Some(source) = result.source.as_deref() {
-        print_field("SOURCE", source.to_uppercase());
+        print_field(
+            "SOURCE",
+            sanitize_terminal(&source.to_uppercase(), TerminalTextLayout::Inline),
+        );
     }
     print_field("ASYNC", yes_no(result.async_run));
     if let Some(waited) = result.waited {
@@ -4749,13 +4982,13 @@ fn print_case_run_result(result: &api::CaseRunResult) {
                 .or_else(|| forward.poll_url.clone())
                 .unwrap_or_else(|| "-".to_string());
             table.add_row(vec![
-                forward.id.as_str().to_string(),
-                forward.debug_request_id.clone(),
-                value_or_dash(forward.debug_request_case_id.as_deref()).to_string(),
-                case_run_forward_target(forward),
+                sanitize_terminal_display(&forward.id),
+                sanitize_terminal_display(&forward.debug_request_id),
+                sanitize_terminal_display(value_or_dash(forward.debug_request_case_id.as_deref())),
+                sanitize_terminal_display(case_run_forward_target(forward)),
                 status,
-                assertion,
-                error,
+                sanitize_terminal_display(assertion),
+                sanitize_terminal_display(error),
             ]);
         }
         println!("{table}");
@@ -4767,8 +5000,8 @@ fn print_case_run_result(result: &api::CaseRunResult) {
         let mut table = new_table(&["Case", "Reason"]);
         for failure in &result.failures {
             table.add_row(vec![
-                failure.case_id.as_str().to_string(),
-                case_run_failure_reason(failure),
+                sanitize_terminal_display(&failure.case_id),
+                sanitize_terminal_display(case_run_failure_reason(failure)),
             ]);
         }
         println!("{table}");
@@ -4785,7 +5018,11 @@ fn print_static_tunnels(response: &api::StaticTunnelsResponse) {
         let mut table = new_table(&["ID", "Slug", "Name"]);
         for tunnel in &response.static_tunnels {
             let name = tunnel.name.as_deref().unwrap_or("");
-            table.add_row(vec![tunnel.id.as_str(), &tunnel.slug, name]);
+            table.add_row(vec![
+                sanitize_terminal_display(&tunnel.id),
+                sanitize_terminal_display(&tunnel.slug),
+                sanitize_terminal_display(name),
+            ]);
         }
         println!("{table}");
     }
@@ -4806,9 +5043,13 @@ fn print_anon_events(response: &api::AnonEventsResponse) {
         let mut table = new_table(&["ID", "Method", "Received At"]);
         for event in &response.data {
             table.add_row(vec![
-                event.id.as_str(),
-                event.method.as_str(),
-                value_or_dash(event.inserted_at.as_deref()),
+                sanitize_terminal(&event.id, TerminalTextLayout::Inline).into_owned(),
+                sanitize_terminal(&event.method, TerminalTextLayout::Inline).into_owned(),
+                sanitize_terminal(
+                    value_or_dash(event.inserted_at.as_deref()),
+                    TerminalTextLayout::Inline,
+                )
+                .into_owned(),
             ]);
         }
         println!("{table}");
@@ -4817,14 +5058,29 @@ fn print_anon_events(response: &api::AnonEventsResponse) {
 }
 
 fn print_anon_event_detail(event: &api::AnonEvent) {
-    print_field("EVENT ID", &event.id);
-    print_field("ENDPOINT ID", &event.endpoint_id);
-    print_field("METHOD", event.method.as_str().bold());
+    print_field(
+        "EVENT ID",
+        sanitize_terminal(&event.id, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "ENDPOINT ID",
+        sanitize_terminal(&event.endpoint_id, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "METHOD",
+        sanitize_terminal(&event.method, TerminalTextLayout::Inline).bold(),
+    );
     if let Some(status) = event.status.as_deref() {
-        print_field("STATUS", status);
+        print_field(
+            "STATUS",
+            sanitize_terminal(status, TerminalTextLayout::Inline),
+        );
     }
     if let Some(inserted_at) = event.inserted_at.as_deref() {
-        print_field("RECEIVED AT", inserted_at.dim());
+        print_field(
+            "RECEIVED AT",
+            sanitize_terminal(inserted_at, TerminalTextLayout::Inline).dim(),
+        );
     }
 
     println!();
@@ -4846,12 +5102,16 @@ fn print_shared_requests(shares: &[api::SharedRequestSummary]) {
     let mut table = new_table(&["ID", "Token", "Fwds", "Views", "Protected", "Expires At"]);
     for share in shares {
         table.add_row(vec![
-            share.id.as_str().to_string(),
-            share.share_token.clone(),
+            sanitize_terminal(&share.id, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&share.share_token, TerminalTextLayout::Inline).into_owned(),
             yes_no(share.include_forwards).to_string(),
             share.view_count.to_string(),
             yes_no(share.password_protected).to_string(),
-            value_or_dash(share.expires_at.as_deref()).to_string(),
+            sanitize_terminal(
+                value_or_dash(share.expires_at.as_deref()),
+                TerminalTextLayout::Inline,
+            )
+            .into_owned(),
         ]);
     }
     println!("{table}");
@@ -4859,10 +5119,16 @@ fn print_shared_requests(shares: &[api::SharedRequestSummary]) {
 
 fn print_shared_request_full(data: &serde_json::Value) {
     if let Some(token) = data.get("share_token").and_then(|v| v.as_str()) {
-        print_field("SHARE TOKEN", token);
+        print_field(
+            "SHARE TOKEN",
+            sanitize_terminal(token, TerminalTextLayout::Inline),
+        );
     }
     if let Some(expires) = data.get("expires_at").and_then(|v| v.as_str()) {
-        print_field("EXPIRES AT", expires.dim());
+        print_field(
+            "EXPIRES AT",
+            sanitize_terminal(expires, TerminalTextLayout::Inline).dim(),
+        );
     }
     if let Some(views) = data.get("view_count").and_then(|v| v.as_u64()) {
         print_field("VIEWS", views);
@@ -4872,19 +5138,28 @@ fn print_shared_request_full(data: &serde_json::Value) {
         println!();
         print_section("DEBUG REQUEST");
         if let Some(id) = request.get("id").and_then(|v| v.as_str()) {
-            print_field("ID", id);
+            print_field("ID", sanitize_terminal(id, TerminalTextLayout::Inline));
         }
         if let Some(method) = request.get("method").and_then(|v| v.as_str()) {
-            print_field("METHOD", method.bold());
+            print_field(
+                "METHOD",
+                sanitize_terminal(method, TerminalTextLayout::Inline).bold(),
+            );
         }
         if let Some(url) = request.get("url").and_then(|v| v.as_str()) {
-            print_field("URL", url);
+            print_field("URL", sanitize_terminal(url, TerminalTextLayout::Inline));
         }
         if let Some(remote) = request.get("remote_addr").and_then(|v| v.as_str()) {
-            print_field("REMOTE", remote.dim());
+            print_field(
+                "REMOTE",
+                sanitize_terminal(remote, TerminalTextLayout::Inline).dim(),
+            );
         }
         if let Some(created) = request.get("created_at").and_then(|v| v.as_str()) {
-            print_field("CREATED AT", created.dim());
+            print_field(
+                "CREATED AT",
+                sanitize_terminal(created, TerminalTextLayout::Inline).dim(),
+            );
         }
 
         if let Some(headers) = request.get("headers").and_then(|v| v.as_object())
@@ -4893,7 +5168,12 @@ fn print_shared_request_full(data: &serde_json::Value) {
             println!();
             print_section("HEADERS");
             for (key, value) in headers {
-                println!("  {}: {}", key.as_str().dim(), value);
+                let value = value.to_string();
+                println!(
+                    "  {}: {}",
+                    sanitize_terminal(key, TerminalTextLayout::Inline).dim(),
+                    sanitize_terminal(&value, TerminalTextLayout::Inline)
+                );
             }
         }
 
@@ -4905,8 +5185,7 @@ fn print_shared_request_full(data: &serde_json::Value) {
             && !body.is_empty()
         {
             println!();
-            print_section("BODY");
-            println!("{}", body);
+            print_body_section("BODY", Some(body));
         }
     }
 
@@ -4931,7 +5210,13 @@ fn print_shared_request_full(data: &serde_json::Value) {
                 .and_then(|v| v.as_u64())
                 .map(|ms| format!("{}ms", ms))
                 .unwrap_or_else(|| "-".to_string());
-            println!("  {} {} → {} ({})", method.bold(), status, target, duration);
+            println!(
+                "  {} {} → {} ({})",
+                sanitize_terminal(method, TerminalTextLayout::Inline).bold(),
+                status,
+                sanitize_terminal(target, TerminalTextLayout::Inline),
+                duration
+            );
         }
     }
 }
@@ -4944,7 +5229,9 @@ fn style_monitor_status(status: Option<&str>) -> String {
     match monitor_status_label(status) {
         "up" => "up".green().to_string(),
         "down" => "down".red().to_string(),
-        s => s.yellow().to_string(),
+        status => sanitize_terminal(status, TerminalTextLayout::Inline)
+            .yellow()
+            .to_string(),
     }
 }
 
@@ -4964,20 +5251,17 @@ fn print_monitors(monitors: &[api::UptimeMonitor]) {
             .check_interval
             .map(|i| format!("{}m", i))
             .unwrap_or_default();
-        let url_display = if m.url.len() > 24 {
-            format!("{}…", &m.url[..23])
-        } else {
-            m.url.clone()
-        };
+        let url_display = truncate_terminal_inline(&m.url, 24);
+        let sanitized_name = sanitize_terminal(&m.name, TerminalTextLayout::Inline);
         let name = if m.enabled {
-            m.name.clone()
+            sanitized_name.into_owned()
         } else {
-            format!("{} (disabled)", m.name)
+            format!("{sanitized_name} (disabled)")
         };
         table.add_row(vec![
-            m.id.clone(),
-            status.to_string(),
-            m.method.to_uppercase(),
+            sanitize_terminal_display(&m.id),
+            sanitize_terminal_display(status),
+            sanitize_terminal_display(m.method.to_uppercase()),
             interval,
             url_display,
             name,
@@ -4987,10 +5271,19 @@ fn print_monitors(monitors: &[api::UptimeMonitor]) {
 }
 
 fn print_monitor_detail(m: &api::UptimeMonitor) {
-    print_field("ID", &m.id);
-    print_field("NAME", &m.name);
-    print_field("URL", m.url.as_str().underlined());
-    print_field("METHOD", m.method.to_uppercase().bold());
+    print_field("ID", sanitize_terminal(&m.id, TerminalTextLayout::Inline));
+    print_field(
+        "NAME",
+        sanitize_terminal(&m.name, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "URL",
+        sanitize_terminal(&m.url, TerminalTextLayout::Inline).underlined(),
+    );
+    print_field(
+        "METHOD",
+        sanitize_terminal(&m.method.to_uppercase(), TerminalTextLayout::Inline).bold(),
+    );
 
     let status = style_monitor_status(m.current_status.as_deref());
     let enabled = if m.enabled {
@@ -5005,7 +5298,10 @@ fn print_monitor_detail(m: &api::UptimeMonitor) {
         print_field("EXPECTED", code);
     }
     if let Some(ref bc) = m.body_contains {
-        print_field("BODY MATCH", bc);
+        print_field(
+            "BODY MATCH",
+            sanitize_terminal(bc, TerminalTextLayout::Inline),
+        );
     }
     if let Some(interval) = m.check_interval {
         print_field("INTERVAL", format!("{interval}m"));
@@ -5027,13 +5323,22 @@ fn print_monitor_detail(m: &api::UptimeMonitor) {
     );
 
     if let Some(ref checked) = m.last_checked_at {
-        print_field("LAST CHECK", checked.as_str().dim());
+        print_field(
+            "LAST CHECK",
+            sanitize_terminal(checked, TerminalTextLayout::Inline).dim(),
+        );
     }
     if let Some(ref changed) = m.last_status_change_at {
-        print_field("STATUS CHANGE", changed.as_str().dim());
+        print_field(
+            "STATUS CHANGE",
+            sanitize_terminal(changed, TerminalTextLayout::Inline).dim(),
+        );
     }
     if let Some(ref created) = m.created_at {
-        print_field("CREATED AT", created.as_str().dim());
+        print_field(
+            "CREATED AT",
+            sanitize_terminal(created, TerminalTextLayout::Inline).dim(),
+        );
     }
 }
 
@@ -5086,12 +5391,12 @@ fn print_uptime_checks(response: &api::UptimeChecksResponse) {
             let error = value_or_dash(check.error_message.as_deref());
 
             table.add_row(vec![
-                check.id.clone(),
-                check.status.clone(),
+                sanitize_terminal_display(&check.id),
+                sanitize_terminal_display(&check.status),
                 code,
                 rt,
-                checked.to_string(),
-                error.to_string(),
+                sanitize_terminal_display(checked),
+                sanitize_terminal_display(error),
             ]);
         }
         println!("{table}");
@@ -5600,12 +5905,12 @@ fn display_error(err: &anyhow::Error, json: bool) {
 
     eprint_status(OutputStatus::Err, "COMMAND FAILED");
     eprintln!();
-    eprint_field("MESSAGE", err);
+    eprint_field("MESSAGE", sanitize_terminal_display(err));
     if let Some(hint) = error_hint(err) {
-        eprint_field("HINT", hint);
+        eprint_field("HINT", sanitize_terminal_display(hint));
     }
     for cause in err.chain().skip(1) {
-        eprint_field("CAUSE", cause);
+        eprint_field("CAUSE", sanitize_terminal_display(cause));
     }
 }
 
@@ -5685,6 +5990,128 @@ mod tests {
         assert!(
             !output.contains("\u{1b}["),
             "output contains ANSI escape sequences: {output:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_escapes_ansi_csi_and_c1_csi_introducers() {
+        let input = "before\u{1b}[31mred\u{1b}[0m\u{9b}2Jafter";
+
+        assert_eq!(
+            sanitize_terminal(input, TerminalTextLayout::Inline),
+            r"before\u{1b}[31mred\u{1b}[0m\u{9b}2Jafter"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_inline_neutralizes_every_c0_del_and_c1_control() {
+        let input = (0..=0x9f).filter_map(char::from_u32).collect::<String>();
+        let sanitized = sanitize_terminal(&input, TerminalTextLayout::Inline);
+
+        assert!(!sanitized.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn sanitize_terminal_escapes_osc_52_with_bel_terminator() {
+        let input = "\u{1b}]52;c;SGVsbG8=\u{7}";
+
+        assert_eq!(
+            sanitize_terminal(input, TerminalTextLayout::Inline),
+            r"\u{1b}]52;c;SGVsbG8=\u{7}"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_escapes_osc_8_with_st_terminator() {
+        let input = "\u{1b}]8;;https://evil.example\u{1b}\\click\u{1b}]8;;\u{1b}\\";
+
+        assert_eq!(
+            sanitize_terminal(input, TerminalTextLayout::Inline),
+            r"\u{1b}]8;;https://evil.example\u{1b}\click\u{1b}]8;;\u{1b}\"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_escapes_carriage_return_backspace_and_inline_layout() {
+        let input = "legitimate\r[OK] forged\u{8}!\n\tnext";
+
+        assert_eq!(
+            sanitize_terminal(input, TerminalTextLayout::Inline),
+            r"legitimate\r[OK] forged\u{8}!\n\tnext"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_block_layout_preserves_only_newline_and_tab_controls() {
+        let input = "line one\n\tline two\rrewritten\u{7}";
+
+        assert_eq!(
+            sanitize_terminal(input, TerminalTextLayout::Block),
+            "line one\n\tline two\\rrewritten\\u{7}"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_borrows_benign_unicode_text_unchanged() {
+        let input = "Café 東京 — webhook payload";
+        let sanitized = sanitize_terminal(input, TerminalTextLayout::Inline);
+
+        assert!(matches!(sanitized, std::borrow::Cow::Borrowed(value) if value == input));
+    }
+
+    #[test]
+    fn format_terminal_body_gutters_forged_status_and_blank_trailing_lines() {
+        let body = "legitimate\n\n[OK] forged\n";
+
+        assert_eq!(
+            format_terminal_body(body),
+            "│ legitimate\n│ \n│ [OK] forged\n│ "
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_display_neutralizes_server_error_controls_and_newlines() {
+        let error = anyhow!("upstream \u{1b}[31mfailed\u{1b}[0m\n[OK] forged\r");
+
+        assert_eq!(
+            sanitize_terminal_display(&error),
+            r"upstream \u{1b}[31mfailed\u{1b}[0m\n[OK] forged\r"
+        );
+    }
+
+    #[test]
+    fn tunnel_lifecycle_event_output_neutralizes_every_remote_text_field() {
+        let event = api::TunnelLifecycleEvent {
+            id: "event-id".to_string(),
+            position: 7,
+            cursor: "cursor".to_string(),
+            organization_id: "organization".to_string(),
+            capture_id: "capture\rforged".to_string(),
+            delivery_id: Some("delivery\u{9b}2J".to_string()),
+            sequence: 1,
+            fence: None,
+            event_type: "opened\n[OK]\u{1b}]52;c;x\u{7}".to_string(),
+            metadata: serde_json::json!({}),
+            created_at: "2026-07-20T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            format_tunnel_lifecycle_event(&event),
+            r"7  opened\n[OK]\u{1b}]52;c;x\u{7}  capture=capture\rforged  attempt=delivery\u{9b}2J"
+        );
+    }
+
+    #[test]
+    fn monitor_output_neutralizes_status_controls_and_truncates_unicode_safely() {
+        let styled = style_monitor_status(Some("pending\n[OK]\u{1b}]52;c;x\u{7}"));
+
+        assert!(!styled.contains('\n'));
+        assert!(!styled.contains("\u{1b}]52"));
+        assert!(styled.contains(r"pending\n[OK]\u{1b}]52;c;x\u{7}"));
+        assert_eq!(truncate_terminal_inline("東京 webhook", 4), "東京 …");
+        assert_eq!(
+            truncate_terminal_inline("\u{1b}]52;c;x\u{7}", 64),
+            r"\u{1b}]52;c;x\u{7}"
         );
     }
 
@@ -6230,6 +6657,21 @@ mod tests {
             Cli::try_parse_from(["hooklistener", "endpoint", "delete", "ep_123", "--yes"]).unwrap();
 
         assert!(cli.yes);
+    }
+
+    #[test]
+    fn listen_accepts_explicit_insecure_dev_server_opt_in_as_global_flag() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "listen",
+            "example",
+            "--ws-url",
+            "ws://dev.example.com",
+            "--allow-insecure-dev-server",
+        ])
+        .unwrap();
+
+        assert!(cli.allow_insecure_dev_server);
     }
 
     #[test]
@@ -6848,7 +7290,7 @@ mod tests {
         let receipt = listen_started_receipt(
             "github-webhooks",
             "http://localhost:3000/webhooks",
-            Some("wss://api.example.dev/socket/websocket"),
+            "wss://api.example.dev/socket/websocket",
             Some(&endpoint),
         );
 

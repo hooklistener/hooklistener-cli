@@ -7,6 +7,12 @@ use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Span;
 use std::collections::{HashMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 pub const MAX_LISTENING_REQUESTS: usize = 500;
 pub const MAX_TUNNEL_REQUESTS: usize = 500;
@@ -30,6 +36,32 @@ fn format_path_with_query(path: &str, query_string: &str) -> String {
         format!("{}?{}", path, query_string)
     }
 }
+
+#[cfg(any(not(windows), test))]
+fn posix_shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+#[cfg(any(windows, test))]
+fn powershell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_quote(argument: &str) -> String {
+    posix_shell_quote(argument)
+}
+
+#[cfg(windows)]
+fn shell_quote(argument: &str) -> String {
+    powershell_quote(argument)
+}
+
+#[cfg(not(windows))]
+const SHELL_LINE_CONTINUATION: &str = " \\\n";
+
+#[cfg(windows)]
+const SHELL_LINE_CONTINUATION: &str = " `\r\n";
 
 #[derive(Debug)]
 pub enum AppState {
@@ -1389,7 +1421,7 @@ impl App {
 
     pub async fn forward_request(&mut self) -> Result<()> {
         if let Some(request) = &self.selected_request {
-            let client = ApiClient::for_forwarding();
+            let client = ApiClient::for_forwarding()?;
 
             match client
                 .forward_request(request, &self.forward_url_input)
@@ -1415,7 +1447,11 @@ impl App {
     }
 
     pub fn generate_curl(request: &WebhookRequest) -> String {
-        let mut parts = vec![format!("curl -X {} '{}'", request.method, request.url)];
+        let mut parts = vec![format!(
+            "curl --request {} --url {}",
+            shell_quote(&request.method),
+            shell_quote(&request.url)
+        )];
 
         let skip_headers = ["cf-", "x-forwarded", "host", "content-length", "x-real-ip"];
 
@@ -1427,8 +1463,10 @@ impl App {
             {
                 continue;
             }
-            let escaped_value = value.replace('\'', "'\\''");
-            parts.push(format!("  -H '{}: {}'", key, escaped_value));
+            parts.push(format!(
+                "  --header {}",
+                shell_quote(&format!("{key}: {value}"))
+            ));
         }
 
         let has_body_method = matches!(request.method.as_str(), "POST" | "PUT" | "PATCH");
@@ -1440,12 +1478,11 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
             if !body.is_empty() {
-                let escaped_body = body.replace('\'', "'\\''");
-                parts.push(format!("  -d '{}'", escaped_body));
+                parts.push(format!("  --data-raw {}", shell_quote(&body)));
             }
         }
 
-        parts.join(" \\\n")
+        parts.join(SHELL_LINE_CONTINUATION)
     }
 
     pub fn generate_json_export(request: &WebhookRequest) -> Result<String> {
@@ -1466,13 +1503,25 @@ impl App {
         format!("hooklistener-{safe_id}.{extension}")
     }
 
-    fn save_export_fallback(
+    fn save_export_fallback(content: &str, request_id: &str, extension: &str) -> Result<PathBuf> {
+        Self::save_export_to_directory(content, request_id, extension, &std::env::current_dir()?)
+    }
+
+    fn save_export_to_directory(
         content: &str,
         request_id: &str,
         extension: &str,
-    ) -> Result<std::path::PathBuf> {
-        let path = std::env::current_dir()?.join(Self::export_filename(request_id, extension));
-        std::fs::write(&path, content)?;
+        directory: &Path,
+    ) -> Result<PathBuf> {
+        let path = directory.join(Self::export_filename(request_id, extension));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut file = options.open(&path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
         Ok(path)
     }
 
@@ -3233,10 +3282,9 @@ mod tests {
     fn test_generate_curl_basic_get() {
         let request = make_request("GET", "https://example.com/hook");
         let curl = App::generate_curl(&request);
-        assert!(curl.contains("curl -X GET"));
+        assert!(curl.contains("curl --request 'GET' --url 'https://example.com/hook'"));
         assert!(curl.contains("https://example.com/hook"));
-        // GET should not have -d
-        assert!(!curl.contains("-d"));
+        assert!(!curl.contains("--data-raw"));
     }
 
     #[test]
@@ -3250,9 +3298,42 @@ mod tests {
         request.body = Some(r#"{"key":"value"}"#.to_string());
 
         let curl = App::generate_curl(&request);
-        assert!(curl.contains("curl -X POST"));
-        assert!(curl.contains("-d"));
-        assert!(curl.contains("-H 'content-type: application/json'"));
+        assert!(curl.contains("curl --request 'POST'"));
+        assert!(curl.contains("--data-raw"));
+        assert!(curl.contains("--header 'content-type: application/json'"));
+    }
+
+    #[test]
+    fn generate_curl_shell_quotes_remote_derived_arguments() {
+        let request = make_request_with_headers(
+            "POST'; touch /tmp/method #",
+            "https://example.com/'$(touch /tmp/url)",
+            vec![("x-'header", "value'; touch /tmp/header #")],
+        );
+
+        let curl = App::generate_curl(&request);
+
+        assert!(curl.contains("--request 'POST'\\''; touch /tmp/method #'"));
+        assert!(curl.contains("--url 'https://example.com/'\\''$(touch /tmp/url)'"));
+        assert!(curl.contains("--header 'x-'\\''header: value'\\''; touch /tmp/header #'"));
+    }
+
+    #[test]
+    fn powershell_quote_keeps_command_separators_inside_one_argument() {
+        assert_eq!(
+            powershell_quote("GET'; Start-Process calc; #"),
+            "'GET''; Start-Process calc; #'"
+        );
+    }
+
+    #[test]
+    fn generate_curl_uses_data_raw_for_at_prefixed_body() {
+        let mut request = make_request("POST", "https://example.com/hook");
+        request.body = Some("@/etc/passwd".to_string());
+
+        let curl = App::generate_curl(&request);
+
+        assert!(curl.contains("--data-raw '@/etc/passwd'"));
     }
 
     #[test]
@@ -3378,6 +3459,38 @@ mod tests {
             App::export_filename("req/../../unsafe", "json"),
             "hooklistener-req_______unsafe.json"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_export_to_directory_creates_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path =
+            App::save_export_to_directory("secret", "request", "json", directory.path()).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_export_to_directory_refuses_preexisting_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, "unchanged").unwrap();
+        let export = directory.path().join("hooklistener-request.json");
+        symlink(&target, &export).unwrap();
+
+        let result = App::save_export_to_directory("secret", "request", "json", directory.path());
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
     }
 
     #[test]

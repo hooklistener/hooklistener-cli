@@ -19,6 +19,8 @@ Hooklistener CLI combines live terminal views with scriptable commands for forwa
 
 Prebuilt binaries are available on the [Releases page](https://github.com/hooklistener/hooklistener-cli/releases). You can also use the install scripts for [macOS or Linux](https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.sh) and [Windows PowerShell](https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.ps1).
 
+Every prebuilt-binary installer and the self-updater require the archive to match its exact entry in the release's `SHA256SUMS.txt`. These co-hosted checksums detect corrupted or mismatched assets, but they do not authenticate a release if GitHub publishing credentials are compromised. That remaining risk requires a signed checksum manifest and an independently managed public key; release signing is not configured yet.
+
 Verify the installation:
 
 ```bash
@@ -222,7 +224,9 @@ Inspect the active configuration with:
 hooklistener config show
 ```
 
-Advanced and self-hosted setups can override the service URLs with `HOOKLISTENER_API_URL`, `HOOKLISTENER_WS_URL`, and `HOOKLISTENER_DEVICE_PORTAL_URL`.
+Advanced and self-hosted setups can override the service URLs with `HOOKLISTENER_API_URL`, `HOOKLISTENER_WS_URL`, and `HOOKLISTENER_DEVICE_PORTAL_URL`. Hooklistener API and relay overrides require `https://` and `wss://` respectively. Cleartext `http://` and `ws://` are accepted automatically only for loopback development servers such as `localhost` or `127.0.0.1`.
+
+For an isolated development environment that cannot use TLS on a non-loopback host, opt in explicitly with `--allow-insecure-dev-server` or `HOOKLISTENER_ALLOW_INSECURE_DEV_SERVER=1`. The CLI prints a warning because this exposes credentials and relay tickets to interception; never use this opt-in for production services.
 
 ## Documentation
 

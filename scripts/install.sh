@@ -129,27 +129,99 @@ verify_checksum() {
     CHECKSUMS="$2"
     ARCHIVE_NAME="$3"
 
-    EXPECTED=$(grep "$ARCHIVE_NAME" "$CHECKSUMS" | awk '{print $1}')
+    EXPECTED=$(awk -v archive_name="$ARCHIVE_NAME" '
+        {
+            listed_name = $2
+            sub(/^\*/, "", listed_name)
+            if (listed_name == archive_name) {
+                matches++
+                checksum = $1
+                if (NF != 2) {
+                    malformed = 1
+                }
+            }
+        }
+        END {
+            if (matches != 1 || malformed) {
+                exit 1
+            }
+            print checksum
+        }
+    ' "$CHECKSUMS") || error "Checksum manifest must contain exactly one entry for $ARCHIVE_NAME"
 
-    if [ -z "$EXPECTED" ]; then
-        warn "Could not find checksum for $ARCHIVE_NAME, skipping verification"
-        return 0
+    if [ "${#EXPECTED}" -ne 64 ]; then
+        error "Checksum manifest contains an invalid SHA256 digest for $ARCHIVE_NAME"
     fi
+    case "$EXPECTED" in
+        *[!0-9a-fA-F]*)
+            error "Checksum manifest contains an invalid SHA256 digest for $ARCHIVE_NAME"
+            ;;
+    esac
+    EXPECTED=$(printf '%s' "$EXPECTED" | tr '[:upper:]' '[:lower:]')
 
     if command -v sha256sum >/dev/null 2>&1; then
         ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print $1}')
     elif command -v shasum >/dev/null 2>&1; then
         ACTUAL=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
     else
-        warn "No SHA256 tool found, skipping checksum verification"
-        return 0
+        error "A SHA256 checksum tool (sha256sum or shasum) is required"
     fi
+    ACTUAL=$(printf '%s' "$ACTUAL" | tr '[:upper:]' '[:lower:]')
 
     if [ "$EXPECTED" != "$ACTUAL" ]; then
         error "Checksum verification failed!\nExpected: $EXPECTED\nActual: $ACTUAL"
     fi
 
+    VERIFIED_ARCHIVE_SHA256="$EXPECTED"
     success "Checksum verified"
+}
+
+# When privilege elevation is required, pass the archive through an already-open
+# descriptor and verify those exact bytes again in a root-owned temporary
+# directory. This prevents an unprivileged process from swapping the extracted
+# binary between checksum verification and the privileged install.
+install_verified_archive_as_root() {
+    ARCHIVE="$1"
+    DESTINATION="$2"
+    EXPECTED="$3"
+
+    sudo sh -c '
+        set -eu
+        umask 077
+        destination=$1
+        expected=$2
+        root_tmp=$(mktemp -d /tmp/hooklistener-install.XXXXXX)
+        trap '\''rm -rf "$root_tmp"'\'' EXIT HUP INT TERM
+
+        archive="$root_tmp/release.tar.gz"
+        binary="$root_tmp/hooklistener"
+        cat <&3 > "$archive"
+
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$archive" | awk '\''{print $1}'\'')
+        elif command -v shasum >/dev/null 2>&1; then
+            actual=$(shasum -a 256 "$archive" | awk '\''{print $1}'\'')
+        else
+            echo "error: a SHA256 checksum tool is required after privilege elevation" >&2
+            exit 1
+        fi
+
+        if [ "$actual" != "$expected" ]; then
+            echo "error: release archive changed after checksum verification" >&2
+            exit 1
+        fi
+
+        member_count=$(tar -tzf "$archive" | awk '\''$0 == "hooklistener" { count++ } END { print count + 0 }'\'')
+        if [ "$member_count" -ne 1 ]; then
+            echo "error: release archive must contain exactly one root-level hooklistener binary" >&2
+            exit 1
+        fi
+
+        tar -xOzf "$archive" hooklistener > "$binary"
+        chmod 0755 "$binary"
+        mkdir -p "$(dirname "$destination")"
+        mv -f "$binary" "$destination"
+    ' sh "$DESTINATION" "$EXPECTED" 3< "$ARCHIVE"
 }
 
 # Main installation function
@@ -184,9 +256,6 @@ main() {
     info "Verifying checksum..."
     verify_checksum "$ARCHIVE_PATH" "$CHECKSUMS_PATH" "$ARCHIVE_NAME"
 
-    info "Extracting archive..."
-    tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
-
     # Check if we need sudo
     NEED_SUDO=""
     if [ ! -w "$INSTALL_DIR" ]; then
@@ -200,12 +269,19 @@ main() {
         info "Installing to $INSTALL_DIR..."
     fi
 
-    # Create install directory if it doesn't exist
-    $NEED_SUDO mkdir -p "$INSTALL_DIR"
-
-    # Install the binary with the expected command name
-    $NEED_SUDO cp "${TMP_DIR}/hooklistener" "${INSTALL_DIR}/${BINARY_NAME}"
-    $NEED_SUDO chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    if [ -n "$NEED_SUDO" ]; then
+        info "Re-verifying and extracting archive in a privileged temporary directory..."
+        install_verified_archive_as_root \
+            "$ARCHIVE_PATH" \
+            "${INSTALL_DIR}/${BINARY_NAME}" \
+            "$VERIFIED_ARCHIVE_SHA256"
+    else
+        info "Extracting archive..."
+        tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
+        mkdir -p "$INSTALL_DIR"
+        cp "${TMP_DIR}/hooklistener" "${INSTALL_DIR}/${BINARY_NAME}"
+        chmod 0755 "${INSTALL_DIR}/${BINARY_NAME}"
+    fi
 
     # Verify installation
     if [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
