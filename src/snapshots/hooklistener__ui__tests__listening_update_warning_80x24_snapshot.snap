@@ -23,5 +23,5 @@ expression: snapshot
  │                                                                            │
  │                                                                            │
  └────────────────────────────────────────────────────────────────────────────┘
- [WARN] UPDATE AVAILABLE   1.8.2 → 1.9.0   Run `hooklistener update`
+ [WARN] UPDATE AVAILABLE   1.8.3 → 1.9.0   Run `hooklistener update`
  Listen (0)  ↑↓ Select | Enter Details | / Search | Q Quit       API connected

@@ -74,6 +74,12 @@ jobs:
             exit 1
           fi
 
+          # actions/checkout fetches the trigger ref as "+<sha>:refs/tags/<tag>",
+          # which materialises a lightweight local tag pointing straight at the
+          # commit. Re-fetch the real tag ref so annotation can be inspected.
+          retry_read git fetch --no-tags --force origin \
+            "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+
           if [[ "$(git cat-file -t "refs/tags/${TAG_NAME}")" != "tag" ]]; then
             echo "::error::Stable releases require an annotated Git tag."
             exit 1
