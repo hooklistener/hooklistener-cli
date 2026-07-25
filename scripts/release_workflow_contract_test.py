@@ -849,17 +849,37 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 self.assertNotRegex(workflow, r"\$\{[^}]+,,\}")
                 self.assertIn("tr '[:upper:]' '[:lower:]'", workflow)
 
-    def test_cargo_audit_install_is_pinned_locked_and_precedes_action(self) -> None:
+    def test_cargo_audit_is_pinned_and_audits_the_committed_lockfile(self) -> None:
         install = "cargo install cargo-audit --version 0.22.2 --locked"
+        audit = "cargo audit --file Cargo.lock"
 
         for workflow, job_name in ((self.ci, "audit"), (self.release, "verify")):
             body = job_body(workflow, job_name)
             with self.subTest(job=job_name):
                 self.assertIn(install, body)
-                self.assertLess(
-                    body.find(install),
-                    body.find("rustsec/audit-check@"),
+                self.assertIn(audit, body)
+                self.assertLess(body.find(install), body.find(audit))
+                # rustsec/audit-check regenerates Cargo.lock before auditing, so
+                # it audits dependencies the commit never locked and leaves the
+                # working tree dirty for `cargo publish --dry-run --locked`.
+                executable = "\n".join(
+                    line
+                    for line in body.splitlines()
+                    if not line.lstrip().startswith("#")
                 )
+                self.assertNotIn("rustsec/audit-check@", executable)
+                self.assertNotIn("generate-lockfile", executable)
+
+    def test_release_verification_asserts_a_pristine_tree_before_publishing(
+        self,
+    ) -> None:
+        body = job_body(self.release, "verify")
+        cleanliness = body.find("git status --porcelain")
+        dry_run = body.find("cargo publish --dry-run --locked")
+
+        self.assertNotEqual(cleanliness, -1)
+        self.assertNotEqual(dry_run, -1)
+        self.assertLess(cleanliness, dry_run)
 
     def test_every_release_asset_policy_is_exact_and_unique(self) -> None:
         expected = {

@@ -20,8 +20,6 @@ jobs:
     permissions:
       actions: read
       contents: read
-      checks: write
-      issues: write
     steps:
       - name: Checkout exact tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -166,10 +164,23 @@ jobs:
       - name: Install cargo-audit 0.22.2
         run: cargo install cargo-audit --version 0.22.2 --locked
 
+      # Audited with the pinned cargo-audit binary instead of rustsec/audit-check
+      # because that action runs `cargo generate-lockfile` first. Regenerating the
+      # lockfile both audits dependencies the tag never locked and leaves
+      # Cargo.lock dirty, which makes the later `cargo publish --dry-run` abort.
       - name: Audit locked Rust dependencies
-        uses: rustsec/audit-check@e9159ac5f7d7d873ce074ca134da2f445c0a4a61 # v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --file Cargo.lock
+
+      - name: Verify verification left the tagged tree pristine
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Release verification modified the checkout; cargo publish requires a clean tree that matches the tag."
+            git --no-pager status --porcelain
+            git --no-pager diff --stat
+            exit 1
+          fi
 
       - name: Test npm installer
         run: node --test npm/packages/hooklistener/scripts/install.test.js

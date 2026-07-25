@@ -70,8 +70,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: write
-      checks: write
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -81,10 +79,14 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install cargo-audit 0.22.2
         run: cargo install cargo-audit --version 0.22.2 --locked
+      # rustsec/audit-check runs `cargo generate-lockfile` before auditing, which
+      # audits freshly resolved dependencies rather than the committed ones and
+      # dirties Cargo.lock. Audit the checked-in lockfile directly instead.
       - name: Run cargo audit
-        uses: rustsec/audit-check@e9159ac5f7d7d873ce074ca134da2f445c0a4a61 # v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --file Cargo.lock
+      - name: Verify Cargo.lock is unchanged
+        shell: bash
+        run: git diff --exit-code -- Cargo.lock
 
   build:
     name: Build (${{ matrix.target }})
