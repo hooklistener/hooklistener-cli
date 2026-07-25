@@ -805,7 +805,9 @@ mod tests {
         assert!(bundle.join("hooklistener-blocked.log").is_dir());
     }
 
-    #[cfg(unix)]
+    // Darwin rejects non-UTF-8 path bytes with EILSEQ before a directory
+    // entry can be created, so this behavior is only observable elsewhere.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn copy_log_files_skips_non_utf8_names_instead_of_panicking() {
         use std::ffi::OsString;

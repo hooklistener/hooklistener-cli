@@ -1,6 +1,6 @@
 [package]
 name = "hooklistener-cli"
-version = "1.7.3"
+version = "1.8.0"
 edition = "2024"
 autobins = false
 description = "A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers"
@@ -24,9 +24,10 @@ crossterm = "0.29"
 tokio = { version = "1.52", features = ["full"] }
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 futures-util = "0.3"
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 dirs = "6.0"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -52,7 +53,7 @@ mockito = "1.7"
 tempfile = "3.27"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [[bin]]
 name = "hooklistener"

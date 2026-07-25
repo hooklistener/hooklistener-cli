@@ -11,6 +11,7 @@ mod syntax;
 mod target_policy;
 mod theme;
 mod tunnel;
+mod tunnel_v3;
 mod ui;
 mod updater;
 

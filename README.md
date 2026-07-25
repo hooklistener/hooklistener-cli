@@ -19,7 +19,24 @@ Hooklistener CLI combines live terminal views with scriptable commands for forwa
 
 Prebuilt binaries are available on the [Releases page](https://github.com/hooklistener/hooklistener-cli/releases). You can also use the install scripts for [macOS or Linux](https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.sh) and [Windows PowerShell](https://raw.githubusercontent.com/hooklistener/hooklistener-cli/main/scripts/install.ps1).
 
-Every prebuilt-binary installer and the self-updater require the archive to match its exact entry in the release's `SHA256SUMS.txt`. These co-hosted checksums detect corrupted or mismatched assets, but they do not authenticate a release if GitHub publishing credentials are compromised. That remaining risk requires a signed checksum manifest and an independently managed public key; release signing is not configured yet.
+The Linux x86_64 prebuilt binary requires glibc 2.35 or newer (for example,
+Ubuntu 22.04 or Debian 12). On an older distribution, build from source with
+`cargo install hooklistener-cli`.
+
+Every prebuilt-binary installer and the self-updater require the archive to
+match its exact entry in the release's `SHA256SUMS.txt`. The release workflow
+also creates a GitHub SLSA provenance attestation that binds each archive
+digest to the release workflow, exact source commit, and tag. To authenticate a
+download independently of the co-hosted checksum file, install the GitHub CLI
+and verify all four constraints:
+
+```bash
+gh attestation verify hooklistener-x86_64-unknown-linux-gnu.tar.gz \
+  --repo hooklistener/hooklistener-cli \
+  --signer-workflow hooklistener/hooklistener-cli/.github/workflows/release.yml \
+  --source-digest <full-release-commit-sha> \
+  --source-ref refs/tags/v1.8.0
+```
 
 Verify the installation:
 
@@ -236,7 +253,9 @@ For an isolated development environment that cannot use TLS on a non-loopback ho
 
 ## Development
 
-Building from source requires Rust 1.85 or later and Cargo.
+Official release, CI, and cross-repository qualification builds are pinned to
+Rust 1.92.0. Install the repository toolchain with `mise install`, or select
+Rust 1.92.0 explicitly before building with Cargo.
 
 ```bash
 git clone https://github.com/hooklistener/hooklistener-cli.git

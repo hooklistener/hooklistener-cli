@@ -1,0 +1,65 @@
+{
+  "version": 3,
+  "status": "stable",
+  "capture_mode": "metadata_only",
+  "transport": "phoenix_binary_push",
+  "control_encoding": "json",
+  "byte_order": "big_endian",
+  "limits": {
+    "max_request_body_bytes": 100000000,
+    "max_response_body_bytes": 100000000,
+    "max_websocket_frame_bytes": 65536,
+    "max_start_metadata_bytes": 55000,
+    "max_control_payload_bytes": 63000,
+    "max_chunk_bytes": 64000,
+    "stream_window_bytes": 1048576,
+    "stream_window_items": 16,
+    "connection_window_bytes": 16777216,
+    "connection_window_items": 256,
+    "connection_window_scope": "per_direction",
+    "max_duplex_connection_window_bytes": 33554432,
+    "websocket_admission_bytes": 26214400,
+    "websocket_admission_items": 800,
+    "service_ingress_admission_bytes": 16777216,
+    "service_ingress_admission_items": 128,
+    "max_concurrent_streams": 128,
+    "max_active_local_forwards": 8,
+    "request_timeout_ms": 80000
+  },
+  "chunk_header": {
+    "bytes": 29,
+    "fields": [
+      {"name": "version", "type": "uint8", "bytes": 1},
+      {"name": "stream_id", "type": "uuid", "bytes": 16},
+      {"name": "sequence", "type": "uint32", "bytes": 4},
+      {"name": "offset", "type": "uint64", "bytes": 8}
+    ]
+  },
+  "flow_control": {
+    "scheme": "cumulative_consumption",
+    "event": "tunnel_stream_window",
+    "fields": ["stream_id", "direction", "consumed_bytes", "consumed_items"]
+  },
+  "events": {
+    "request_start": "tunnel_request_start",
+    "request_chunk": "tunnel_request_chunk",
+    "request_end": "tunnel_request_end",
+    "response_start": "tunnel_response_start",
+    "response_chunk": "tunnel_response_chunk",
+    "response_end": "tunnel_response_end",
+    "window": "tunnel_stream_window",
+    "abort": "tunnel_stream_abort"
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "encoding": "lowercase_hex",
+    "end_fields": ["stream_id", "total_bytes", "sha256"]
+  },
+  "golden_chunk": {
+    "stream_id": "00112233-4455-6677-8899-aabbccddeeff",
+    "sequence": 16909060,
+    "offset": 72623859790382856,
+    "data_hex": "000102ff",
+    "encoded_hex": "0300112233445566778899aabbccddeeff010203040102030405060708000102ff"
+  }
+}

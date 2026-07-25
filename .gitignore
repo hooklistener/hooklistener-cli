@@ -47,3 +47,7 @@ Thumbs.db
 tarpaulin-report.html
 cobertura.xml
 coverage/
+
+# Python tooling
+__pycache__/
+*.py[cod]

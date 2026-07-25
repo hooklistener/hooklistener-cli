@@ -6,17 +6,254 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: hooklistener-cli-release
+  cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify release candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      checks: write
+      issues: write
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release workflow contracts
+        run: python3 scripts/release_workflow_contract_test.py
+
+      - name: Verify release governance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/verify-release-governance.sh
+
+      - name: Install Rust 1.92.0
+        uses: dtolnay/rust-toolchain@387aeee55b189f024a4f6d94890c5b18d73339cc # 1.92.0
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20.20.2
+
+      - name: Verify npm packaging toolchain
+        run: test "$(npm --version)" = "10.8.2"
+
+      - name: Verify immutable tag and package versions
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          TAG_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=.github/scripts/retry-read.sh
+          source .github/scripts/retry-read.sh
+
+          if [[ ! "${TAG_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag must be an exact semver tag such as v1.8.0."
+            exit 1
+          fi
+
+          if ! git show-ref --verify --quiet "refs/tags/${TAG_NAME}"; then
+            echo "::error::The workflow ref is not the exact ${TAG_NAME} tag."
+            exit 1
+          fi
+
+          if [[ "$(git cat-file -t "refs/tags/${TAG_NAME}")" != "tag" ]]; then
+            echo "::error::Stable releases require an annotated Git tag."
+            exit 1
+          fi
+
+          tag_commit="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
+          expected_tag_sha="$(printf '%s' "${TAG_SHA}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${tag_commit}" != "${expected_tag_sha}" ]]; then
+            echo "::error::The checked-out tag does not resolve to the workflow commit."
+            exit 1
+          fi
+
+          retry_read git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          if ! git merge-base --is-ancestor "${tag_commit}" refs/remotes/origin/main; then
+            echo "::error::Release tags must point to a commit contained in origin/main."
+            exit 1
+          fi
+
+          TAG_VERSION="${TAG_NAME#v}" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import tomllib
+
+          root = pathlib.Path(".")
+          tag_version = os.environ["TAG_VERSION"]
+
+          with (root / "Cargo.toml").open("rb") as file:
+              cargo_version = tomllib.load(file)["package"]["version"]
+
+          with (root / "Cargo.lock").open("rb") as file:
+              lock = tomllib.load(file)
+
+          lock_versions = [
+              package["version"]
+              for package in lock["package"]
+              if package["name"] == "hooklistener-cli"
+          ]
+
+          with (root / "npm/packages/hooklistener/package.json").open(
+              encoding="utf-8"
+          ) as file:
+              npm_version = json.load(file)["version"]
+
+          if len(lock_versions) != 1:
+              raise SystemExit(
+                  "Cargo.lock must contain exactly one hooklistener-cli package"
+              )
+
+          versions = {
+              "tag": tag_version,
+              "Cargo.toml": cargo_version,
+              "Cargo.lock": lock_versions[0],
+              "npm package": npm_version,
+          }
+          if len(set(versions.values())) != 1:
+              rendered = ", ".join(
+                  f"{source}={version}" for source, version in versions.items()
+              )
+              raise SystemExit(f"release versions do not match: {rendered}")
+
+          print(f"Release identity verified: v{tag_version}")
+          PY
+
+      - name: Enforce monotonic public release order
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: >-
+          bash .github/scripts/verify-monotonic-release-order.sh
+          "${TAG_NAME}" verify
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run full Rust test suite
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Install cargo-audit 0.22.2
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit locked Rust dependencies
+        uses: rustsec/audit-check@e9159ac5f7d7d873ce074ca134da2f445c0a4a61 # v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test npm installer
+        run: node --test npm/packages/hooklistener/scripts/install.test.js
+
+      - name: Validate crates.io package
+        run: cargo publish --dry-run --locked
+
+      - name: Validate npm package contents
+        shell: bash
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          npm pack \
+            --dry-run \
+            --json \
+            --ignore-scripts \
+            ./npm/packages/hooklistener > "${RUNNER_TEMP}/npm-pack.json"
+
+          TAG_VERSION="${TAG_VERSION#v}" \
+            PACK_JSON="${RUNNER_TEMP}/npm-pack.json" \
+            node <<'NODE'
+          const fs = require("node:fs");
+
+          const report = JSON.parse(fs.readFileSync(process.env.PACK_JSON, "utf8"));
+          if (!Array.isArray(report) || report.length !== 1) {
+            throw new Error("npm pack must produce exactly one package");
+          }
+
+          const packageReport = report[0];
+          if (
+            packageReport.name !== "hooklistener" ||
+            packageReport.version !== process.env.TAG_VERSION
+          ) {
+            throw new Error(
+              `unexpected npm package identity: ${packageReport.name}@${packageReport.version}`,
+            );
+          }
+
+          const expectedFiles = [
+            "README.md",
+            "bin/hooklistener.js",
+            "package.json",
+            "scripts/install.js",
+          ];
+          const actualFiles = packageReport.files
+            .map(({ path }) => path)
+            .sort();
+
+          if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+            throw new Error(
+              `unexpected npm package contents: ${actualFiles.join(", ")}`,
+            );
+          }
+          NODE
+
+      - name: Build and smoke-test release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          expected_version="hooklistener ${GITHUB_REF_NAME#v}"
+          actual_version="$(target/release/hooklistener --version)"
+
+          if [[ "${actual_version}" != "${expected_version}" ]]; then
+            echo "::error::Release binary reported '${actual_version}', expected '${expected_version}'."
+            exit 1
+          fi
+
+  tunnel-v3-conformance:
+    name: Qualify tunnel v3 on release platforms
+    needs: verify
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tunnel-phase1-conformance.yml
+    with:
+      source_ref: ${{ github.ref }}
+      source_sha: ${{ github.sha }}
+
   build:
     name: Build (${{ matrix.target }})
+    needs: verify
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
           - os: windows-latest
@@ -30,116 +267,614 @@ jobs:
             archive: tar.gz
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Verify Cargo.toml version matches tag
-        shell: bash
-        run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
-            exit 1
-          fi
-
-      - name: Install Rust (stable + target)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.92.0
+        uses: dtolnay/rust-toolchain@387aeee55b189f024a4f6d94890c5b18d73339cc # 1.92.0
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build (cargo)
         run: cargo build --release --target ${{ matrix.target }} --locked
 
+      - name: Smoke-test release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary_path="target/${{ matrix.target }}/release/hooklistener"
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            binary_path="${binary_path}.exe"
+          fi
+
+          expected_version="hooklistener ${GITHUB_REF_NAME#v}"
+          actual_version="$("${binary_path}" --version)"
+          if [[ "${actual_version}" != "${expected_version}" ]]; then
+            echo "::error::Release binary reported '${actual_version}', expected '${expected_version}'."
+            exit 1
+          fi
+
+      - name: Enforce Linux glibc compatibility floor
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary_path="target/${{ matrix.target }}/release/hooklistener"
+          version_info="${RUNNER_TEMP}/hooklistener-glibc-versions.txt"
+          readelf --wide --version-info "${binary_path}" > "${version_info}"
+
+          VERSION_INFO="${version_info}" python3 <<'PY'
+          import os
+          import re
+
+          contents = open(
+              os.environ["VERSION_INFO"], encoding="utf-8"
+          ).read()
+          versions = [
+              tuple(map(int, match))
+              for match in re.findall(r"GLIBC_(\d+)\.(\d+)", contents)
+          ]
+          if not versions:
+              raise SystemExit("release binary did not declare a glibc ABI")
+
+          maximum = max(versions)
+          if maximum > (2, 35):
+              raise SystemExit(
+                  "release binary requires GLIBC_"
+                  + ".".join(map(str, maximum))
+                  + "; the supported floor is glibc 2.35"
+              )
+          print("Linux ABI floor verified: maximum GLIBC_" + ".".join(map(str, maximum)))
+          PY
+
       - name: Package binary
         shell: bash
         run: |
+          set -euo pipefail
           binary_name="hooklistener"
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
             binary_name="${binary_name}.exe"
           fi
 
           mkdir -p target/dist
+          archive_epoch="$(git show -s --format=%ct "${GITHUB_SHA}")"
+          if [[ ! "${archive_epoch}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Could not resolve the immutable tag commit timestamp."
+            exit 1
+          fi
 
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             pushd "target/${{ matrix.target }}/release"
-            7z a "../../dist/${binary_name}-${{ matrix.target }}.zip" "${binary_name}"
+            7z a \
+              -tzip \
+              -mx=9 \
+              -mtc=off \
+              -mta=off \
+              -mtm=off \
+              "../../dist/${binary_name}-${{ matrix.target }}.zip" \
+              "${binary_name}"
             popd
           else
-            tar -czf "target/dist/${binary_name}-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "${binary_name}"
+            binary_path="target/${{ matrix.target }}/release/${binary_name}"
+            ARCHIVE_EPOCH="${archive_epoch}" \
+              BINARY_PATH="${binary_path}" \
+              python3 -c \
+                'import os; epoch = int(os.environ["ARCHIVE_EPOCH"]); os.utime(os.environ["BINARY_PATH"], (epoch, epoch))'
+
+            if [[ "$(uname -s)" == "Darwin" ]]; then
+              COPYFILE_DISABLE=1 tar \
+                --format ustar \
+                --uid 0 \
+                --gid 0 \
+                --uname root \
+                --gname root \
+                -cf - \
+                -C "target/${{ matrix.target }}/release" \
+                "${binary_name}" |
+                gzip -n > "target/dist/${binary_name}-${{ matrix.target }}.tar.gz"
+            else
+              tar \
+                --sort=name \
+                --format=ustar \
+                --mtime="@${archive_epoch}" \
+                --owner=0 \
+                --group=0 \
+                --numeric-owner \
+                -cf - \
+                -C "target/${{ matrix.target }}/release" \
+                "${binary_name}" |
+                gzip -n > "target/dist/${binary_name}-${{ matrix.target }}.tar.gz"
+            fi
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
           path: |
             target/dist/*
           if-no-files-found: error
+          overwrite: true
+          retention-days: 30
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [verify, tunnel-v3-conformance, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
+      - name: Checkout exact release policy source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify current release governance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/verify-release-governance.sh
+
+      - name: Verify effective publisher credentials
+        shell: bash
+        env:
+          HAS_CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+          HAS_HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [[ "${HAS_CARGO_REGISTRY_TOKEN}" == "true" ]] ||
+            missing+=("CARGO_REGISTRY_TOKEN")
+          [[ "${HAS_NPM_TOKEN}" == "true" ]] ||
+            missing+=("NPM_TOKEN")
+          [[ "${HAS_HOMEBREW_TAP_TOKEN}" == "true" ]] ||
+            missing+=("HOMEBREW_TAP_TOKEN")
+
+          if [[ "${#missing[@]}" -ne 0 ]]; then
+            echo "::error::The release environment is missing: ${missing[*]}."
+            exit 1
+          fi
+
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
+          pattern: dist-*
           merge-multiple: true
 
       - name: Generate checksums
         shell: bash
         run: |
+          set -euo pipefail
           cd dist
-          shopt -s nullglob
-          for f in *; do
-            if [[ -f "$f" ]]; then
-              sha256sum "$f" >> SHA256SUMS.txt
+
+          expected=(
+            "hooklistener-aarch64-apple-darwin.tar.gz"
+            "hooklistener-x86_64-apple-darwin.tar.gz"
+            "hooklistener-x86_64-unknown-linux-gnu.tar.gz"
+            "hooklistener.exe-x86_64-pc-windows-msvc.zip"
+          )
+
+          mapfile -t actual < <(
+            find . -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+              LC_ALL=C sort
+          )
+          if [[ "${#actual[@]}" -ne "${#expected[@]}" ]]; then
+            echo "::error::Expected exactly four release archives, found ${#actual[@]}."
+            printf 'Found: %s\n' "${actual[@]}"
+            exit 1
+          fi
+
+          for archive in "${expected[@]}"; do
+            if [[ ! -f "${archive}" ]]; then
+              echo "::error::Missing expected release archive: ${archive}"
+              exit 1
             fi
           done
-          echo "Generated SHA256SUMS.txt" && cat SHA256SUMS.txt
 
-      - name: Publish Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*
-          generate_release_notes: true
+          sha256sum "${expected[@]}" > SHA256SUMS.txt
+          echo "Generated SHA256SUMS.txt"
+          cat SHA256SUMS.txt
+
+      - name: Inspect resumable prerelease
+        id: existing-release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=.github/scripts/retry-read.sh
+          source .github/scripts/retry-read.sh
+          release_json="${RUNNER_TEMP}/existing-release.json"
+          release_status="$(
+            curl \
+              --silent \
+              --show-error \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --retry 2 \
+              --retry-delay 2 \
+              --retry-max-time 120 \
+              --retry-connrefused \
+              --retry-all-errors \
+              --output "${release_json}" \
+              --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+          )"
+
+          if [[ "${release_status}" == "404" ]]; then
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "complete=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${release_status}" != "200" ]]; then
+            echo "::error::GitHub returned HTTP ${release_status}; refusing ambiguous release mutation."
+            exit 1
+          fi
+
+          expected_assets=(
+            "SHA256SUMS.txt"
+            "hooklistener-aarch64-apple-darwin.tar.gz"
+            "hooklistener-x86_64-apple-darwin.tar.gz"
+            "hooklistener-x86_64-unknown-linux-gnu.tar.gz"
+            "hooklistener.exe-x86_64-pc-windows-msvc.zip"
+          )
+          expected_assets_json="$(
+            printf '%s\n' "${expected_assets[@]}" |
+              jq --raw-input --slurp 'split("\n") | map(select(length > 0))'
+          )"
+
+          jq -e \
+            --arg tag "${TAG_NAME}" \
+            --argjson expected_assets "${expected_assets_json}" \
+            '.tag_name == $tag
+             and .draft == false
+             and .prerelease == true
+             and ([.assets[].name] | length)
+               == ([.assets[].name] | unique | length)
+             and (([.assets[].name] - $expected_assets) | length) == 0' \
+            "${release_json}" >/dev/null
+
+          existing_dir="${RUNNER_TEMP}/existing-release-assets"
+          mkdir -p "${existing_dir}"
+          mapfile -t actual_assets < <(
+            jq --raw-output '.assets[].name' "${release_json}" |
+              LC_ALL=C sort
+          )
+          for asset_name in "${actual_assets[@]}"; do
+            retry_read gh release download "${TAG_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${asset_name}" \
+              --dir "${existing_dir}" \
+              --clobber
+            if ! cmp --silent "dist/${asset_name}" "${existing_dir}/${asset_name}"; then
+              echo "::error::Existing prerelease asset ${asset_name} differs; refusing overwrite."
+              exit 1
+            fi
+          done
+
+          for archive in dist/*.tar.gz dist/*.zip; do
+            retry_read gh attestation verify "${archive}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-digest "${SOURCE_SHA}" \
+              --source-ref "refs/tags/${TAG_NAME}"
+          done
+
+          missing_assets="${RUNNER_TEMP}/missing-release-assets.txt"
+          : > "${missing_assets}"
+          for asset_name in "${expected_assets[@]}"; do
+            if ! jq -e \
+              --arg asset_name "${asset_name}" \
+              'any(.assets[]; .name == $asset_name)' \
+              "${release_json}" >/dev/null; then
+              printf 'dist/%s\n' "${asset_name}" >> "${missing_assets}"
+            fi
+          done
+
+          echo "exists=true" >> "${GITHUB_OUTPUT}"
+          if [[ -s "${missing_assets}" ]]; then
+            echo "complete=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "complete=true" >> "${GITHUB_OUTPUT}"
+          fi
+          {
+            echo "missing_assets<<HOOKLISTENER_MISSING_ASSETS"
+            cat "${missing_assets}"
+            echo "HOOKLISTENER_MISSING_ASSETS"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Attest release artifacts
+        if: steps.existing-release.outputs.exists != 'true'
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
+
+      - name: Publish prerelease
+        if: steps.existing-release.outputs.exists != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t release_assets < <(
+            find dist -mindepth 1 -maxdepth 1 -type f -print |
+              LC_ALL=C sort
+          )
+          if [[ "${#release_assets[@]}" -ne 5 ]]; then
+            echo "::error::Expected exactly five files for the prerelease."
+            exit 1
+          fi
+
+          bash .github/scripts/verify-monotonic-release-order.sh \
+            "${TAG_NAME}" \
+            prerelease-create
+          bash .github/scripts/verify-remote-release-tag.sh \
+            "${TAG_NAME}" \
+            "${SOURCE_SHA}"
+          gh release create "${TAG_NAME}" \
+            "${release_assets[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --prerelease \
+            --generate-notes \
+            --verify-tag
+
+      - name: Resume partial prerelease
+        if: >-
+          steps.existing-release.outputs.exists == 'true' &&
+          steps.existing-release.outputs.complete != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          MISSING_ASSETS: ${{ steps.existing-release.outputs.missing_assets }}
+        run: |
+          set -euo pipefail
+          mapfile -t missing_assets < <(
+            printf '%s\n' "${MISSING_ASSETS}" |
+              sed '/^[[:space:]]*$/d'
+          )
+          if [[ "${#missing_assets[@]}" -eq 0 ]]; then
+            echo "::error::Partial prerelease did not report any missing assets."
+            exit 1
+          fi
+          for asset in "${missing_assets[@]}"; do
+            if [[ ! -f "${asset}" ]]; then
+              echo "::error::Missing local release asset ${asset}."
+              exit 1
+            fi
+          done
+          bash .github/scripts/verify-monotonic-release-order.sh \
+            "${TAG_NAME}" \
+            prerelease-resume
+          bash .github/scripts/verify-remote-release-tag.sh \
+            "${TAG_NAME}" \
+            "${SOURCE_SHA}"
+          gh release upload "${TAG_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            "${missing_assets[@]}"
+
+      - name: Verify complete prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=.github/scripts/retry-read.sh
+          source .github/scripts/retry-read.sh
+          release_json="${RUNNER_TEMP}/complete-prerelease.json"
+          complete_visible=false
+          for attempt in 1 2 3; do
+            retry_read_to_file "${release_json}" gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+            if jq -e \
+              --arg tag "${TAG_NAME}" \
+              --argjson expected_assets '[
+                "SHA256SUMS.txt",
+                "hooklistener-aarch64-apple-darwin.tar.gz",
+                "hooklistener-x86_64-apple-darwin.tar.gz",
+                "hooklistener-x86_64-unknown-linux-gnu.tar.gz",
+                "hooklistener.exe-x86_64-pc-windows-msvc.zip"
+              ]' \
+              '.tag_name == $tag
+               and .draft == false
+               and .prerelease == true
+               and ([.assets[].name] | length)
+                 == ([.assets[].name] | unique | length)
+               and ([.assets[].name] | sort) == ($expected_assets | sort)' \
+              "${release_json}" >/dev/null; then
+              complete_visible=true
+              break
+            fi
+            if [[ "${attempt}" -lt 3 ]]; then
+              echo "::warning::Complete prerelease is not visible yet; retrying."
+              sleep "$((attempt * 2))"
+            fi
+          done
+          if [[ "${complete_visible}" != "true" ]]; then
+            echo "::error::Complete prerelease state did not become visible."
+            exit 1
+          fi
+
+          release_dir="${RUNNER_TEMP}/complete-prerelease-assets"
+          mkdir -p "${release_dir}"
+          retry_read gh release download "${TAG_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "${release_dir}" \
+            --clobber
+
+          for asset in dist/*; do
+            asset_name="$(basename "${asset}")"
+            if ! cmp --silent "${asset}" "${release_dir}/${asset_name}"; then
+              echo "::error::Published prerelease asset ${asset_name} differs from the release build."
+              exit 1
+            fi
+          done
+
+          (
+            cd "${release_dir}"
+            sha256sum --check --strict SHA256SUMS.txt
+          )
+          for archive in "${release_dir}"/*.tar.gz "${release_dir}"/*.zip; do
+            retry_read gh attestation verify "${archive}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-digest "${SOURCE_SHA}" \
+              --source-ref "refs/tags/${TAG_NAME}"
+          done
 
   publish-crates:
     name: Publish to crates.io
-    needs: release
+    needs: [verify, release]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Verify current release governance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/verify-release-governance.sh
+
+      - name: Install Rust 1.92.0
+        uses: dtolnay/rust-toolchain@387aeee55b189f024a4f6d94890c5b18d73339cc # 1.92.0
+
+      - name: Check crates.io publication state
+        id: registry-state
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${VERSION#v}"
+          cargo package --locked --no-verify
+          crate_path="target/package/hooklistener-cli-${VERSION}.crate"
+          if [[ ! -f "${crate_path}" ]]; then
+            echo "::error::cargo package did not produce ${crate_path}."
+            exit 1
+          fi
+          local_checksum="$(sha256sum "${crate_path}" | awk '{print $1}')"
+
+          response_file="${RUNNER_TEMP}/crates-io-version.json"
+          if ! response_status="$(
+            curl \
+              --silent \
+              --show-error \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --retry 2 \
+              --retry-delay 2 \
+              --retry-max-time 120 \
+              --retry-connrefused \
+              --retry-all-errors \
+              --output "${response_file}" \
+              --write-out '%{http_code}' \
+              --header "User-Agent: hooklistener-release-workflow (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})" \
+              "https://crates.io/api/v1/crates/hooklistener-cli/${VERSION}"
+          )"; then
+            echo "::error::Could not determine whether hooklistener-cli ${VERSION} already exists on crates.io."
+            exit 1
+          fi
+
+          case "${response_status}" in
+            200)
+              published_version="$(jq -er '.version.num' "${response_file}")"
+              published_checksum="$(jq -er '.version.checksum' "${response_file}")"
+              if [[ "${published_version}" != "${VERSION}" ]]; then
+                echo "::error::crates.io returned version ${published_version}, expected ${VERSION}."
+                exit 1
+              fi
+              if [[ "${published_checksum}" != "${local_checksum}" ]]; then
+                echo "::error::hooklistener-cli ${VERSION} exists on crates.io with different package contents."
+                exit 1
+              fi
+              echo "hooklistener-cli ${VERSION} is already published with the expected checksum."
+              echo "published=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            404)
+              echo "published=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "::error::crates.io returned HTTP ${response_status}; refusing an ambiguous publish."
+              exit 1
+              ;;
+          esac
 
       - name: Publish to crates.io
-        run: cargo publish --locked
+        if: steps.registry-state.outputs.published != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/verify-monotonic-release-order.sh \
+            "${GITHUB_REF_NAME}" \
+            crates-publish
+          bash .github/scripts/verify-remote-release-tag.sh \
+            "${GITHUB_REF_NAME}" \
+            "${GITHUB_SHA}"
+          cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
 
   publish-npm:
     name: Publish to npm
-    needs: release
+    needs: [verify, release]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify current release governance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/verify-release-governance.sh
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 20.20.2
           registry-url: https://registry.npmjs.org
+
+      - name: Verify npm packaging toolchain
+        run: test "$(npm --version)" = "10.8.2"
 
       - name: Get version from tag
         id: version
@@ -147,17 +882,159 @@ jobs:
           VERSION="${GITHUB_REF#refs/tags/v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Publish npm package
-        run: npm/scripts/publish-npm.sh "${{ steps.version.outputs.version }}"
+      - name: Check npm publication state
+        id: registry-state
+        shell: bash
         env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          package_directory="${RUNNER_TEMP}/npm-package"
+          mkdir -p "${package_directory}"
+          npm pack \
+            --json \
+            --ignore-scripts \
+            --pack-destination "${package_directory}" \
+            ./npm/packages/hooklistener > "${RUNNER_TEMP}/npm-pack.json"
+          package_filename="$(
+            jq -er \
+              --arg version "${VERSION}" \
+              '
+                if length == 1
+                  and .[0].name == "hooklistener"
+                  and .[0].version == $version
+                  and .[0].filename == ("hooklistener-" + $version + ".tgz")
+                  and (.[0].integrity | test("^sha512-[A-Za-z0-9+/]+={0,2}$"))
+                then .[0].filename
+                else error("unexpected local npm package identity")
+                end
+              ' \
+              "${RUNNER_TEMP}/npm-pack.json"
+          )"
+          local_integrity="$(
+            jq -er \
+              --arg version "${VERSION}" \
+              '
+                if length == 1
+                  and .[0].name == "hooklistener"
+                  and .[0].version == $version
+                then .[0].integrity
+                else error("unexpected local npm package identity")
+                end
+              ' \
+              "${RUNNER_TEMP}/npm-pack.json"
+          )"
+          package_path="${package_directory}/${package_filename}"
+          if [[ ! -f "${package_path}" ]] || [[ -L "${package_path}" ]]; then
+            echo "::error::npm pack did not produce the expected regular tarball."
+            exit 1
+          fi
+          mapfile -t package_files < <(
+            find "${package_directory}" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type f \
+              -printf '%f\n'
+          )
+          if [[ "${#package_files[@]}" -ne 1 ]] ||
+             [[ "${package_files[0]}" != "${package_filename}" ]]; then
+            echo "::error::npm pack produced an ambiguous package set."
+            exit 1
+          fi
+          {
+            echo "package_path=${package_path}"
+            echo "integrity=${local_integrity}"
+          } >> "${GITHUB_OUTPUT}"
+
+          response_file="${RUNNER_TEMP}/npm-version.json"
+          if ! response_status="$(
+            curl \
+              --silent \
+              --show-error \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --retry 2 \
+              --retry-delay 2 \
+              --retry-max-time 120 \
+              --retry-connrefused \
+              --retry-all-errors \
+              --output "${response_file}" \
+              --write-out '%{http_code}' \
+              "https://registry.npmjs.org/hooklistener/${VERSION}"
+          )"; then
+            echo "::error::Could not determine whether hooklistener@${VERSION} already exists on npm."
+            exit 1
+          fi
+
+          case "${response_status}" in
+            200)
+              published_version="$(jq -er '.version' "${response_file}")"
+              published_integrity="$(jq -er '.dist.integrity' "${response_file}")"
+              if [[ "${published_version}" != "${VERSION}" ]]; then
+                echo "::error::npm returned version ${published_version}, expected ${VERSION}."
+                exit 1
+              fi
+              if [[ "${published_integrity}" != "${local_integrity}" ]]; then
+                echo "::error::hooklistener@${VERSION} exists on npm with different package contents."
+                exit 1
+              fi
+              echo "hooklistener@${VERSION} is already published with the expected integrity."
+              echo "published=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            404)
+              echo "published=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "::error::npm returned HTTP ${response_status}; refusing an ambiguous publish."
+              exit 1
+              ;;
+          esac
+
+      - name: Publish npm package
+        if: steps.registry-state.outputs.published != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/verify-monotonic-release-order.sh \
+            "${GITHUB_REF_NAME}" \
+            npm-publish
+          bash .github/scripts/verify-remote-release-tag.sh \
+            "${GITHUB_REF_NAME}" \
+            "${GITHUB_SHA}"
+          npm/scripts/publish-npm.sh \
+            "${{ steps.version.outputs.version }}" \
+            "${PACKAGE_TARBALL}" \
+            "${EXPECTED_INTEGRITY}"
+        env:
+          EXPECTED_INTEGRITY: ${{ steps.registry-state.outputs.integrity }}
+          GH_TOKEN: ${{ github.token }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_TARBALL: ${{ steps.registry-state.outputs.package_path }}
 
   update-homebrew:
     name: Update Homebrew Tap
-    needs: release
+    needs: [publish-crates, publish-npm]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
     steps:
+      - name: Checkout exact release policy source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify current release governance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/verify-release-governance.sh
+
       - name: Extract version
         id: version
         env:
@@ -167,107 +1044,538 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "tag=$REF_NAME" >> $GITHUB_OUTPUT
 
-      - name: Download checksums
-        env:
-          REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt" -o SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
-      - name: Extract checksums
+      - name: Download and verify release artifacts
         id: checksums
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # shellcheck source=.github/scripts/retry-read.sh
+          source .github/scripts/retry-read.sh
+          release_json="${RUNNER_TEMP}/homebrew-source-release.json"
+          retry_read_to_file "${release_json}" gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}"
+          jq -e \
+            --arg tag "${TAG}" \
+            --argjson expected_assets '[
+              "SHA256SUMS.txt",
+              "hooklistener-aarch64-apple-darwin.tar.gz",
+              "hooklistener-x86_64-apple-darwin.tar.gz",
+              "hooklistener-x86_64-unknown-linux-gnu.tar.gz",
+              "hooklistener.exe-x86_64-pc-windows-msvc.zip"
+            ]' \
+            '.tag_name == $tag
+             and .draft == false
+             and .prerelease == true
+             and ([.assets[].name] | length)
+               == ([.assets[].name] | unique | length)
+             and ([.assets[].name] | sort) == ($expected_assets | sort)' \
+            "${release_json}" >/dev/null
 
-          extract_checksum() {
-            local asset_name="$1"
-            local checksum
-            checksum=$(awk -v asset_name="$asset_name" '$2 == asset_name { print $1 }' SHA256SUMS.txt)
+          release_dir="${RUNNER_TEMP}/homebrew-source-assets"
+          mkdir -p "${release_dir}"
+          retry_read gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "${release_dir}" \
+            --clobber
 
-            if [[ ! "$checksum" =~ ^[a-f0-9]{64}$ ]]; then
-              echo "::error::Expected exactly one valid SHA-256 entry for ${asset_name}" >&2
-              return 1
+          archives=(
+            "hooklistener-aarch64-apple-darwin.tar.gz"
+            "hooklistener-x86_64-apple-darwin.tar.gz"
+            "hooklistener-x86_64-unknown-linux-gnu.tar.gz"
+            "hooklistener.exe-x86_64-pc-windows-msvc.zip"
+          )
+          declare -A checksums=()
+
+          manifest="${release_dir}/SHA256SUMS.txt"
+          while IFS= read -r line || [[ -n "${line}" ]]; do
+            if [[ ! "${line}" =~ ^([a-f0-9]{64})[[:space:]][[:space:]]([^/[:space:]]+)$ ]]; then
+              echo "::error::Malformed release checksum entry."
+              exit 1
             fi
+            digest="${BASH_REMATCH[1]}"
+            asset_name="${BASH_REMATCH[2]}"
+            case "${asset_name}" in
+              hooklistener-aarch64-apple-darwin.tar.gz | \
+                hooklistener-x86_64-apple-darwin.tar.gz | \
+                hooklistener-x86_64-unknown-linux-gnu.tar.gz | \
+                hooklistener.exe-x86_64-pc-windows-msvc.zip)
+                ;;
+              *)
+                echo "::error::Unexpected release checksum entry."
+                exit 1
+                ;;
+            esac
+            if [[ -n "${checksums["${asset_name}"]:-}" ]]; then
+              echo "::error::Duplicate release checksum entry for ${asset_name}."
+              exit 1
+            fi
+            checksums["${asset_name}"]="${digest}"
+          done < "${manifest}"
 
-            printf '%s\n' "$checksum"
-          }
+          if [[ "${#checksums[@]}" -ne "${#archives[@]}" ]]; then
+            echo "::error::Release checksum manifest is incomplete."
+            exit 1
+          fi
+          (
+            cd "${release_dir}"
+            sha256sum --check --strict SHA256SUMS.txt
+          )
+          for archive in "${archives[@]}"; do
+            retry_read gh attestation verify "${release_dir}/${archive}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-digest "${SOURCE_SHA}" \
+              --source-ref "refs/tags/${TAG}"
+          done
 
-          ARM64_SHA=$(extract_checksum "hooklistener-aarch64-apple-darwin.tar.gz")
-          X86_64_SHA=$(extract_checksum "hooklistener-x86_64-apple-darwin.tar.gz")
-          LINUX_SHA=$(extract_checksum "hooklistener-x86_64-unknown-linux-gnu.tar.gz")
-
-          echo "arm64=$ARM64_SHA" >> $GITHUB_OUTPUT
-          echo "x86_64=$X86_64_SHA" >> $GITHUB_OUTPUT
-          echo "linux=$LINUX_SHA" >> $GITHUB_OUTPUT
+          echo "arm64=${checksums[hooklistener-aarch64-apple-darwin.tar.gz]}" >> "${GITHUB_OUTPUT}"
+          echo "x86_64=${checksums[hooklistener-x86_64-apple-darwin.tar.gz]}" >> "${GITHUB_OUTPUT}"
+          echo "linux=${checksums[hooklistener-x86_64-unknown-linux-gnu.tar.gz]}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: hooklistener/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
+          ref: main
+          persist-credentials: true
+
+      - name: Enforce monotonic Homebrew formula order
+        id: tap-state
+        shell: bash
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          formula_path="homebrew-tap/Formula/hooklistener.rb"
+
+          if [[ ! -f "${formula_path}" ]]; then
+            echo "same_version=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          mapfile -t existing_versions < <(
+            sed -nE 's/^[[:space:]]*version "([^"]+)".*/\1/p' "${formula_path}"
+          )
+          if [[ "${#existing_versions[@]}" -ne 1 ]]; then
+            echo "::error::The tap formula must contain exactly one explicit version."
+            exit 1
+          fi
+
+          comparison="$(
+            TARGET_VERSION="${TARGET_VERSION}" \
+              EXISTING_VERSION="${existing_versions[0]}" \
+              python3 <<'PY'
+          import os
+          import re
+
+          stable = re.compile(
+              r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
+          )
+
+          def parse(name: str, value: str) -> tuple[int, int, int]:
+              match = stable.fullmatch(value)
+              if match is None:
+                  raise SystemExit(f"{name} is not a stable semantic version: {value!r}")
+              return tuple(int(part) for part in match.groups())
+
+          target = parse("target version", os.environ["TARGET_VERSION"])
+          existing = parse("existing tap version", os.environ["EXISTING_VERSION"])
+
+          if existing > target:
+              print("newer")
+          elif existing == target:
+              print("same")
+          else:
+              print("older")
+          PY
+          )"
+
+          case "${comparison}" in
+            newer)
+              echo "::error::The Homebrew tap is already newer than ${TARGET_VERSION}; refusing a downgrade."
+              exit 1
+              ;;
+            same)
+              echo "same_version=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            older)
+              echo "same_version=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "::error::Could not compare the Homebrew formula version."
+              exit 1
+              ;;
+          esac
 
       - name: Update formula
+        shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
           ARM64_SHA: ${{ steps.checksums.outputs.arm64 }}
           X86_64_SHA: ${{ steps.checksums.outputs.x86_64 }}
           LINUX_SHA: ${{ steps.checksums.outputs.linux }}
         run: |
-          cd homebrew-tap
-
-          cat > Formula/hooklistener.rb << EOF
-          # typed: false
-          # frozen_string_literal: true
-
-          class Hooklistener < Formula
-            desc "CLI tool for webhook inspection and local tunnel exposure"
-            homepage "https://github.com/hooklistener/hooklistener-cli"
-            version "${VERSION}"
-            license "MIT"
-
-            on_macos do
-              on_arm do
-                url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-aarch64-apple-darwin.tar.gz"
-                sha256 "${ARM64_SHA}"
-              end
-
-              on_intel do
-                url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-x86_64-apple-darwin.tar.gz"
-                sha256 "${X86_64_SHA}"
-              end
-            end
-
-            on_linux do
-              on_intel do
-                url "https://github.com/hooklistener/hooklistener-cli/releases/download/v#{version}/hooklistener-x86_64-unknown-linux-gnu.tar.gz"
-                sha256 "${LINUX_SHA}"
-              end
-            end
-
-            def install
-              bin.install "hooklistener"
-            end
-
-            test do
-              assert_match version.to_s, shell_output("#{bin}/hooklistener --version")
-            end
-          end
-          EOF
+          set -euo pipefail
+          python3 .github/scripts/render-homebrew-formula.py \
+            --version "${VERSION}" \
+            --arm64-sha "${ARM64_SHA}" \
+            --x86-64-sha "${X86_64_SHA}" \
+            --linux-sha "${LINUX_SHA}" \
+            > homebrew-tap/Formula/hooklistener.rb
 
       - name: Commit and push
+        shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
+          SAME_VERSION: ${{ steps.tap-state.outputs.same_version }}
+          ARM64_SHA: ${{ steps.checksums.outputs.arm64 }}
+          X86_64_SHA: ${{ steps.checksums.outputs.x86_64 }}
+          LINUX_SHA: ${{ steps.checksums.outputs.linux }}
         run: |
+          set -euo pipefail
+          cli_repository="${PWD}"
+          expected_formula="${RUNNER_TEMP}/expected-hooklistener.rb"
+          python3 .github/scripts/render-homebrew-formula.py \
+            --version "${VERSION}" \
+            --arm64-sha "${ARM64_SHA}" \
+            --x86-64-sha "${X86_64_SHA}" \
+            --linux-sha "${LINUX_SHA}" \
+            > "${expected_formula}"
+          if ! cmp --silent \
+            "${expected_formula}" \
+            homebrew-tap/Formula/hooklistener.rb; then
+            echo "::error::The generated Homebrew formula is not deterministic."
+            exit 1
+          fi
+          ruby -c homebrew-tap/Formula/hooklistener.rb
+
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/hooklistener.rb
-          if git diff --cached --quiet; then
+
+          if ! git diff --cached --quiet; then
+            echo "::error::The Homebrew checkout contained pre-staged changes."
+            exit 1
+          fi
+          mapfile -d '' -t tracked_changes < <(git diff --name-only -z)
+          mapfile -d '' -t untracked_changes < <(
+            git ls-files --others --exclude-standard -z
+          )
+          changed_paths=("${tracked_changes[@]}" "${untracked_changes[@]}")
+          if [[ "${#changed_paths[@]}" -eq 0 ]]; then
+            if [[ "${SAME_VERSION}" != "true" ]]; then
+              echo "::error::The tap content matched without the expected version."
+              exit 1
+            fi
+          elif [[ "${#changed_paths[@]}" -ne 1 ]] ||
+               [[ "${changed_paths[0]}" != "Formula/hooklistener.rb" ]]; then
+            echo "::error::The Homebrew checkout contains unrelated changes."
+            exit 1
+          elif [[ "${SAME_VERSION}" == "true" ]]; then
+            echo "::error::The existing Homebrew version has different contents; refusing to mutate it."
+            exit 1
+          fi
+
+          checkout_sha="$(git rev-parse HEAD)"
+          fetch_main() {
+            git fetch \
+              --no-tags \
+              origin \
+              "+refs/heads/main:refs/remotes/origin/main"
+          }
+          for attempt in 1 2 3; do
+            if fetch_main; then
+              break
+            fi
+            if [[ "${attempt}" -eq 3 ]]; then
+              echo "::error::Could not refresh the Homebrew tap main branch."
+              exit 1
+            fi
+            sleep "$((attempt * 2))"
+          done
+          if [[ "$(git rev-parse refs/remotes/origin/main)" != "${checkout_sha}" ]]; then
+            echo "::error::The Homebrew tap changed during release; rerun the failed job."
+            exit 1
+          fi
+
+          if [[ "${#changed_paths[@]}" -eq 0 ]]; then
             echo "Homebrew formula already up to date for ${VERSION}"
             exit 0
           fi
+
+          git add Formula/hooklistener.rb
+          mapfile -d '' -t staged_paths < <(
+            git diff --cached --name-only -z
+          )
+          if [[ "${#staged_paths[@]}" -ne 1 ]] ||
+             [[ "${staged_paths[0]}" != "Formula/hooklistener.rb" ]]; then
+            echo "::error::Only the exact Homebrew formula may be committed."
+            exit 1
+          fi
+          git diff --cached --check
+          if ! git diff --quiet ||
+             [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+            echo "::error::The Homebrew checkout changed after staging."
+            exit 1
+          fi
+
           git commit -m "Update hooklistener to ${VERSION}"
-          git push
+          (
+            cd "${cli_repository}"
+            bash .github/scripts/verify-monotonic-release-order.sh \
+              "${GITHUB_REF_NAME}" \
+              homebrew-push
+            bash .github/scripts/verify-remote-release-tag.sh \
+              "${GITHUB_REF_NAME}" \
+              "${GITHUB_SHA}"
+          )
+          git push origin HEAD:refs/heads/main
+
+  promote-release:
+    name: Promote GitHub Release
+    needs: [release, publish-crates, publish-npm, update-homebrew]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    steps:
+      - name: Checkout exact release policy source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify current release governance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/verify-release-governance.sh
+
+      - name: Verify release payload and promote
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=.github/scripts/retry-read.sh
+          source .github/scripts/retry-read.sh
+          release_before="${RUNNER_TEMP}/release-before-promotion.json"
+          retry_read_to_file "${release_before}" gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+
+          jq -e \
+            --arg tag "${TAG_NAME}" \
+            --argjson expected_assets '[
+              "SHA256SUMS.txt",
+              "hooklistener-aarch64-apple-darwin.tar.gz",
+              "hooklistener-x86_64-apple-darwin.tar.gz",
+              "hooklistener-x86_64-unknown-linux-gnu.tar.gz",
+              "hooklistener.exe-x86_64-pc-windows-msvc.zip"
+            ]' \
+            '.tag_name == $tag
+             and .draft == false
+             and (.prerelease | type) == "boolean"
+             and ([.assets[].name] | length)
+               == ([.assets[].name] | unique | length)
+             and ([.assets[].name] | sort) == ($expected_assets | sort)' \
+            "${release_before}" >/dev/null
+
+          release_dir="${RUNNER_TEMP}/promotion-release-assets"
+          mkdir -p "${release_dir}"
+          retry_read gh release download "${TAG_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "${release_dir}" \
+            --clobber
+
+          archives=(
+            "hooklistener-aarch64-apple-darwin.tar.gz"
+            "hooklistener-x86_64-apple-darwin.tar.gz"
+            "hooklistener-x86_64-unknown-linux-gnu.tar.gz"
+            "hooklistener.exe-x86_64-pc-windows-msvc.zip"
+          )
+          declare -A checksums=()
+
+          manifest="${release_dir}/SHA256SUMS.txt"
+          while IFS= read -r line || [[ -n "${line}" ]]; do
+            if [[ ! "${line}" =~ ^([a-f0-9]{64})[[:space:]][[:space:]]([^/[:space:]]+)$ ]]; then
+              echo "::error::Malformed release checksum entry."
+              exit 1
+            fi
+            digest="${BASH_REMATCH[1]}"
+            asset_name="${BASH_REMATCH[2]}"
+            case "${asset_name}" in
+              hooklistener-aarch64-apple-darwin.tar.gz | \
+                hooklistener-x86_64-apple-darwin.tar.gz | \
+                hooklistener-x86_64-unknown-linux-gnu.tar.gz | \
+                hooklistener.exe-x86_64-pc-windows-msvc.zip)
+                ;;
+              *)
+                echo "::error::Unexpected release checksum entry."
+                exit 1
+                ;;
+            esac
+            if [[ -n "${checksums["${asset_name}"]:-}" ]]; then
+              echo "::error::Duplicate release checksum entry for ${asset_name}."
+              exit 1
+            fi
+            checksums["${asset_name}"]="${digest}"
+          done < "${manifest}"
+
+          if [[ "${#checksums[@]}" -ne "${#archives[@]}" ]]; then
+            echo "::error::Release checksum manifest is incomplete."
+            exit 1
+          fi
+          (
+            cd "${release_dir}"
+            sha256sum --check --strict SHA256SUMS.txt
+          )
+          for archive in "${archives[@]}"; do
+            retry_read gh attestation verify "${release_dir}/${archive}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-digest "${SOURCE_SHA}" \
+              --source-ref "refs/tags/${TAG_NAME}"
+          done
+
+          release_recheck="${RUNNER_TEMP}/release-immediately-before-promotion.json"
+          retry_read_to_file "${release_recheck}" gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+          jq -e --slurp '
+            def snapshot:
+              {
+                tag_name,
+                draft,
+                prerelease,
+                assets: (
+                  .assets
+                  | map({id, name, size, digest, updated_at})
+                  | sort_by(.name)
+                )
+              };
+            (.[0] | snapshot) == (.[1] | snapshot)
+          ' "${release_before}" "${release_recheck}" >/dev/null
+
+          if ! promotion_decision="$(
+            bash .github/scripts/verify-monotonic-release-order.sh \
+              "${TAG_NAME}" \
+              promote
+          )"; then
+            echo "::error::The release is no longer safe to promote."
+            exit 1
+          fi
+
+          release_final="${RUNNER_TEMP}/release-final-pre-promotion.json"
+          retry_read_to_file "${release_final}" gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+          jq -e --slurp '
+            def snapshot:
+              {
+                tag_name,
+                draft,
+                prerelease,
+                assets: (
+                  .assets
+                  | map({id, name, size, digest, updated_at})
+                  | sort_by(.name)
+                )
+              };
+            (.[0] | snapshot) == (.[1] | snapshot)
+          ' "${release_recheck}" "${release_final}" >/dev/null
+
+          bash .github/scripts/verify-remote-release-tag.sh \
+            "${TAG_NAME}" \
+            "${SOURCE_SHA}"
+          case "${promotion_decision}" in
+            promote)
+              gh release edit \
+                "${TAG_NAME}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --prerelease=false \
+                --draft=false \
+                --latest
+              ;;
+            superseded)
+              echo "The exact release is already stable and a newer public version exists; leaving GitHub Latest unchanged."
+              ;;
+            *)
+              echo "::error::Unexpected promotion decision: ${promotion_decision}."
+              exit 1
+              ;;
+          esac
+
+          release_after="${RUNNER_TEMP}/release-after-promotion.json"
+          stable_visible=false
+          for attempt in 1 2 3; do
+            retry_read_to_file "${release_after}" gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+            if jq -e --slurp \
+              --arg tag "${TAG_NAME}" \
+              --argjson expected_assets '[
+                "SHA256SUMS.txt",
+                "hooklistener-aarch64-apple-darwin.tar.gz",
+                "hooklistener-x86_64-apple-darwin.tar.gz",
+                "hooklistener-x86_64-unknown-linux-gnu.tar.gz",
+                "hooklistener.exe-x86_64-pc-windows-msvc.zip"
+              ]' '
+              def assets:
+                .assets
+                | map({id, name, size, digest, updated_at})
+                | sort_by(.name);
+              (.[0].tag_name == $tag)
+                and (.[0].draft == false)
+                and (.[0].prerelease == false)
+                and ([.[0].assets[].name] | sort)
+                  == ($expected_assets | sort)
+                and ((.[1] | assets) == (.[0] | assets))
+            ' "${release_after}" "${release_final}" >/dev/null; then
+              stable_visible=true
+              break
+            fi
+            if [[ "${attempt}" -lt 3 ]]; then
+              echo "::warning::Stable GitHub release is not visible yet; retrying."
+              sleep "$((attempt * 2))"
+            fi
+          done
+          if [[ "${stable_visible}" != "true" ]]; then
+            echo "::error::Stable GitHub release state did not become visible."
+            exit 1
+          fi
+
+          bash .github/scripts/verify-remote-release-tag.sh \
+            "${TAG_NAME}" \
+            "${SOURCE_SHA}"
+
+          if [[ "${promotion_decision}" == "promote" ]]; then
+            latest_visible=false
+            for attempt in 1 2 3; do
+              latest_tag="$(
+                retry_read_capture \
+                  gh api \
+                  "repos/${GITHUB_REPOSITORY}/releases/latest" \
+                  --jq '.tag_name'
+              )"
+              if [[ "${latest_tag}" == "${TAG_NAME}" ]]; then
+                latest_visible=true
+                break
+              fi
+              if [[ "${attempt}" -lt 3 ]]; then
+                echo "::warning::GitHub Latest is not updated yet; retrying."
+                sleep "$((attempt * 2))"
+              fi
+            done
+            if [[ "${latest_visible}" != "true" ]]; then
+              echo "::error::Promoted stable release did not become the GitHub Latest release."
+              exit 1
+            fi
+          fi

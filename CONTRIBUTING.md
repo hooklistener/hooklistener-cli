@@ -98,6 +98,92 @@ with keyboard shortcut (/) and filter persistence.
 Closes #42
 ```
 
+## Release Controls
+
+Stable releases are created only by `.github/workflows/release.yml` from an exact
+`vMAJOR.MINOR.PATCH` tag whose commit is contained in `main`.
+
+Prepare each version in a normal pull request. `Cargo.toml`, the root
+`Cargo.lock` entry for `hooklistener-cli`, and
+`npm/packages/hooklistener/package.json` must contain the same exact version.
+The repository's `release.toml` can prepare the local Cargo version commit, but
+it intentionally cannot tag, push, or publish.
+
+Before merging the version pull request or creating its tag, repository
+administrators must verify these controls:
+
+- Protect the `release` environment with required reviewers and restrict it to
+  one custom deployment pattern, `v*.*.*`. Prevent self-approval and disable
+  administrator bypass of environment protection rules. The workflow separately
+  enforces exact semantic versions.
+- Store `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, and `HOMEBREW_TAP_TOKEN` only as
+  `release` environment secrets; delete the repository-scoped copies after
+  rotating them. Rotate them periodically and immediately after suspected
+  exposure.
+- Apply effective `main` rules—not merely an active ruleset with no matching
+  ref—that prevent deletion and force pushes, require at least one pull-request
+  approval, require branches to be current, and require all of these checks:
+  `Rustfmt`, `Clippy`, `Tests (stable)`, `Cargo Audit`, `Analyze`, the four
+  `Build (...)` targets, and
+  `Authenticated lifecycle (linux|macos|windows)`. Pin every context to the
+  GitHub Actions app rather than accepting the same name from any source.
+- Apply two active tag rulesets to `refs/tags/v*.*.*`: a creation-only ruleset
+  whose only bypass actors are the designated release maintainers, and a
+  separate update-and-deletion ruleset with no bypass actors. Do not combine
+  them: a maintainer allowed to bypass creation in a combined ruleset could
+  also bypass immutability. Leave both rulesets' exclusion lists empty, and
+  review all ruleset and environment bypass actors manually.
+
+Inspect the effective state rather than trusting settings-page names:
+
+```sh
+gh api --paginate --slurp \
+  'repos/hooklistener/hooklistener-cli/rules/branches/main?per_page=100'
+gh api --paginate --slurp \
+  'repos/hooklistener/hooklistener-cli/rulesets?targets=tag&per_page=100'
+gh api repos/hooklistener/hooklistener-cli/environments/release
+gh api --paginate --slurp \
+  'repos/hooklistener/hooklistener-cli/environments/release/deployment-branch-policies?per_page=100'
+```
+
+An empty effective-rules response, a missing `release` environment, empty
+reviewer protection, or a null/unmatched deployment policy blocks release.
+The release workflow checks the readable metadata and effective credential
+presence, but an administrator must verify secret scope and bypass actors.
+The sole `v*.*.*` environment deployment pattern must be of type **tag**; the
+read-only policy-list response does not expose that type. Confirm that CodeQL
+is active rather than `disabled_inactivity` before requiring its `Analyze`
+check.
+
+After the version pull request and all required checks pass, create one
+annotated tag at that exact merged commit and push only that tag:
+
+```sh
+version=1.8.0
+release_sha=<full-merged-version-commit-sha>
+git fetch origin main --tags
+git merge-base --is-ancestor "${release_sha}" origin/main
+git tag -a "v${version}" "${release_sha}" -m "Release v${version}"
+git push origin "refs/tags/v${version}"
+```
+
+The tag starts a release-profile V3 conformance gate on Linux, macOS, and
+Windows. Every public release, package-registry, and tap mutation waits for
+that exact tag SHA to pass. Pre-publication jobs may still upload private
+Actions evidence and update the workflow's security check or issue.
+
+If a publish partially fails, use **Re-run failed jobs** on the original workflow
+run. Do not re-run all jobs or create another tag for the same version. The
+workflow verifies an already-published package before continuing. Immediately
+before every public mutation it also rereads the complete GitHub release,
+crates.io, and npm version inventories. A delayed run cannot publish or promote
+behind a newer version; if its exact GitHub release is already stable, the
+workflow verifies it without moving GitHub Latest backward.
+
+A release is stable only after the exact version and contents are confirmed on
+crates.io, npm, the Homebrew tap, and the non-prerelease GitHub release. Until
+all four agree, treat it as an incomplete release.
+
 ## Getting Help
 
 - Join our [Discussions](https://github.com/hooklistener/hooklistener-cli/discussions)

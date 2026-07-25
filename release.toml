@@ -1,9 +1,15 @@
-# cargo-release configuration
-# Usage: cargo release <version>  (e.g. cargo release 0.3.15)
+# cargo-release configuration for preparing a version-bump PR.
+# Usage on a release branch: cargo release <version> --execute
 # Install: cargo install cargo-release
+#
+# This helper may update and commit Cargo.toml/Cargo.lock locally. It must not
+# tag, push, or publish. Update npm/packages/hooklistener/package.json to the
+# same version, review the complete diff, and send the version bump through a
+# normal pull request. Create the release tag from the merged commit only after
+# the repository and release-environment controls in CONTRIBUTING.md pass.
 
-# Create and push the git tag
-tag = true
+# Tags are created separately from the exact merged commit.
+tag = false
 tag-prefix = ""
 tag-name = "v{{version}}"
 tag-message = "Release v{{version}}"
@@ -11,8 +17,8 @@ tag-message = "Release v{{version}}"
 # Commit the version bump
 pre-release-commit-message = "Release v{{version}}"
 
-# Push commit and tag to remote
-push = true
+# A protected-main pull request is the only path to the remote.
+push = false
 
 # Run cargo publish (we let CI handle publishing instead)
 publish = false

@@ -3313,9 +3313,25 @@ mod tests {
 
         let curl = App::generate_curl(&request);
 
-        assert!(curl.contains("--request 'POST'\\''; touch /tmp/method #'"));
-        assert!(curl.contains("--url 'https://example.com/'\\''$(touch /tmp/url)'"));
-        assert!(curl.contains("--header 'x-'\\''header: value'\\''; touch /tmp/header #'"));
+        #[cfg(not(windows))]
+        let expected = [
+            "--request 'POST'\\''; touch /tmp/method #'",
+            "--url 'https://example.com/'\\''$(touch /tmp/url)'",
+            "--header 'x-'\\''header: value'\\''; touch /tmp/header #'",
+        ];
+        #[cfg(windows)]
+        let expected = [
+            "--request 'POST''; touch /tmp/method #'",
+            "--url 'https://example.com/''$(touch /tmp/url)'",
+            "--header 'x-''header: value''; touch /tmp/header #'",
+        ];
+
+        for argument in expected {
+            assert!(
+                curl.contains(argument),
+                "generated curl missing {argument:?}: {curl}"
+            );
+        }
     }
 
     #[test]
@@ -3516,10 +3532,10 @@ mod tests {
     #[test]
     fn available_update_persists_after_tick() {
         let mut app = App::with_config(make_config());
-        app.available_update = Some("1.8.0".to_string());
+        app.available_update = Some("1.9.0".to_string());
 
         app.tick();
 
-        assert_eq!(app.available_update.as_deref(), Some("1.8.0"));
+        assert_eq!(app.available_update.as_deref(), Some("1.9.0"));
     }
 }
