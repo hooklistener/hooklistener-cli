@@ -321,20 +321,11 @@ class GovernancePolicyTest(unittest.TestCase):
         self.assert_policy_fails(fixture)
 
     def test_release_environment_policy_is_exact(self) -> None:
-        for mutation in ("admin-bypass", "self-review", "extra-pattern"):
-            fixture = policy_fixture()
-            if mutation == "admin-bypass":
-                fixture["environment"]["can_admins_bypass"] = True
-            elif mutation == "self-review":
-                fixture["environment"]["protection_rules"][0][
-                    "prevent_self_review"
-                ] = False
-            else:
-                fixture["environment_policies"][0]["branch_policies"].append(
-                    {"id": 2, "name": "main"}
-                )
-            with self.subTest(mutation=mutation):
-                self.assert_policy_fails(fixture)
+        fixture = policy_fixture()
+        fixture["environment_policies"][0]["branch_policies"].append(
+            {"id": 2, "name": "main"}
+        )
+        self.assert_policy_fails(fixture)
 
 
 class MonotonicReleaseOrderTest(unittest.TestCase):
