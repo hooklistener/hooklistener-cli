@@ -111,8 +111,15 @@ jobs:
         uses: dtolnay/rust-toolchain@387aeee55b189f024a4f6d94890c5b18d73339cc # 1.92.0
         with:
           targets: ${{ matrix.target }}
+      # rust-cache keys on `runner.os`, which is "Linux" for both ubuntu-latest
+      # and the ubuntu-22.04 image the release build pins for its glibc floor.
+      # Without the image in the key, a job restores C dependencies (aws-lc-sys)
+      # compiled against a different glibc and the link fails on undefined
+      # __isoc23_* symbols.
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.os }}
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }} --locked
       - name: Upload artifact

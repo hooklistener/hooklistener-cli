@@ -881,6 +881,21 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotEqual(dry_run, -1)
         self.assertLess(cleanliness, dry_run)
 
+    def test_build_caches_are_scoped_to_the_runner_image(self) -> None:
+        # CI builds Linux on ubuntu-latest while the release pins ubuntu-22.04
+        # for its glibc floor. rust-cache keys on `runner.os` ("Linux" for both)
+        # and the job id ("build" in both workflows), so without the image in the
+        # key one job restores C artifacts (aws-lc-sys) built against a different
+        # glibc and linking fails on undefined __isoc23_* symbols.
+        for workflow, label in ((self.ci, "ci"), (self.release, "release")):
+            body = job_body(workflow, "build")
+            with self.subTest(workflow=label):
+                cache = body.find("Swatinem/rust-cache@")
+                self.assertNotEqual(cache, -1)
+                self.assertIn("key: ${{ matrix.os }}", body[cache:])
+
+        self.assertIn("os: ubuntu-22.04", job_body(self.release, "build"))
+
     def test_every_release_asset_policy_is_exact_and_unique(self) -> None:
         expected = {
             "SHA256SUMS.txt",
