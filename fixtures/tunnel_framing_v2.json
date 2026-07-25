@@ -6,6 +6,10 @@
   "max_raw_chunk_bytes": 47000,
   "queue_depth_frames": 1,
   "backpressure": "per_frame_ack",
+  "max_json_depth": 16,
+  "max_json_structural_nodes": 65536,
+  "max_json_primitive_bytes": 256,
+  "max_response_headers": 4096,
   "sample_payload": {
     "request_id": "22222222-2222-4222-8222-222222222222",
     "headers": [

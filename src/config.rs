@@ -32,6 +32,9 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
+        #[cfg(windows)]
+        let _config_file_guard = ConfigFileGuard::acquire()?;
+
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -182,6 +185,90 @@ impl Config {
     }
 }
 
+#[cfg(windows)]
+struct ConfigFileGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    // Win32 mutex ownership belongs to the thread that successfully waited.
+    _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(windows)]
+impl ConfigFileGuard {
+    fn acquire() -> std::io::Result<Self> {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+        // A fixed per-session name coordinates every Hooklistener CLI process even when
+        // the same config path is spelled differently. CreateMutexW atomically creates
+        // the mutex or opens the existing kernel object.
+        // SAFETY: the security attributes are optional, the mutex is not initially
+        // owned, and the macro provides a static NUL-terminated UTF-16 string.
+        let handle = unsafe {
+            CreateMutexW(
+                std::ptr::null(),
+                0,
+                windows_sys::w!("Local\\Hooklistener.Config.File.v1"),
+            )
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        const WAIT_MS: u32 = 30_000;
+
+        // SAFETY: handle is a live mutex handle and remains owned by this function.
+        match unsafe { WaitForSingleObject(handle, WAIT_MS) } {
+            WAIT_OBJECT_0 => Ok(Self {
+                handle,
+                _not_send_or_sync: std::marker::PhantomData,
+            }),
+            WAIT_ABANDONED => {
+                tracing::warn!("recovering an abandoned Windows config file mutex");
+                Ok(Self {
+                    handle,
+                    _not_send_or_sync: std::marker::PhantomData,
+                })
+            }
+            status => {
+                // Capture WAIT_FAILED before CloseHandle can overwrite last-error.
+                let error = if status == WAIT_FAILED {
+                    std::io::Error::last_os_error()
+                } else if status == WAIT_TIMEOUT {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for the Windows config file mutex",
+                    )
+                } else {
+                    std::io::Error::other(format!(
+                        "unexpected Windows config mutex wait status: {status:#x}"
+                    ))
+                };
+
+                // SAFETY: handle is live and ownership was not acquired.
+                let _ = unsafe { CloseHandle(handle) };
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConfigFileGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+
+        // SAFETY: the guard cannot move across threads and owns this live mutex handle.
+        // Drop must not panic; release first, then close the process-local handle.
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn read_private_config_file(path: &Path) -> Result<String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -223,6 +310,11 @@ fn replace_file_windows(temp_path: &Path, path: &Path) -> Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
     };
+
+    // ReplaceFileW has documented partial-failure states when replacements overlap.
+    // Serialize the complete replacement and recovery sequence with config reads and
+    // replacements in every Hooklistener CLI process in this Windows session.
+    let _config_file_guard = ConfigFileGuard::acquire()?;
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str().encode_wide().chain(Some(0)).collect()
@@ -312,7 +404,8 @@ mod tests {
     use chrono::Duration;
     use std::sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     };
     use std::thread;
     use tempfile::TempDir;
@@ -523,25 +616,35 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn native_replace_preserves_destination_attributes() {
+    fn native_replace_rejects_readonly_destination_without_corruption() {
         let dir = TempDir::new().unwrap();
         let path = config_path_in(&dir);
-        Config::default().save_to(&path).unwrap();
+        let old_config = Config {
+            access_token: Some("old_token".to_string()),
+            ..Config::default()
+        };
+        old_config.save_to(&path).unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_readonly(true);
         fs::set_permissions(&path, permissions).unwrap();
 
-        Config {
+        let result = Config {
             access_token: Some("new_token".to_string()),
             ..Config::default()
         }
-        .save_to(&path)
-        .unwrap();
+        .save_to(&path);
 
+        assert!(result.is_err());
         assert!(fs::metadata(&path).unwrap().permissions().readonly());
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_readonly(false);
         fs::set_permissions(&path, permissions).unwrap();
+
+        assert_eq!(
+            Config::load_from(&path).unwrap().access_token.as_deref(),
+            Some("old_token")
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
@@ -563,26 +666,59 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_saves_only_expose_complete_json() {
+    fn concurrent_saves_and_loads_only_expose_complete_configs() {
         const WRITERS: usize = 12;
 
         let dir = TempDir::new().unwrap();
         let path = Arc::new(config_path_in(&dir));
-        Config::default().save_to(&path).unwrap();
-        let barrier = Arc::new(Barrier::new(WRITERS + 1));
+        Config {
+            access_token: Some("initial".to_string()),
+            latest_known_version: Some("x".repeat(32 * 1024)),
+            ..Config::default()
+        }
+        .save_to(&path)
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(WRITERS));
         let writing = Arc::new(AtomicBool::new(true));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (reader_ready_tx, reader_ready_rx) = mpsc::sync_channel(0);
 
         let reader_path = Arc::clone(&path);
-        let reader_barrier = Arc::clone(&barrier);
         let reader_writing = Arc::clone(&writing);
+        let reader_reads = Arc::clone(&reads);
         let reader = thread::spawn(move || {
-            reader_barrier.wait();
+            let mut reader_ready_tx = Some(reader_ready_tx);
             while reader_writing.load(Ordering::Acquire) {
-                let contents = fs::read_to_string(reader_path.as_ref()).unwrap();
-                serde_json::from_str::<Config>(&contents).unwrap();
+                #[cfg(windows)]
+                {
+                    let config = Config::load_from(reader_path.as_ref()).unwrap();
+                    let token = config.access_token.as_deref().unwrap();
+                    assert!(token == "initial" || token.starts_with("writer-"));
+                    assert_eq!(
+                        config.latest_known_version.as_deref().map(str::len),
+                        Some(32 * 1024)
+                    );
+                }
+
+                #[cfg(not(windows))]
+                {
+                    let contents = fs::read_to_string(reader_path.as_ref()).unwrap();
+                    serde_json::from_str::<Config>(&contents).unwrap();
+                }
+
+                reader_reads.fetch_add(1, Ordering::Release);
+                if let Some(reader_ready_tx) = reader_ready_tx.take() {
+                    reader_ready_tx.send(()).unwrap();
+                }
                 thread::yield_now();
             }
         });
+
+        // Keep the reader hot before releasing the writers together. This prevents a
+        // scheduler from letting the test finish without exercising concurrent loads.
+        reader_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
 
         let writers: Vec<_> = (0..WRITERS)
             .map(|writer| {
@@ -606,6 +742,7 @@ mod tests {
         }
         writing.store(false, Ordering::Release);
         reader.join().unwrap();
+        assert!(reads.load(Ordering::Acquire) > 0);
 
         let final_contents = fs::read_to_string(path.as_ref()).unwrap();
         serde_json::from_str::<Config>(&final_contents).unwrap();

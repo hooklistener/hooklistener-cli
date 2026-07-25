@@ -5,6 +5,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Fully qualified Git ref whose source is being qualified
+        required: true
+        type: string
+      source_sha:
+        description: Immutable Git commit to check out and qualify
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -18,29 +28,73 @@ jobs:
         include:
           - platform: linux
             os: ubuntu-latest
+            binary: target/release/hooklistener
           - platform: macos
             os: macos-latest
+            binary: target/release/hooklistener
           - platform: windows
             os: windows-latest
+            binary: target/release/hooklistener.exe
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact source identity
+        shell: bash
+        env:
+          EXPECTED_REF: ${{ inputs.source_ref || github.ref }}
+          EXPECTED_SHA: ${{ inputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${EXPECTED_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Conformance source SHA must be a full 40-character Git commit."
+            exit 1
+          fi
+
+          expected_sha="$(printf '%s' "${EXPECTED_SHA}" | tr '[:upper:]' '[:lower:]')"
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+            echo "::error::Checked-out source ${actual_sha} does not match ${EXPECTED_SHA}."
+            exit 1
+          fi
+
+          if [[ "${EXPECTED_REF}" == refs/tags/* ]]; then
+            if ! git show-ref --verify --quiet "${EXPECTED_REF}"; then
+              echo "::error::Release conformance ref ${EXPECTED_REF} is not an exact tag."
+              exit 1
+            fi
+
+            ref_sha="$(git rev-parse "${EXPECTED_REF}^{commit}")"
+            if [[ "${ref_sha}" != "${expected_sha}" ]]; then
+              echo "::error::Release conformance tag does not resolve to ${EXPECTED_SHA}."
+              exit 1
+            fi
+          fi
+      - uses: dtolnay/rust-toolchain@387aeee55b189f024a4f6d94890c5b18d73339cc # 1.92.0
         with:
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Validate bounded relay and lifecycle contracts
-        run: cargo test --locked tunnel
-      - name: Run authenticated human and JSON flows
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate protocol v3 streaming contracts
+        run: python3 scripts/verify_tunnel_v3_release_tests.py
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Run release-profile authenticated human and JSON flows
         env:
+          HOOKLISTENER_CONFORMANCE_BINARY: ${{ github.workspace }}/${{ matrix.binary }}
+          HOOKLISTENER_CLI_GIT_SHA: ${{ inputs.source_sha || github.sha }}
           HOOKLISTENER_CONFORMANCE_OUTPUT: ${{ runner.temp }}/phase1-${{ matrix.platform }}.json
           HOOKLISTENER_CONFORMANCE_PLATFORM: ${{ matrix.platform }}
-        run: cargo test --locked --test tunnel_phase1_conformance -- --nocapture
+        run: cargo test --release --locked --test tunnel_phase1_conformance -- --nocapture
       - name: Upload platform receipt
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: phase1-${{ matrix.platform }}
+          name: phase1-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/phase1-${{ matrix.platform }}.json
           if-no-files-found: error
           retention-days: 30

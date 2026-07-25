@@ -279,6 +279,12 @@ pub struct RelayTicket {
     pub scope: String,
     pub plan_fingerprint: String,
     pub expires_at: String,
+    #[serde(default = "default_tunnel_protocol_versions")]
+    pub supported_protocol_versions: Vec<u64>,
+}
+
+fn default_tunnel_protocol_versions() -> Vec<u64> {
+    vec![2]
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2034,6 +2040,32 @@ mod tests {
         assert_eq!(ticket.scope, "relay:listen");
         assert_eq!(ticket.plan_fingerprint, "fingerprint");
         assert_eq!(ticket.expires_at, "2026-07-14T20:01:00Z");
+        assert_eq!(ticket.supported_protocol_versions, vec![2]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_exchange_parses_tunnel_protocol_capabilities() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v1/tunnel/relay-tickets")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"ticket":"hktr_once","scope":"relay:tunnel","plan_fingerprint":"fingerprint","expires_at":"2026-07-14T20:01:00Z","supported_protocol_versions":[3,2]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let ticket = issue_relay_ticket(
+            "access-secret",
+            &server.url(),
+            &serde_json::json!({"mode": "direct_response"}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ticket.supported_protocol_versions, vec![3, 2]);
         mock.assert_async().await;
     }
 

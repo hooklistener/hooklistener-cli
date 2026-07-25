@@ -50,7 +50,10 @@ impl TestHome {
     }
 
     fn command(&self, api_url: &str, args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hooklistener"));
+        let binary = std::env::var_os("HOOKLISTENER_CONFORMANCE_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_hooklistener")));
+        let mut command = Command::new(binary);
         command
             .args(["--color", "never", "--log-dir"])
             .arg(self.root.join("logs"))
@@ -115,8 +118,11 @@ fn assert_json_receipt(stdout: &str, operation: &str) -> Value {
 fn write_platform_receipt(path: &Path) {
     let platform = std::env::var("HOOKLISTENER_CONFORMANCE_PLATFORM")
         .unwrap_or_else(|_| std::env::consts::OS.to_string());
+    let service_git_sha = std::env::var("HOOKLISTENER_SERVICE_GIT_SHA").ok();
+    let cli_git_sha = std::env::var("HOOKLISTENER_CLI_GIT_SHA").ok();
+    let run_attempt = std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_else(|_| "1".to_string());
     let evidence_id = std::env::var("GITHUB_RUN_ID")
-        .map(|run| format!("{run}-{platform}"))
+        .map(|run| format!("{run}-{run_attempt}-{platform}"))
         .unwrap_or_else(|_| format!("local-{platform}"));
     let receipt = json!({
         "$schema": "hooklistener.tunnel.cli-platform-evidence/1",
@@ -126,7 +132,11 @@ fn write_platform_receipt(path: &Path) {
         "flows": {"human": "passed", "json": "passed"},
         "commands": ["tunnel prepare", "tunnel list"],
         "contract_schema_major": 1,
-        "evidence_id": evidence_id
+        "evidence_id": evidence_id,
+        "provenance": {
+            "service_git_sha": service_git_sha,
+            "cli_git_sha": cli_git_sha
+        }
     });
 
     if let Some(parent) = path.parent() {

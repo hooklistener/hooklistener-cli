@@ -22,21 +22,27 @@ use tokio_tungstenite::{
     },
 };
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::api;
 use crate::target_policy::TargetPolicy;
+use crate::tunnel_v3;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
+type WsRead = futures_util::stream::SplitStream<WsStream>;
 
-// Protocol v2 historically permits an envelope large enough for a 256 MiB body
-// encoded as base64. Keep that wire-format ceiling for compatibility, while the
-// local admission and buffering limits below remain deliberately much smaller.
-const TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 402_653_184;
+// Protocol v2 carries logical JSON streams as bounded 64 KiB WebSocket frames.
+// This must match limits.max_stream_bytes in the service join contract.
+const TUNNEL_MAX_STREAM_BYTES: usize = 67_108_864;
 const TUNNEL_PROTOCOL_VERSION: u64 = 2;
 const TUNNEL_MAX_FRAME_BYTES: usize = 65_536;
 const TUNNEL_MAX_RAW_CHUNK_BYTES: usize = 47_000;
+const TUNNEL_MAX_JSON_DEPTH: usize = 16;
+const TUNNEL_MAX_JSON_STRUCTURAL_NODES: usize = 65_536;
+const TUNNEL_MAX_JSON_PRIMITIVE_BYTES: usize = 256;
+const TUNNEL_MAX_RESPONSE_HEADERS: usize = 4_096;
 const LEGACY_MAX_REQUEST_BODY_BYTES: usize = 10_485_760;
 const LEGACY_MAX_RESPONSE_BODY_BYTES: usize = 7_000_000;
 const LEGACY_MAX_RESPONSE_HEADER_BYTES: usize = 1_048_576;
@@ -50,7 +56,7 @@ const LOCAL_WORK_MAX_BYTES: usize = LOCAL_MAX_TUNNEL_BODY_BYTES;
 const INBOUND_STREAM_MAX_COUNT: usize = 16;
 const INBOUND_STREAM_MAX_BYTES: usize = 32 * 1024 * 1024;
 const RESPONSE_BUFFER_MAX_BYTES: usize = LOCAL_MAX_TUNNEL_BODY_BYTES;
-const _: () = assert!(INBOUND_STREAM_MAX_BYTES < TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES);
+const _: () = assert!(INBOUND_STREAM_MAX_BYTES < TUNNEL_MAX_STREAM_BYTES);
 const OUTBOUND_CONTROL_MAX_COUNT: usize = 256;
 const OUTBOUND_RESPONSE_MAX_COUNT: usize = 256;
 const OUTBOUND_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -108,6 +114,23 @@ impl PriorityWriter {
         self.enqueue_channel(message, false).await
     }
 
+    async fn control_v3(&self, message: tunnel_v3::ControlMessage) -> Result<()> {
+        self.enqueue_v3_control(message, true).await
+    }
+
+    fn try_control_v3(&self, message: tunnel_v3::ControlMessage) -> Result<()> {
+        let encoded = tunnel_v3::encode_client_control(&message, TUNNEL_MAX_FRAME_BYTES)?;
+        self.try_enqueue(Message::Text(encoded.into()), true)
+    }
+
+    async fn response_control_v3(&self, message: tunnel_v3::ControlMessage) -> Result<()> {
+        self.enqueue_v3_control(message, false).await
+    }
+
+    async fn binary_response(&self, message: Vec<u8>) -> Result<()> {
+        self.enqueue(Message::Binary(message.into()), false).await
+    }
+
     async fn pong(&self, data: Bytes) -> Result<()> {
         self.enqueue(Message::Pong(data), true).await
     }
@@ -119,6 +142,15 @@ impl PriorityWriter {
         }
         self.enqueue(Message::Text(String::from_utf8(json)?.into()), control)
             .await
+    }
+
+    async fn enqueue_v3_control(
+        &self,
+        message: tunnel_v3::ControlMessage,
+        control: bool,
+    ) -> Result<()> {
+        let encoded = tunnel_v3::encode_client_control(&message, TUNNEL_MAX_FRAME_BYTES)?;
+        self.enqueue(Message::Text(encoded.into()), control).await
     }
 
     async fn enqueue(&self, message: Message, control: bool) -> Result<()> {
@@ -140,6 +172,30 @@ impl PriorityWriter {
             .send(item)
             .await
             .map_err(|_| anyhow!("Tunnel writer stopped"))
+    }
+
+    fn try_enqueue(&self, message: Message, control: bool) -> Result<()> {
+        let size = message.len().max(1);
+        let permits: u32 = size
+            .try_into()
+            .map_err(|_| anyhow!("Outbound message byte count is invalid"))?;
+        let bytes = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(permits)
+            .map_err(|_| anyhow!("Tunnel writer byte queue is full"))?;
+        let item = OutboundItem {
+            message,
+            _bytes: bytes,
+        };
+        let sender = if control {
+            &self.control_tx
+        } else {
+            &self.response_tx
+        };
+        sender
+            .try_send(item)
+            .map_err(|_| anyhow!("Tunnel writer control queue is unavailable"))
     }
 
     #[cfg(test)]
@@ -301,6 +357,178 @@ impl RelayRuntime {
     }
 }
 
+fn complete_tunnel_worker(
+    completion: std::result::Result<
+        (tokio::task::Id, (String, Result<()>)),
+        tokio::task::JoinError,
+    >,
+    runtime: &mut RelayRuntime,
+) {
+    match completion {
+        Ok((_task_id, (request_id, result))) => {
+            runtime.active_deliveries.remove(&request_id);
+            if let Err(error) = result {
+                error!(request_id = %request_id, error = %error, "Local delivery task failed");
+            }
+        }
+        Err(error) => {
+            let task_id = error.id();
+            let request_id = runtime
+                .active_deliveries
+                .iter()
+                .find_map(|(request_id, active)| {
+                    (active.abort.id() == task_id).then(|| request_id.clone())
+                });
+
+            if let Some(request_id) = request_id {
+                runtime.active_deliveries.remove(&request_id);
+                if !error.is_cancelled() {
+                    error!(request_id = %request_id, error = %error, "Local delivery task panicked");
+                }
+            } else if !error.is_cancelled() {
+                error!(error = %error, "Local delivery task panicked");
+            }
+        }
+    }
+}
+
+fn reap_ready_tunnel_workers(runtime: &mut RelayRuntime) -> usize {
+    let mut reaped = 0;
+
+    while let Some(completion) = runtime.workers.try_join_next_with_id() {
+        complete_tunnel_worker(completion, runtime);
+        reaped += 1;
+    }
+
+    reaped
+}
+
+struct ActiveV3Delivery {
+    abort: AbortHandle,
+    phase: Arc<AtomicU8>,
+    response_tx: mpsc::Sender<tunnel_v3::WindowUpdate>,
+}
+
+struct V3RelayRuntime {
+    requests: tunnel_v3::RequestStreams,
+    response_window: tunnel_v3::ConnectionSendWindow,
+    work_count: Arc<Semaphore>,
+    workers: JoinSet<(Uuid, Result<()>)>,
+    active_deliveries: HashMap<Uuid, ActiveV3Delivery>,
+    auto_drain_requested: bool,
+}
+
+impl V3RelayRuntime {
+    fn new(topic: String, limits: tunnel_v3::StreamingLimits) -> Result<Self> {
+        Ok(Self {
+            requests: tunnel_v3::RequestStreams::new(topic, limits)?,
+            response_window: tunnel_v3::ConnectionSendWindow::new(
+                limits.connection_window_bytes,
+                limits.connection_window_items,
+            ),
+            work_count: Arc::new(Semaphore::new(
+                limits.max_active_local_forwards.min(LOCAL_WORK_MAX_COUNT),
+            )),
+            workers: JoinSet::new(),
+            active_deliveries: HashMap::new(),
+            auto_drain_requested: false,
+        })
+    }
+}
+
+async fn complete_v3_worker(
+    completion: std::result::Result<(tokio::task::Id, (Uuid, Result<()>)), tokio::task::JoinError>,
+    runtime: &mut V3RelayRuntime,
+    writer: &PriorityWriter,
+    tunnel_topic: &str,
+) -> Result<()> {
+    match completion {
+        Ok((_task_id, (stream_id, result))) => {
+            let active = runtime.active_deliveries.remove(&stream_id);
+            if runtime.requests.contains(stream_id) {
+                runtime.requests.cancel(stream_id, "local_delivery_ended");
+                let outcome = active
+                    .as_ref()
+                    .map(|active| active.phase.load(Ordering::Acquire))
+                    .and_then(cancellation_classification)
+                    .map(|(_code, outcome)| outcome)
+                    .unwrap_or("outcome_unknown");
+                writer
+                    .control_v3(v3_abort_message(
+                        tunnel_topic,
+                        stream_id,
+                        "request",
+                        "local_delivery_ended",
+                        outcome,
+                    ))
+                    .await?;
+            }
+            if let Err(error) = result {
+                let error = bounded_control_neutral_log_text(&error.to_string());
+                error!(stream_id = %stream_id, error = %error, "Protocol v3 local delivery failed");
+            }
+        }
+        Err(error) => {
+            let task_id = error.id();
+            let stream_id = runtime
+                .active_deliveries
+                .iter()
+                .find_map(|(stream_id, active)| {
+                    (active.abort.id() == task_id).then_some(*stream_id)
+                });
+
+            if let Some(stream_id) = stream_id {
+                let active = runtime
+                    .active_deliveries
+                    .remove(&stream_id)
+                    .expect("matched active protocol v3 delivery");
+
+                if runtime.requests.contains(stream_id) {
+                    let code = if error.is_cancelled() {
+                        "local_delivery_cancelled"
+                    } else {
+                        "local_delivery_panicked"
+                    };
+                    let outcome = cancellation_classification(active.phase.load(Ordering::Acquire))
+                        .map(|(_code, outcome)| outcome)
+                        .unwrap_or("outcome_unknown");
+                    runtime.requests.cancel(stream_id, code);
+                    writer
+                        .control_v3(v3_abort_message(
+                            tunnel_topic,
+                            stream_id,
+                            "request",
+                            code,
+                            outcome,
+                        ))
+                        .await?;
+                }
+            }
+
+            if !error.is_cancelled() {
+                error!(error = %error, "Protocol v3 local delivery panicked");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn reap_ready_v3_workers(
+    runtime: &mut V3RelayRuntime,
+    writer: &PriorityWriter,
+    tunnel_topic: &str,
+) -> Result<usize> {
+    let mut reaped = 0;
+
+    while let Some(completion) = runtime.workers.try_join_next_with_id() {
+        complete_v3_worker(completion, runtime, writer, tunnel_topic).await?;
+        reaped += 1;
+    }
+
+    Ok(reaped)
+}
+
 struct LocalDelivery {
     request_id: String,
     method: String,
@@ -341,6 +569,194 @@ fn stream_error_message(topic: &str, stream_id: &str, code: &str) -> ChannelMess
         event: "tunnel_stream_error".to_string(),
         payload: serde_json::json!({"stream_id": stream_id, "code": code}),
         reference: None,
+    }
+}
+
+fn v3_control_message(
+    topic: &str,
+    event: &str,
+    payload: serde_json::Value,
+) -> tunnel_v3::ControlMessage {
+    tunnel_v3::ControlMessage {
+        join_ref: Some("1".to_string()),
+        reference: None,
+        topic: topic.to_string(),
+        event: event.to_string(),
+        payload,
+    }
+}
+
+fn v3_abort_message(
+    topic: &str,
+    stream_id: Uuid,
+    direction: &str,
+    code: &str,
+    outcome: &str,
+) -> tunnel_v3::ControlMessage {
+    v3_control_message(
+        topic,
+        "tunnel_stream_abort",
+        serde_json::json!({
+            "stream_id": stream_id,
+            "direction": direction,
+            "code": code,
+            "outcome": outcome,
+        }),
+    )
+}
+
+fn v3_payload_stream_id(payload: &serde_json::Value) -> Result<Uuid> {
+    payload
+        .get("stream_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("Protocol v3 event is missing stream_id"))?
+        .parse()
+        .context("Protocol v3 event has an invalid stream_id")
+}
+
+fn admit_v3_response_window(
+    sender: &mpsc::Sender<tunnel_v3::WindowUpdate>,
+    update: tunnel_v3::WindowUpdate,
+) -> std::result::Result<(), &'static str> {
+    match sender.try_send(update) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err("response_window_overflow"),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err("response_window_receiver_closed"),
+    }
+}
+
+async fn enqueue_v3_response_chunk(
+    stream: &mut tunnel_v3::ResponseStream,
+    writer: &PriorityWriter,
+    response_rx: &mut mpsc::Receiver<tunnel_v3::WindowUpdate>,
+    data: &[u8],
+    local_deadline: tokio::time::Instant,
+) -> Result<()> {
+    loop {
+        let connection_credit = stream.connection_credit_notifier();
+        let connection_credit_available = connection_credit.notified();
+        tokio::pin!(connection_credit_available);
+        connection_credit_available.as_mut().enable();
+
+        match stream.try_encode_chunk(data) {
+            Ok(encoded) => return writer.binary_response(encoded).await,
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<tunnel_v3::WindowError>(),
+                    Some(tunnel_v3::WindowError::Backpressured)
+                ) =>
+            {
+                let remaining =
+                    local_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(anyhow!("deadline_exceeded"));
+                }
+
+                tokio::select! {
+                    update = response_rx.recv() => {
+                        let update = update.ok_or_else(|| anyhow!("Protocol v3 response stream stopped"))?;
+                        stream.acknowledge(update)?;
+                    }
+                    _ = &mut connection_credit_available => {}
+                    _ = tokio::time::sleep_until(local_deadline) => {
+                        return Err(anyhow!("deadline_exceeded"));
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn acknowledge_v3_response_window(
+    stream: &mut tunnel_v3::ResponseStream,
+    response_rx: &mut mpsc::Receiver<tunnel_v3::WindowUpdate>,
+    local_deadline: tokio::time::Instant,
+) -> Result<()> {
+    let remaining = local_deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(anyhow!("deadline_exceeded"));
+    }
+    let update = tokio::time::timeout(remaining, response_rx.recv())
+        .await
+        .map_err(|_| anyhow!("deadline_exceeded"))?
+        .ok_or_else(|| anyhow!("Protocol v3 response stream stopped"))?;
+    stream.acknowledge(update)
+}
+
+struct V3RequestBodyBridge {
+    request_body: reqwest::Body,
+    response_started: watch::Sender<bool>,
+    pump: tokio::task::JoinHandle<Result<()>>,
+}
+
+fn spawn_v3_request_body_bridge(
+    source: tunnel_v3::BodyPipeReceiver,
+    consumption_tx: mpsc::Sender<tunnel_v3::WindowUpdate>,
+) -> V3RequestBodyBridge {
+    // The extra handoff contains at most one negotiated chunk. The protocol
+    // pipe remains bounded by its byte/item windows, while this queue lets the
+    // pump retain ownership and drain safely if the local server responds
+    // before reqwest consumes the complete request body.
+    let (local_tx, local_rx) = mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(1);
+    let (response_started, response_started_rx) = watch::channel(false);
+    let pump = tokio::spawn(run_v3_request_body_pump(
+        source,
+        consumption_tx,
+        local_tx,
+        response_started_rx,
+    ));
+    let stream = futures_util::stream::unfold(local_rx, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+
+    V3RequestBodyBridge {
+        request_body: reqwest::Body::wrap_stream(stream),
+        response_started,
+        pump,
+    }
+}
+
+async fn run_v3_request_body_pump(
+    mut source: tunnel_v3::BodyPipeReceiver,
+    consumption_tx: mpsc::Sender<tunnel_v3::WindowUpdate>,
+    local_tx: mpsc::Sender<std::result::Result<Bytes, std::io::Error>>,
+    mut response_started: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut local_tx = Some(local_tx);
+
+    loop {
+        let chunk = match source.recv().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => return Ok(()),
+            Err(reason) => {
+                if let Some(sender) = local_tx.take() {
+                    let _ = sender.try_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        reason.clone(),
+                    )));
+                }
+                return Err(anyhow!(reason));
+            }
+        };
+
+        if let Some(sender) = local_tx.take()
+            && !*response_started.borrow()
+        {
+            let sent = tokio::select! {
+                biased;
+                _ = response_started.changed() => false,
+                result = sender.send(Ok(chunk.data)) => result.is_ok(),
+            };
+            if sent {
+                local_tx = Some(sender);
+            }
+        }
+
+        consumption_tx
+            .send(chunk.window)
+            .await
+            .map_err(|_| anyhow!("Protocol v3 request consumption reporter stopped"))?;
     }
 }
 
@@ -402,16 +818,27 @@ struct TunnelLimits {
     max_request_body_bytes: usize,
     max_response_body_bytes: usize,
     max_response_header_bytes: usize,
+    max_response_header_items: usize,
     ordered_response_headers: bool,
 }
 
 impl TunnelLimits {
     fn from_join_response(response: &serde_json::Value) -> Self {
         let limits = response.get("limits");
+        let framing = response.get("framing");
         let advertised_body_limit = json_limit(limits, "max_body_bytes");
         let body_limit = advertised_body_limit
             .unwrap_or(LEGACY_MAX_REQUEST_BODY_BYTES)
             .min(LOCAL_MAX_TUNNEL_BODY_BYTES);
+        let response_header_items = [
+            json_limit(limits, "max_response_header_items"),
+            json_limit(framing, "max_response_headers"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(TUNNEL_MAX_RESPONSE_HEADERS)
+        .min(TUNNEL_MAX_RESPONSE_HEADERS);
 
         Self {
             max_request_body_bytes: body_limit,
@@ -421,6 +848,7 @@ impl TunnelLimits {
             max_response_header_bytes: json_limit(limits, "max_response_header_bytes")
                 .unwrap_or(LEGACY_MAX_RESPONSE_HEADER_BYTES)
                 .min(LOCAL_MAX_RESPONSE_HEADER_BYTES),
+            max_response_header_items: response_header_items,
             ordered_response_headers: limits
                 .and_then(|limits| limits.get("response_headers_format"))
                 .and_then(|format| format.as_str())
@@ -431,6 +859,18 @@ impl TunnelLimits {
 
 fn json_limit(limits: Option<&serde_json::Value>, key: &str) -> Option<usize> {
     limits?.get(key)?.as_u64()?.try_into().ok()
+}
+
+fn optional_positive_limit_at_most(
+    contract: &serde_json::Value,
+    key: &str,
+    local_max: usize,
+) -> bool {
+    contract.get(key).is_none_or(|value| {
+        value
+            .as_u64()
+            .is_some_and(|limit| limit > 0 && limit <= local_max as u64)
+    })
 }
 
 fn tunnel_websocket_config() -> WebSocketConfig {
@@ -511,6 +951,42 @@ fn supported_tunnel_method(method: &str) -> Option<reqwest::Method> {
     reqwest::Method::from_bytes(method.as_bytes()).ok()
 }
 
+fn response_body_forbidden(method: &str, status: u16) -> bool {
+    method.eq_ignore_ascii_case("HEAD") || matches!(status, 204 | 205 | 304)
+}
+
+fn ensure_response_chunk_allowed(method: &str, status: u16) -> Result<()> {
+    if response_body_forbidden(method, status) {
+        Err(anyhow!(
+            "Local response included a body where HTTP forbids one"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn relayed_response_content_length(
+    method: &str,
+    status: u16,
+    content_length: Option<u64>,
+) -> Option<u64> {
+    if response_body_forbidden(method, status) {
+        Some(0)
+    } else {
+        content_length
+    }
+}
+
+fn valid_reset_content_length(headers: &reqwest::header::HeaderMap) -> bool {
+    let mut values = headers.get_all(reqwest::header::CONTENT_LENGTH).iter();
+
+    match (values.next(), values.next()) {
+        (None, None) => true,
+        (Some(value), None) => value.as_bytes() == b"0",
+        _ => false,
+    }
+}
+
 fn response_headers_to_map(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
@@ -556,6 +1032,27 @@ fn encode_response_body(bytes: &[u8]) -> (String, &'static str) {
 fn response_header_bytes(headers: &reqwest::header::HeaderMap) -> usize {
     headers.iter().fold(0usize, |total, (name, value)| {
         total.saturating_add(name.as_str().len() + value.as_bytes().len() + 4)
+    })
+}
+
+fn response_header_limit_error(
+    headers: &reqwest::header::HeaderMap,
+    limits: TunnelLimits,
+) -> Option<String> {
+    let item_count = headers.len();
+    if item_count > limits.max_response_header_items {
+        return Some(format!(
+            "Local response headers exceed tunnel item limit ({} > {})",
+            item_count, limits.max_response_header_items
+        ));
+    }
+
+    let header_bytes = response_header_bytes(headers);
+    (header_bytes > limits.max_response_header_bytes).then(|| {
+        format!(
+            "Local response headers exceed tunnel limit ({} > {} bytes)",
+            header_bytes, limits.max_response_header_bytes
+        )
     })
 }
 
@@ -919,6 +1416,20 @@ struct ChannelMessage {
     reference: Option<String>,
 }
 
+fn decode_channel_message(text: &str, protocol_v3: bool) -> Result<ChannelMessage> {
+    if protocol_v3 {
+        let message = tunnel_v3::decode_server_control(text)?;
+        Ok(ChannelMessage {
+            topic: message.topic,
+            event: message.event,
+            payload: message.payload,
+            reference: message.reference,
+        })
+    } else {
+        serde_json::from_str(text).map_err(Into::into)
+    }
+}
+
 const DIRECT_RESPONSE_MODE: &str = "direct_response";
 const CAPTURE_FORWARD_MODE: &str = "capture_forward";
 
@@ -957,7 +1468,7 @@ impl TunnelStreamAssembler {
             .ok_or_else(|| anyhow!("Framed stream is missing an id"))?
             .to_string();
         let total_bytes = json_usize(payload, "total_bytes")?;
-        if total_bytes > TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES {
+        if total_bytes > TUNNEL_MAX_STREAM_BYTES {
             return Err(anyhow!("Tunnel stream exceeds the advertised limit"));
         }
 
@@ -1063,7 +1574,7 @@ impl OutboundTunnelStream {
         payload: &serde_json::Value,
     ) -> Result<Self> {
         let encoded = serde_json::to_vec(payload)?;
-        if encoded.len() > TUNNEL_MAX_WEBSOCKET_MESSAGE_BYTES {
+        if encoded.len() > TUNNEL_MAX_STREAM_BYTES {
             return Err(anyhow!("Tunnel stream exceeds the advertised limit"));
         }
 
@@ -1188,16 +1699,57 @@ fn validate_framing_contract(response: &serde_json::Value) -> Result<()> {
     let framing = response
         .get("framing")
         .ok_or_else(|| anyhow!("Server did not advertise bounded tunnel framing"))?;
+    let limits = response
+        .get("limits")
+        .ok_or_else(|| anyhow!("Server did not advertise bounded tunnel limits"))?;
 
     if framing.get("version").and_then(serde_json::Value::as_u64) != Some(TUNNEL_PROTOCOL_VERSION)
+        || framing.get("transport").and_then(serde_json::Value::as_str) != Some("framed")
+        || framing
+            .get("frame_encoding")
+            .and_then(serde_json::Value::as_str)
+            != Some("base64url")
         || framing
             .get("max_frame_bytes")
             .and_then(serde_json::Value::as_u64)
             != Some(TUNNEL_MAX_FRAME_BYTES as u64)
         || framing
+            .get("max_raw_chunk_bytes")
+            .and_then(serde_json::Value::as_u64)
+            != Some(TUNNEL_MAX_RAW_CHUNK_BYTES as u64)
+        || framing
             .get("queue_depth_frames")
             .and_then(serde_json::Value::as_u64)
             != Some(1)
+        || framing
+            .get("backpressure")
+            .and_then(serde_json::Value::as_str)
+            != Some("per_frame_ack")
+        || !optional_positive_limit_at_most(framing, "max_json_depth", TUNNEL_MAX_JSON_DEPTH)
+        || !optional_positive_limit_at_most(
+            framing,
+            "max_json_structural_nodes",
+            TUNNEL_MAX_JSON_STRUCTURAL_NODES,
+        )
+        || !optional_positive_limit_at_most(
+            framing,
+            "max_json_primitive_bytes",
+            TUNNEL_MAX_JSON_PRIMITIVE_BYTES,
+        )
+        || !optional_positive_limit_at_most(
+            framing,
+            "max_response_headers",
+            TUNNEL_MAX_RESPONSE_HEADERS,
+        )
+        || limits
+            .get("max_stream_bytes")
+            .and_then(serde_json::Value::as_u64)
+            != Some(TUNNEL_MAX_STREAM_BYTES as u64)
+        || !optional_positive_limit_at_most(
+            limits,
+            "max_response_header_items",
+            TUNNEL_MAX_RESPONSE_HEADERS,
+        )
     {
         return Err(anyhow!(
             "Server advertised an incompatible framing contract"
@@ -1211,15 +1763,32 @@ fn listen_join_payload() -> serde_json::Value {
     serde_json::json!({"mode": CAPTURE_FORWARD_MODE})
 }
 
+#[cfg(test)]
 fn tunnel_join_payload(
     local_port: u16,
     organization_id: Option<&str>,
     slug: Option<&str>,
     resume_token: Option<&str>,
 ) -> serde_json::Value {
+    tunnel_join_payload_for_version(
+        local_port,
+        organization_id,
+        slug,
+        resume_token,
+        TUNNEL_PROTOCOL_VERSION,
+    )
+}
+
+fn tunnel_join_payload_for_version(
+    local_port: u16,
+    organization_id: Option<&str>,
+    slug: Option<&str>,
+    resume_token: Option<&str>,
+    protocol_version: u64,
+) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "mode": DIRECT_RESPONSE_MODE,
-        "protocol_version": TUNNEL_PROTOCOL_VERSION,
+        "protocol_version": protocol_version,
         "local_port": local_port,
     });
 
@@ -1237,6 +1806,18 @@ fn tunnel_join_payload(
     }
 
     payload
+}
+
+fn selected_tunnel_protocol(supported_protocol_versions: &[u64]) -> Result<u64> {
+    if supported_protocol_versions.contains(&tunnel_v3::VERSION.into()) {
+        Ok(tunnel_v3::VERSION.into())
+    } else if supported_protocol_versions.contains(&TUNNEL_PROTOCOL_VERSION) {
+        Ok(TUNNEL_PROTOCOL_VERSION)
+    } else {
+        Err(anyhow!(
+            "Relay handshake rejected: service and CLI have no common tunnel protocol version"
+        ))
+    }
 }
 
 fn validate_join_mode(response: &serde_json::Value, expected: &str) -> Result<()> {
@@ -2240,7 +2821,12 @@ impl TunnelForwarder {
             ));
         }
 
-        let ws_url = build_ws_url(&self.base_url, &relay_ticket.ticket, "tunnel/websocket");
+        let protocol_version = selected_tunnel_protocol(&relay_ticket.supported_protocol_versions)?;
+        let protocol_v3 = protocol_version == u64::from(tunnel_v3::VERSION);
+        let mut ws_url = build_ws_url(&self.base_url, &relay_ticket.ticket, "tunnel/websocket");
+        if protocol_v3 {
+            ws_url.push_str("&vsn=2.0.0");
+        }
 
         debug!(
             endpoint = %websocket_endpoint(&self.base_url, "tunnel/websocket"),
@@ -2273,11 +2859,12 @@ impl TunnelForwarder {
         let (mut write, mut read) = ws_stream.split();
 
         // Join the tunnel:connect channel with local_port, organization_id, and optional slug
-        let join_payload = tunnel_join_payload(
+        let join_payload = tunnel_join_payload_for_version(
             self.local_port,
             self.org_id.as_deref(),
             self.slug.as_deref(),
             resume_token.as_deref(),
+            protocol_version,
         );
 
         if resume_token.is_some() {
@@ -2286,14 +2873,25 @@ impl TunnelForwarder {
             info!(slug = %slug, "Requesting static tunnel");
         }
 
-        let join_message = ChannelMessage {
-            topic: "tunnel:connect".to_string(),
-            event: "phx_join".to_string(),
-            payload: join_payload,
-            reference: Some("1".to_string()),
+        let join_json = if protocol_v3 {
+            tunnel_v3::encode_client_control(
+                &tunnel_v3::ControlMessage {
+                    join_ref: None,
+                    reference: Some("1".to_string()),
+                    topic: "tunnel:connect".to_string(),
+                    event: "phx_join".to_string(),
+                    payload: join_payload,
+                },
+                TUNNEL_MAX_FRAME_BYTES,
+            )?
+        } else {
+            serde_json::to_string(&ChannelMessage {
+                topic: "tunnel:connect".to_string(),
+                event: "phx_join".to_string(),
+                payload: join_payload,
+                reference: Some("1".to_string()),
+            })?
         };
-
-        let join_json = serde_json::to_string(&join_message)?;
         write
             .send(Message::Text(join_json.into()))
             .await
@@ -2306,14 +2904,16 @@ impl TunnelForwarder {
             max_request_body_bytes: LEGACY_MAX_REQUEST_BODY_BYTES,
             max_response_body_bytes: LEGACY_MAX_RESPONSE_BODY_BYTES,
             max_response_header_bytes: LEGACY_MAX_RESPONSE_HEADER_BYTES,
+            max_response_header_items: TUNNEL_MAX_RESPONSE_HEADERS,
             ordered_response_headers: false,
         };
+        let mut streaming_limits = None;
 
         while !joined {
             match tokio::time::timeout(Duration::from_secs(10), read.next()).await {
                 Ok(Some(msg_result)) => match msg_result {
                     Ok(Message::Text(text)) => {
-                        let msg: ChannelMessage = serde_json::from_str(&text)?;
+                        let msg = decode_channel_message(&text, protocol_v3)?;
                         if msg.event == "phx_reply"
                             && msg.reference.as_deref() == Some("1")
                             && let Some(status) = msg.payload.get("status")
@@ -2340,25 +2940,31 @@ impl TunnelForwarder {
                                     return Err(error);
                                 }
 
-                                if let Err(error) = validate_framing_contract(response) {
-                                    let reason = error.to_string();
-                                    let _ = self
-                                        .event_tx
-                                        .send(TunnelEvent::ConnectionError(reason.clone()))
-                                        .await;
-                                    return Err(error);
-                                }
-
-                                tunnel_limits = TunnelLimits::from_join_response(response);
-                                if !tunnel_limits.ordered_response_headers {
-                                    let error = anyhow!(
-                                        "Server did not advertise ordered response headers"
+                                if protocol_v3 {
+                                    streaming_limits = Some(
+                                        tunnel_v3::StreamingLimits::from_join_response(response)?,
                                     );
-                                    let _ = self
-                                        .event_tx
-                                        .send(TunnelEvent::ConnectionError(error.to_string()))
-                                        .await;
-                                    return Err(error);
+                                } else {
+                                    if let Err(error) = validate_framing_contract(response) {
+                                        let reason = error.to_string();
+                                        let _ = self
+                                            .event_tx
+                                            .send(TunnelEvent::ConnectionError(reason.clone()))
+                                            .await;
+                                        return Err(error);
+                                    }
+
+                                    tunnel_limits = TunnelLimits::from_join_response(response);
+                                    if !tunnel_limits.ordered_response_headers {
+                                        let error = anyhow!(
+                                            "Server did not advertise ordered response headers"
+                                        );
+                                        let _ = self
+                                            .event_tx
+                                            .send(TunnelEvent::ConnectionError(error.to_string()))
+                                            .await;
+                                        return Err(error);
+                                    }
                                 }
 
                                 let session_id = response
@@ -2398,9 +3004,7 @@ impl TunnelForwarder {
                                     subdomain = %log_subdomain,
                                     tunnel_id = %log_tunnel_id,
                                     tunnel_type = %tunnel_type,
-                                    max_request_body_bytes = tunnel_limits.max_request_body_bytes,
-                                    max_response_body_bytes = tunnel_limits.max_response_body_bytes,
-                                    max_response_header_bytes = tunnel_limits.max_response_header_bytes,
+                                    protocol_version = protocol_version,
                                     "Tunnel established"
                                 );
 
@@ -2447,6 +3051,12 @@ impl TunnelForwarder {
         }
 
         let (writer, mut writer_task) = PriorityWriter::spawn(write);
+        if let Some(streaming_limits) = streaming_limits {
+            return self
+                .run_v3_tunnel(read, writer, writer_task, tunnel_topic, streaming_limits)
+                .await;
+        }
+
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping_interval.tick().await;
@@ -2455,6 +3065,12 @@ impl TunnelForwarder {
 
         // Listen for tunnel_request events
         loop {
+            // Completed tasks have already returned their local-forward
+            // permits. Remove their JoinSet results and delivery indexes
+            // before admitting more messages from a continuously readable
+            // socket.
+            reap_ready_tunnel_workers(&mut runtime);
+
             tokio::select! {
                 biased;
                 writer_result = &mut writer_task => {
@@ -2472,6 +3088,11 @@ impl TunnelForwarder {
                         reference: Some(ping_counter.to_string()),
                     }).await?;
                     ping_counter += 1;
+                },
+                completed = runtime.workers.join_next_with_id(), if !runtime.workers.is_empty() => {
+                    if let Some(completion) = completed {
+                        complete_tunnel_worker(completion, &mut runtime);
+                    }
                 },
                 maybe_msg = read.next() => match maybe_msg {
                     Some(msg) => match msg {
@@ -2521,19 +3142,631 @@ impl TunnelForwarder {
                     break;
                     }
                 },
-                completed = runtime.workers.join_next(), if !runtime.workers.is_empty() => {
-                    if let Some(result) = completed {
-                        match result {
-                            Ok((request_id, Ok(()))) => {
-                                runtime.active_deliveries.remove(&request_id);
-                            }
-                            Ok((request_id, Err(error))) => {
-                                runtime.active_deliveries.remove(&request_id);
-                                error!(request_id = %request_id, error = %error, "Local delivery task failed");
-                            }
-                            Err(error) if error.is_cancelled() => {}
-                            Err(error) => error!(error = %error, "Local delivery task panicked"),
+            }
+        }
+
+        runtime.workers.abort_all();
+        while runtime.workers.join_next().await.is_some() {}
+        writer_task.abort();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_v3_request(
+        &self,
+        incoming: tunnel_v3::IncomingRequest,
+        phase: Arc<AtomicU8>,
+        writer: PriorityWriter,
+        tunnel_topic: String,
+        limits: tunnel_v3::StreamingLimits,
+        connection_window: tunnel_v3::ConnectionSendWindow,
+        mut response_rx: mpsc::Receiver<tunnel_v3::WindowUpdate>,
+        _work_permit: OwnedSemaphorePermit,
+    ) -> Result<()> {
+        let tunnel_v3::IncomingRequest { start, body } = incoming;
+        let stream_id = start.stream_id;
+        let started_at = std::time::Instant::now();
+        let local_deadline = tokio::time::Instant::now() + Duration::from_millis(start.timeout_ms);
+
+        let target = match self.target.request_url(
+            &start.path,
+            (!start.query_string.is_empty()).then_some(start.query_string.as_str()),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        error.code(),
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
+
+        let remaining = local_deadline.saturating_duration_since(tokio::time::Instant::now());
+
+        let method = match supported_tunnel_method(&start.method) {
+            Some(method) => method,
+            None => {
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "invalid_method_before_forward",
+                        format!("Unsupported HTTP method: {}", start.method),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
+        let client = match self.target.http_client_with_timeout(remaining) {
+            Ok(client) => client,
+            Err(error) => {
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "local_client_error_before_forward",
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
+
+        let mut request = client.request(method, target);
+        for (name, value) in &start.headers {
+            if should_forward_request_header(name)
+                && let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                && let Ok(value) = reqwest::header::HeaderValue::from_str(value)
+            {
+                request = request.header(name, value);
+            }
+        }
+        if let Some(content_length) = start.content_length {
+            request = request.header(reqwest::header::CONTENT_LENGTH, content_length);
+        }
+
+        let (consumption_tx, mut consumption_rx) =
+            mpsc::channel(limits.stream_window_items.saturating_add(1));
+        let V3RequestBodyBridge {
+            request_body,
+            response_started,
+            pump: request_body_pump,
+        } = spawn_v3_request_body_bridge(body, consumption_tx);
+        request = request.body(request_body);
+
+        let reporter_writer = writer.clone();
+        let reporter_topic = tunnel_topic.clone();
+        let consumption_reporter = tokio::spawn(async move {
+            while let Some(update) = consumption_rx.recv().await {
+                reporter_writer
+                    .control_v3(v3_control_message(
+                        &reporter_topic,
+                        "tunnel_stream_window",
+                        serde_json::json!({
+                            "stream_id": stream_id,
+                            "direction": "request",
+                            "consumed_bytes": update.consumed_bytes,
+                            "consumed_items": update.consumed_items,
+                        }),
+                    ))
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        phase.store(DELIVERY_STARTED, Ordering::Release);
+        let mut response = match request.send().await {
+            Ok(response) => {
+                // A final local response transfers ownership away from
+                // reqwest. Keep draining the bounded protocol source so the
+                // service can finish ingress without waiting on a local
+                // server that has already stopped reading the upload.
+                let _ = response_started.send(true);
+                response
+            }
+            Err(error) => {
+                let _ = response_started.send(true);
+                request_body_pump.abort();
+                consumption_reporter.abort();
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "local_forward_failed",
+                        format!("Failed to forward request: {}", error.without_url()),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
+
+        match request_body_pump.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                consumption_reporter.abort();
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "request_body_drain_failed",
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                consumption_reporter.abort();
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "request_body_pump_failed",
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        }
+
+        match consumption_reporter.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "request_window_delivery_failed",
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "request_window_reporter_failed",
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        }
+
+        let status = response.status().as_u16();
+        if !(200..=599).contains(&status) || status == 101 {
+            return self
+                .report_v3_failure(
+                    stream_id,
+                    "invalid_local_response_status",
+                    format!("Local response status {status} cannot be relayed"),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
+                )
+                .await;
+        }
+        if response_header_bytes(response.headers()) > LOCAL_MAX_RESPONSE_HEADER_BYTES
+            || response
+                .headers()
+                .iter()
+                .any(|(_name, value)| value.to_str().is_err())
+        {
+            return self
+                .report_v3_failure(
+                    stream_id,
+                    "response_headers_too_large",
+                    "Local response headers cannot be relayed safely".to_string(),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
+                )
+                .await;
+        }
+        if status == 205 && !valid_reset_content_length(response.headers()) {
+            return self
+                .report_v3_failure(
+                    stream_id,
+                    "body_not_allowed",
+                    "A 205 Reset Content response may only declare Content-Length: 0".to_string(),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
+                )
+                .await;
+        }
+
+        let response_header_pairs = response_headers_to_ordered_pairs(response.headers());
+        let response_headers = response_headers_to_map(response.headers());
+        let response_content_length =
+            relayed_response_content_length(&start.method, status, response.content_length());
+        if response_content_length
+            .is_some_and(|length| length > limits.max_response_body_bytes as u64)
+        {
+            return self
+                .report_v3_failure(
+                    stream_id,
+                    "response_body_too_large",
+                    format!(
+                        "Local response body exceeds tunnel limit (max {} bytes)",
+                        limits.max_response_body_bytes
+                    ),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
+                )
+                .await;
+        }
+
+        let response_start = tunnel_v3::response_start_payload(
+            stream_id,
+            status,
+            &response_header_pairs,
+            response_content_length,
+        );
+
+        if let Err(error) =
+            tunnel_v3::validate_control_payload(&response_start, limits.max_control_payload_bytes)
+        {
+            return self
+                .report_v3_failure(
+                    stream_id,
+                    "response_headers_too_large",
+                    error.to_string(),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
+                )
+                .await;
+        }
+
+        if let Err(error) = writer
+            .response_control_v3(v3_control_message(
+                &tunnel_topic,
+                "tunnel_response_start",
+                response_start,
+            ))
+            .await
+        {
+            return self
+                .report_v3_failure(
+                    stream_id,
+                    "response_start_delivery_failed",
+                    error.to_string(),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
+                )
+                .await;
+        }
+
+        let mut response_stream = match tunnel_v3::ResponseStream::new(
+            stream_id,
+            tunnel_topic.clone(),
+            "1".to_string(),
+            limits,
+            connection_window,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "response_stream_initialization_failed",
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
+        let mut preview = Vec::with_capacity(UI_BODY_PREVIEW_BYTES.saturating_add(1));
+        let mut streamed_response_bytes = 0u64;
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if let Err(error) = ensure_response_chunk_allowed(&start.method, status) {
+                        return self
+                            .report_v3_failure(
+                                stream_id,
+                                "body_not_allowed",
+                                error.to_string(),
+                                &writer,
+                                &tunnel_topic,
+                                &phase,
+                            )
+                            .await;
+                    }
+
+                    let preview_remaining = UI_BODY_PREVIEW_BYTES
+                        .saturating_add(1)
+                        .saturating_sub(preview.len());
+                    preview.extend_from_slice(&chunk[..chunk.len().min(preview_remaining)]);
+
+                    for data in chunk.chunks(limits.max_chunk_bytes) {
+                        let next_bytes = streamed_response_bytes.saturating_add(data.len() as u64);
+                        if response_content_length
+                            .is_some_and(|content_length| next_bytes > content_length)
+                        {
+                            return self
+                                .report_v3_failure(
+                                    stream_id,
+                                    "response_content_length_mismatch",
+                                    "Local response exceeded its declared Content-Length"
+                                        .to_string(),
+                                    &writer,
+                                    &tunnel_topic,
+                                    &phase,
+                                )
+                                .await;
                         }
+                        if let Err(error) = enqueue_v3_response_chunk(
+                            &mut response_stream,
+                            &writer,
+                            &mut response_rx,
+                            data,
+                            local_deadline,
+                        )
+                        .await
+                        {
+                            return self
+                                .report_v3_failure(
+                                    stream_id,
+                                    "response_delivery_failed",
+                                    error.to_string(),
+                                    &writer,
+                                    &tunnel_topic,
+                                    &phase,
+                                )
+                                .await;
+                        }
+                        streamed_response_bytes = next_bytes;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    return self
+                        .report_v3_failure(
+                            stream_id,
+                            "response_read_failed",
+                            format!("Failed to read local response: {}", error.without_url()),
+                            &writer,
+                            &tunnel_topic,
+                            &phase,
+                        )
+                        .await;
+                }
+            }
+        }
+        drop(response);
+
+        if response_content_length
+            .is_some_and(|content_length| streamed_response_bytes != content_length)
+        {
+            return self
+                .report_v3_failure(
+                    stream_id,
+                    "response_content_length_mismatch",
+                    "Local response did not match its declared Content-Length".to_string(),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
+                )
+                .await;
+        }
+
+        let evidence = match response_stream.finish() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "response_integrity_failed",
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        };
+        if let Err(error) = writer
+            .response_control_v3(v3_control_message(
+                &tunnel_topic,
+                "tunnel_response_end",
+                evidence.end_payload(stream_id),
+            ))
+            .await
+        {
+            return self
+                .report_v3_failure(
+                    stream_id,
+                    "response_end_delivery_failed",
+                    error.to_string(),
+                    &writer,
+                    &tunnel_topic,
+                    &phase,
+                )
+                .await;
+        }
+
+        while !response_stream.fully_consumed() {
+            if let Err(error) = acknowledge_v3_response_window(
+                &mut response_stream,
+                &mut response_rx,
+                local_deadline,
+            )
+            .await
+            {
+                return self
+                    .report_v3_failure(
+                        stream_id,
+                        "response_consumption_failed",
+                        error.to_string(),
+                        &writer,
+                        &tunnel_topic,
+                        &phase,
+                    )
+                    .await;
+            }
+        }
+
+        phase.store(DELIVERY_TERMINAL, Ordering::Release);
+        let mut response_body = body_preview(&preview, &response_headers);
+        if evidence.bytes > preview.len() as u64
+            && let Some(body) = &mut response_body
+        {
+            body.push_str(&format!("\n… [{} bytes total]", evidence.bytes));
+        }
+        self.emit_presentation(TunnelEvent::RequestForwarded {
+            request_id: stream_id.to_string(),
+            status,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            response_headers: bounded_presentation_headers(response_header_pairs),
+            response_body,
+        });
+        Ok(())
+    }
+
+    async fn report_v3_failure(
+        &self,
+        stream_id: Uuid,
+        code: &str,
+        message: String,
+        writer: &PriorityWriter,
+        tunnel_topic: &str,
+        phase: &AtomicU8,
+    ) -> Result<()> {
+        let previous_phase = phase.swap(DELIVERY_TERMINAL, Ordering::AcqRel);
+        let outcome = cancellation_classification(previous_phase)
+            .map(|(_code, outcome)| outcome)
+            .unwrap_or("outcome_unknown");
+        writer
+            .response_control_v3(v3_abort_message(
+                tunnel_topic,
+                stream_id,
+                "response",
+                code,
+                outcome,
+            ))
+            .await?;
+        self.emit_presentation(TunnelEvent::RequestFailed {
+            request_id: stream_id.to_string(),
+            error: bounded_presentation_text(&message),
+        });
+        Err(anyhow!(message))
+    }
+
+    async fn run_v3_tunnel(
+        &self,
+        mut read: WsRead,
+        writer: PriorityWriter,
+        mut writer_task: tokio::task::JoinHandle<Result<()>>,
+        tunnel_topic: String,
+        limits: tunnel_v3::StreamingLimits,
+    ) -> Result<()> {
+        let mut runtime = V3RelayRuntime::new(tunnel_topic.clone(), limits)?;
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_interval.tick().await;
+        let mut ping_counter = 2u64;
+
+        loop {
+            // A completed task has already released its local-forward permit.
+            // Reap every ready result before accepting more ingress so the
+            // JoinSet and active-delivery index cannot grow while the socket is
+            // continuously readable.
+            reap_ready_v3_workers(&mut runtime, &writer, &tunnel_topic).await?;
+
+            tokio::select! {
+                biased;
+                writer_result = &mut writer_task => {
+                    match writer_result {
+                        Ok(Ok(())) => return Err(anyhow!("Tunnel writer stopped")),
+                        Ok(Err(error)) => return Err(error.context("Tunnel writer failed")),
+                        Err(error) => return Err(anyhow!("Tunnel writer task failed: {error}")),
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    let mut message = v3_control_message(
+                        &tunnel_topic,
+                        "ping",
+                        serde_json::json!({}),
+                    );
+                    message.reference = Some(ping_counter.to_string());
+                    writer.control_v3(message).await?;
+                    ping_counter = ping_counter.saturating_add(1);
+                }
+                completed = runtime.workers.join_next_with_id(), if !runtime.workers.is_empty() => {
+                    if let Some(completion) = completed {
+                        complete_v3_worker(
+                            completion,
+                            &mut runtime,
+                            &writer,
+                            &tunnel_topic,
+                        ).await?;
+                    }
+                },
+                maybe_message = read.next() => match maybe_message {
+                    Some(Ok(Message::Text(text))) => {
+                        let message = tunnel_v3::decode_server_control(&text)?;
+                        if matches!(message.event.as_str(), "phx_error" | "phx_close") {
+                            return Err(anyhow!("Protocol v3 channel closed"));
+                        }
+                        if let Err(error) = self
+                            .handle_v3_control(
+                                message,
+                                &writer,
+                                &tunnel_topic,
+                                limits,
+                                &mut runtime,
+                            )
+                            .await
+                        {
+                            let error = bounded_control_neutral_log_text(&error.to_string());
+                            warn!(error = %error, "Rejected protocol v3 control event");
+                        }
+                    }
+                    Some(Ok(Message::Binary(encoded))) => {
+                        self.handle_v3_binary(
+                            &encoded,
+                            &writer,
+                            &tunnel_topic,
+                            limits,
+                            &mut runtime,
+                        ).await?;
+                    }
+                    Some(Ok(Message::Ping(data))) => writer.pong(data).await?,
+                    Some(Ok(Message::Close(frame))) => {
+                        let frame = bounded_control_neutral_log_text(&format!("{frame:?}"));
+                        info!(frame = %frame, "Tunnel WebSocket closed");
+                        self.emit_presentation(TunnelEvent::Disconnected);
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        let error = bounded_control_neutral_log_text(&error.to_string());
+                        return Err(anyhow!("Tunnel WebSocket error: {error}"));
+                    }
+                    None => {
+                        self.emit_presentation(TunnelEvent::Disconnected);
+                        break;
                     }
                 },
             }
@@ -2542,6 +3775,339 @@ impl TunnelForwarder {
         runtime.workers.abort_all();
         while runtime.workers.join_next().await.is_some() {}
         writer_task.abort();
+        Ok(())
+    }
+
+    async fn handle_v3_control(
+        &self,
+        message: tunnel_v3::ControlMessage,
+        writer: &PriorityWriter,
+        tunnel_topic: &str,
+        limits: tunnel_v3::StreamingLimits,
+        runtime: &mut V3RelayRuntime,
+    ) -> Result<()> {
+        if message.topic != tunnel_topic && message.topic != "phoenix" {
+            return Err(anyhow!("Protocol v3 control event has an unexpected topic"));
+        }
+        tunnel_v3::validate_control_payload(&message.payload, limits.max_control_payload_bytes)?;
+
+        match message.event.as_str() {
+            "tunnel_request_start" => {
+                let stream_id = v3_payload_stream_id(&message.payload)?;
+                if runtime.active_deliveries.contains_key(&stream_id) {
+                    writer
+                        .control_v3(v3_abort_message(
+                            tunnel_topic,
+                            stream_id,
+                            "request",
+                            "duplicate_stream",
+                            "known_not_executed",
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+
+                let incoming = match runtime.requests.start(&message.payload) {
+                    Ok(incoming) => incoming,
+                    Err(error) => {
+                        writer
+                            .control_v3(v3_abort_message(
+                                tunnel_topic,
+                                stream_id,
+                                "request",
+                                "invalid_request_start",
+                                "known_not_executed",
+                            ))
+                            .await?;
+                        return Err(error);
+                    }
+                };
+
+                let Some(work_permit) = runtime.work_count.clone().try_acquire_owned().ok() else {
+                    runtime
+                        .requests
+                        .cancel(stream_id, "relay_overloaded_before_forward");
+                    writer
+                        .control_v3(v3_abort_message(
+                            tunnel_topic,
+                            stream_id,
+                            "request",
+                            "relay_overloaded_before_forward",
+                            "known_not_executed",
+                        ))
+                        .await?;
+                    return Ok(());
+                };
+
+                let headers = bounded_presentation_headers(incoming.start.headers.iter().cloned());
+                self.emit_presentation(TunnelEvent::RequestReceived {
+                    request_id: stream_id.to_string(),
+                    method: incoming.start.method.clone(),
+                    path: bounded_presentation_text(&incoming.start.path),
+                    headers,
+                    body: None,
+                    query_string: bounded_presentation_text(&incoming.start.query_string),
+                    replay: incoming.start.replay,
+                });
+
+                let (response_tx, response_rx) =
+                    mpsc::channel(limits.stream_window_items.saturating_add(1));
+                let phase = Arc::new(AtomicU8::new(DELIVERY_QUEUED));
+                let task_phase = phase.clone();
+                let worker = self.clone();
+                let task_writer = writer.clone();
+                let task_topic = tunnel_topic.to_string();
+                let response_window = runtime.response_window.clone();
+                let abort = runtime.workers.spawn(async move {
+                    let result = worker
+                        .forward_v3_request(
+                            incoming,
+                            task_phase,
+                            task_writer,
+                            task_topic,
+                            limits,
+                            response_window,
+                            response_rx,
+                            work_permit,
+                        )
+                        .await;
+                    (stream_id, result)
+                });
+
+                runtime.active_deliveries.insert(
+                    stream_id,
+                    ActiveV3Delivery {
+                        abort,
+                        phase,
+                        response_tx,
+                    },
+                );
+            }
+            "tunnel_request_end" => {
+                let stream_id = v3_payload_stream_id(&message.payload)?;
+                if let Err(error) = runtime.requests.finish(&message.payload) {
+                    if let Some(active) = runtime.active_deliveries.remove(&stream_id) {
+                        active.abort.abort();
+                    }
+                    writer
+                        .control_v3(v3_abort_message(
+                            tunnel_topic,
+                            stream_id,
+                            "request",
+                            "invalid_request_end",
+                            "outcome_unknown",
+                        ))
+                        .await?;
+                    return Err(error);
+                }
+            }
+            "tunnel_stream_window" => {
+                if message
+                    .payload
+                    .get("direction")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("response")
+                {
+                    return Err(anyhow!("Protocol v3 window has an unexpected direction"));
+                }
+                let stream_id = v3_payload_stream_id(&message.payload)?;
+                let update = tunnel_v3::WindowUpdate {
+                    consumed_bytes: message
+                        .payload
+                        .get("consumed_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| anyhow!("Protocol v3 window has invalid bytes"))?,
+                    consumed_items: message
+                        .payload
+                        .get("consumed_items")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| anyhow!("Protocol v3 window has invalid items"))?,
+                };
+                let admission_error = runtime
+                    .active_deliveries
+                    .get(&stream_id)
+                    .and_then(|active| admit_v3_response_window(&active.response_tx, update).err());
+
+                if let Some(code) = admission_error
+                    && let Some(active) = runtime.active_deliveries.remove(&stream_id)
+                {
+                    let phase = active.phase.load(Ordering::Acquire);
+                    let outcome = cancellation_classification(phase)
+                        .map(|(_code, outcome)| outcome)
+                        .unwrap_or("outcome_unknown");
+
+                    active.abort.abort();
+                    runtime.requests.cancel(stream_id, code);
+                    writer.try_control_v3(v3_abort_message(
+                        tunnel_topic,
+                        stream_id,
+                        "response",
+                        code,
+                        outcome,
+                    ))?;
+                }
+            }
+            "tunnel_stream_abort" => {
+                let stream_id = v3_payload_stream_id(&message.payload)?;
+                let direction = message
+                    .payload
+                    .get("direction")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow!("Protocol v3 abort has no direction"))?;
+                if !matches!(direction, "request" | "response") {
+                    return Err(anyhow!("Protocol v3 abort has an invalid direction"));
+                }
+
+                if runtime.requests.contains(stream_id) {
+                    runtime.requests.cancel(stream_id, "remote_abort");
+                }
+                if let Some(active) = runtime.active_deliveries.remove(&stream_id) {
+                    active.abort.abort();
+                }
+            }
+            "buffered_summary" => {
+                let count = message
+                    .payload
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let oldest_captured_at = message
+                    .payload
+                    .get("oldest_captured_at")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+
+                info!(count = count, "Buffered requests waiting on server");
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::BufferedSummary {
+                        count,
+                        oldest_captured_at,
+                    })
+                    .await;
+
+                if self.replay_buffered && count > 0 && !runtime.auto_drain_requested {
+                    runtime.auto_drain_requested = true;
+                    let mut replay =
+                        v3_control_message(tunnel_topic, "buffered:replay", serde_json::json!({}));
+                    replay.reference = Some("buffered-replay".to_string());
+                    writer
+                        .control_v3(replay)
+                        .await
+                        .context("Failed to send buffered replay request")?;
+                }
+            }
+            "buffered_replayed" => {
+                let capture_id = message
+                    .payload
+                    .get("capture_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let status = message
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|status| u16::try_from(status).ok())
+                    .unwrap_or(0);
+
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::BufferedReplayed { capture_id, status })
+                    .await;
+            }
+            "buffered_replay_failed" => {
+                let capture_id = message
+                    .payload
+                    .get("capture_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let reason = message
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let _ = self
+                    .event_tx
+                    .send(TunnelEvent::BufferedReplayFailed { capture_id, reason })
+                    .await;
+            }
+            "phx_reply" => {
+                if message.reference.as_deref() == Some("buffered-replay") {
+                    let status = message
+                        .payload
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+
+                    if status != "ok" {
+                        let reason = message
+                            .payload
+                            .get("response")
+                            .and_then(|response| response.get("reason"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        if reason != "buffer_empty" {
+                            let log_reason = bounded_control_neutral_log_text(&reason);
+                            warn!(reason = %log_reason, "Buffered replay request rejected");
+                            let _ = self
+                                .event_tx
+                                .send(TunnelEvent::BufferedReplayFailed {
+                                    capture_id: "unknown".to_string(),
+                                    reason,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+            "phx_error" | "phx_close" => {
+                return Err(anyhow!("Protocol v3 channel closed"));
+            }
+            event => debug!(event = %event, "Unhandled protocol v3 tunnel event"),
+        }
+
+        Ok(())
+    }
+
+    async fn handle_v3_binary(
+        &self,
+        encoded: &[u8],
+        writer: &PriorityWriter,
+        tunnel_topic: &str,
+        limits: tunnel_v3::StreamingLimits,
+        runtime: &mut V3RelayRuntime,
+    ) -> Result<()> {
+        let push = tunnel_v3::decode_server_binary_push(encoded)?;
+        if push.topic != tunnel_topic || push.event != "tunnel_request_chunk" {
+            return Err(anyhow!("Unexpected protocol v3 binary channel event"));
+        }
+        let chunk = tunnel_v3::decode_chunk(push.payload, limits.max_chunk_bytes)?;
+        let stream_id = chunk.stream_id;
+
+        if let Err(error) = runtime.requests.accept_binary_push(encoded) {
+            runtime.requests.cancel(stream_id, "invalid_request_chunk");
+            if let Some(active) = runtime.active_deliveries.remove(&stream_id) {
+                active.abort.abort();
+            }
+            writer
+                .control_v3(v3_abort_message(
+                    tunnel_topic,
+                    stream_id,
+                    "request",
+                    "invalid_request_chunk",
+                    "outcome_unknown",
+                ))
+                .await?;
+            let error = bounded_control_neutral_log_text(&error.to_string());
+            warn!(stream_id = %stream_id, error = %error, "Rejected protocol v3 request chunk");
+        }
+
         Ok(())
     }
 
@@ -2779,21 +4345,33 @@ impl TunnelForwarder {
                 }
             }
             "tunnel_stream_error" => {
-                if let Some(stream_id) = msg
+                let stream_id = msg
                     .payload
                     .get("stream_id")
                     .and_then(serde_json::Value::as_str)
-                    && let Some(assembler) = runtime.inbound_streams.remove(stream_id)
-                {
-                    runtime.inbound_reserved_bytes = runtime
-                        .inbound_reserved_bytes
-                        .saturating_sub(assembler.total_bytes);
-                }
+                    .map(str::to_string);
                 let code = msg
                     .payload
                     .get("code")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("stream_error");
+
+                if let Some(stream_id) = stream_id.as_deref() {
+                    if let Some(assembler) = runtime.inbound_streams.remove(stream_id) {
+                        runtime.inbound_reserved_bytes = runtime
+                            .inbound_reserved_bytes
+                            .saturating_sub(assembler.total_bytes);
+                    }
+
+                    if let Some(active) = runtime.active_deliveries.remove(stream_id) {
+                        active.abort.abort();
+                        self.emit_presentation(TunnelEvent::RequestFailed {
+                            request_id: stream_id.to_string(),
+                            error: bounded_presentation_text(code),
+                        });
+                    }
+                }
+
                 let code = bounded_control_neutral_log_text(code);
                 warn!(code = %code, "Tunnel stream failed");
             }
@@ -3091,13 +4669,9 @@ impl TunnelForwarder {
             Ok(mut response) => {
                 let status = response.status().as_u16();
 
-                let header_bytes = response_header_bytes(response.headers());
-                if header_bytes > tunnel_limits.max_response_header_bytes {
-                    let error_msg = format!(
-                        "Local response headers exceed tunnel limit ({} > {} bytes)",
-                        header_bytes, tunnel_limits.max_response_header_bytes
-                    );
-
+                if let Some(error_msg) =
+                    response_header_limit_error(response.headers(), tunnel_limits)
+                {
                     return self
                         .report_tunnel_failure(
                             &request_id,
@@ -3431,7 +5005,20 @@ impl TunnelForwarder {
 mod tests {
     use super::*;
     use flate2::{Compression, write::DeflateEncoder, write::GzEncoder, write::ZlibEncoder};
+    use sha2::{Digest, Sha256};
     use std::io::Write;
+
+    fn v2_join_contract() -> serde_json::Value {
+        serde_json::json!({
+            "limits": {
+                "max_stream_bytes": TUNNEL_MAX_STREAM_BYTES,
+            },
+            "framing": serde_json::from_str::<serde_json::Value>(include_str!(
+                "../fixtures/tunnel_framing_v2.json"
+            ))
+            .unwrap(),
+        })
+    }
 
     fn preview_headers(values: &[(&str, &str)]) -> HashMap<String, String> {
         values
@@ -3513,6 +5100,213 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v3_join_uses_phoenix_v2_controls_and_explicit_version() {
+        let payload = tunnel_join_payload_for_version(
+            3000,
+            Some("org-1"),
+            Some("payments"),
+            None,
+            tunnel_v3::VERSION.into(),
+        );
+        assert_eq!(payload["protocol_version"], 3);
+
+        let encoded = tunnel_v3::encode_client_control(
+            &tunnel_v3::ControlMessage {
+                join_ref: None,
+                reference: Some("1".to_string()),
+                topic: "tunnel:connect".to_string(),
+                event: "phx_join".to_string(),
+                payload,
+            },
+            TUNNEL_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        assert!(encoded.starts_with("[null,\"1\",\"tunnel:connect\",\"phx_join\","));
+
+        let reply = decode_channel_message(
+            r#"[null,"1","tunnel:connect","phx_reply",{"status":"ok"}]"#,
+            true,
+        )
+        .unwrap();
+        assert_eq!(reply.reference.as_deref(), Some("1"));
+        assert_eq!(reply.event, "phx_reply");
+    }
+
+    #[test]
+    fn tunnel_protocol_selection_prefers_v3_and_defaults_old_services_to_v2() {
+        assert_eq!(selected_tunnel_protocol(&[3, 2]).unwrap(), 3);
+        assert_eq!(selected_tunnel_protocol(&[2, 3]).unwrap(), 3);
+        assert_eq!(selected_tunnel_protocol(&[2]).unwrap(), 2);
+
+        for unsupported in [&[][..], &[4][..], &[4, 1][..]] {
+            let error = selected_tunnel_protocol(unsupported)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("no common tunnel protocol"));
+            assert!(is_fatal_error(&error));
+        }
+    }
+
+    #[test]
+    fn protocol_v3_response_window_admission_never_waits_for_worker_capacity() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let first = tunnel_v3::WindowUpdate {
+            consumed_bytes: 64_000,
+            consumed_items: 1,
+        };
+        let second = tunnel_v3::WindowUpdate {
+            consumed_bytes: 128_000,
+            consumed_items: 2,
+        };
+
+        assert_eq!(admit_v3_response_window(&sender, first), Ok(()));
+        assert_eq!(
+            admit_v3_response_window(&sender, second),
+            Err("response_window_overflow")
+        );
+        assert_eq!(receiver.try_recv().unwrap(), first);
+
+        drop(receiver);
+        assert_eq!(
+            admit_v3_response_window(&sender, second),
+            Err("response_window_receiver_closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_v3_response_window_overflow_aborts_only_the_affected_stream() {
+        let address = "127.0.0.1:9".parse().unwrap();
+        let (forwarder, _event_rx) = forwarder_for_local_address(address).await;
+        let (writer, mut control_rx, _response_rx) = test_priority_writer();
+        let limits = test_streaming_limits();
+        let mut runtime = V3RelayRuntime::new("tunnel:connect".to_string(), limits).unwrap();
+        let stream_id = Uuid::new_v4();
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        response_tx
+            .try_send(tunnel_v3::WindowUpdate {
+                consumed_bytes: 1,
+                consumed_items: 1,
+            })
+            .unwrap();
+        let phase = Arc::new(AtomicU8::new(DELIVERY_STARTED));
+        let abort = runtime.workers.spawn(async move {
+            std::future::pending::<()>().await;
+            (stream_id, Ok(()))
+        });
+        runtime.active_deliveries.insert(
+            stream_id,
+            ActiveV3Delivery {
+                abort,
+                phase,
+                response_tx,
+            },
+        );
+
+        forwarder
+            .handle_v3_control(
+                v3_control_message(
+                    "tunnel:connect",
+                    "tunnel_stream_window",
+                    serde_json::json!({
+                        "stream_id": stream_id,
+                        "direction": "response",
+                        "consumed_bytes": 2,
+                        "consumed_items": 2,
+                    }),
+                ),
+                &writer,
+                "tunnel:connect",
+                limits,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(!runtime.active_deliveries.contains_key(&stream_id));
+        let abort = protocol_v3_control(control_rx.recv().await.unwrap());
+        assert_eq!(abort.event, "tunnel_stream_abort");
+        assert_eq!(abort.payload["stream_id"], stream_id.to_string());
+        assert_eq!(abort.payload["direction"], "response");
+        assert_eq!(abort.payload["code"], "response_window_overflow");
+        assert_eq!(abort.payload["outcome"], "outcome_unknown");
+        assert!(
+            runtime
+                .workers
+                .join_next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_v3_ninth_start_is_explicitly_rejected_before_local_forwarding() {
+        let address = "127.0.0.1:9".parse().unwrap();
+        let (forwarder, _event_rx) = forwarder_for_local_address(address).await;
+        let (writer, mut control_rx, _response_rx) = test_priority_writer();
+        let mut limits = test_streaming_limits();
+        limits.max_concurrent_streams = 128;
+        limits.max_active_local_forwards = LOCAL_WORK_MAX_COUNT;
+        let mut runtime = V3RelayRuntime::new("tunnel:connect".to_string(), limits).unwrap();
+        let occupied = (0..LOCAL_WORK_MAX_COUNT)
+            .map(|_| {
+                runtime
+                    .work_count
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("one of the eight local forwarding slots")
+            })
+            .collect::<Vec<_>>();
+        let ninth_stream_id = Uuid::new_v4();
+
+        forwarder
+            .handle_v3_control(
+                v3_control_message(
+                    "tunnel:connect",
+                    "tunnel_request_start",
+                    serde_json::json!({
+                        "stream_id": ninth_stream_id,
+                        "deadline_unix_ms": 1,
+                        "timeout_ms": 30_000,
+                        "method": "POST",
+                        "path": "/overload",
+                        "query_string": "",
+                        "headers": [],
+                        "content_length": 0,
+                        "replay": false,
+                    }),
+                ),
+                &writer,
+                "tunnel:connect",
+                limits,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(!runtime.active_deliveries.contains_key(&ninth_stream_id));
+        assert!(!runtime.requests.contains(ninth_stream_id));
+        assert_eq!(runtime.work_count.available_permits(), 0);
+
+        let abort = protocol_v3_control(
+            tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+                .await
+                .expect("ninth start was silently dropped")
+                .unwrap(),
+        );
+        assert_eq!(abort.event, "tunnel_stream_abort");
+        assert_eq!(abort.payload["stream_id"], ninth_stream_id.to_string());
+        assert_eq!(abort.payload["direction"], "request");
+        assert_eq!(abort.payload["code"], "relay_overloaded_before_forward");
+        assert_eq!(abort.payload["outcome"], "known_not_executed");
+        assert!(control_rx.try_recv().is_err());
+
+        drop(occupied);
+        assert_eq!(runtime.work_count.available_permits(), LOCAL_WORK_MAX_COUNT);
+    }
+
+    #[test]
     fn test_join_mode_must_be_confirmed_by_server() {
         assert!(
             validate_join_mode(
@@ -3571,6 +5365,37 @@ mod tests {
         assert!(should_forward_request_header("content-type"));
         assert!(should_forward_request_header("authorization"));
         assert!(should_forward_request_header("x-custom-header"));
+    }
+
+    #[test]
+    fn protocol_v3_205_reset_content_forbids_body_and_nonzero_content_length() {
+        assert!(response_body_forbidden("GET", 205));
+        assert!(ensure_response_chunk_allowed("GET", 205).is_err());
+        assert_eq!(
+            relayed_response_content_length("GET", 205, Some(123)),
+            Some(0)
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert!(valid_reset_content_length(&headers));
+
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("0"),
+        );
+        assert!(valid_reset_content_length(&headers));
+
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("1"),
+        );
+        assert!(!valid_reset_content_length(&headers));
+
+        headers.append(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("0"),
+        );
+        assert!(!valid_reset_content_length(&headers));
     }
 
     #[test]
@@ -3672,9 +5497,23 @@ mod tests {
             serde_json::from_str(include_str!("../fixtures/tunnel_framing_v2.json")).unwrap();
 
         assert_eq!(fixture["version"], TUNNEL_PROTOCOL_VERSION);
+        assert_eq!(fixture["transport"], "framed");
+        assert_eq!(fixture["frame_encoding"], "base64url");
         assert_eq!(fixture["max_frame_bytes"], TUNNEL_MAX_FRAME_BYTES);
         assert_eq!(fixture["max_raw_chunk_bytes"], TUNNEL_MAX_RAW_CHUNK_BYTES);
         assert_eq!(fixture["queue_depth_frames"], 1);
+        assert_eq!(fixture["backpressure"], "per_frame_ack");
+        assert_eq!(fixture["max_json_depth"], TUNNEL_MAX_JSON_DEPTH);
+        assert_eq!(
+            fixture["max_json_structural_nodes"],
+            TUNNEL_MAX_JSON_STRUCTURAL_NODES
+        );
+        assert_eq!(
+            fixture["max_json_primitive_bytes"],
+            TUNNEL_MAX_JSON_PRIMITIVE_BYTES
+        );
+        assert_eq!(fixture["max_response_headers"], TUNNEL_MAX_RESPONSE_HEADERS);
+        validate_framing_contract(&v2_join_contract()).unwrap();
 
         let headers = ordered_header_pairs(fixture["sample_payload"].get("headers")).unwrap();
         assert_eq!(headers[0], ("x-repeated".into(), "first".into()));
@@ -3685,6 +5524,87 @@ mod tests {
                 .unwrap(),
             vec![0x00, 0xff, b'b', b'i', b'n']
         );
+    }
+
+    #[test]
+    fn test_framing_contract_rejects_incompatible_core_fields_and_stream_limit() {
+        let incompatible_fields = [
+            ("version", serde_json::json!(3)),
+            ("transport", serde_json::json!("unframed")),
+            ("frame_encoding", serde_json::json!("base64")),
+            ("max_frame_bytes", serde_json::json!(65_535)),
+            ("max_raw_chunk_bytes", serde_json::json!(46_999)),
+            ("queue_depth_frames", serde_json::json!(2)),
+            ("backpressure", serde_json::json!("none")),
+        ];
+
+        for (field, value) in incompatible_fields {
+            let mut response = v2_join_contract();
+            response["framing"][field] = value;
+            assert!(validate_framing_contract(&response).is_err(), "{field}");
+        }
+
+        let mut response = v2_join_contract();
+        response["limits"]["max_stream_bytes"] = serde_json::json!(TUNNEL_MAX_STREAM_BYTES + 1);
+        assert!(validate_framing_contract(&response).is_err());
+    }
+
+    #[test]
+    fn test_framing_contract_bridges_legacy_and_bounded_scanner_advertisements() {
+        let mut legacy = v2_join_contract();
+        for field in [
+            "max_json_depth",
+            "max_json_structural_nodes",
+            "max_json_primitive_bytes",
+            "max_response_headers",
+        ] {
+            legacy["framing"].as_object_mut().unwrap().remove(field);
+        }
+        assert!(legacy["limits"].get("max_response_header_items").is_none());
+        validate_framing_contract(&legacy).unwrap();
+        assert_eq!(
+            TunnelLimits::from_join_response(&legacy).max_response_header_items,
+            TUNNEL_MAX_RESPONSE_HEADERS
+        );
+
+        let mut bounded = v2_join_contract();
+        bounded["framing"]["max_json_depth"] = serde_json::json!(8);
+        bounded["framing"]["max_json_structural_nodes"] = serde_json::json!(32_768);
+        bounded["framing"]["max_json_primitive_bytes"] = serde_json::json!(128);
+        bounded["framing"]["max_response_headers"] = serde_json::json!(2_048);
+        bounded["limits"]["max_response_header_items"] = serde_json::json!(1_024);
+        validate_framing_contract(&bounded).unwrap();
+        assert_eq!(
+            TunnelLimits::from_join_response(&bounded).max_response_header_items,
+            1_024
+        );
+    }
+
+    #[test]
+    fn test_framing_contract_rejects_scanner_limits_above_local_ceilings() {
+        let incompatible_fields = [
+            ("max_json_depth", TUNNEL_MAX_JSON_DEPTH + 1),
+            (
+                "max_json_structural_nodes",
+                TUNNEL_MAX_JSON_STRUCTURAL_NODES + 1,
+            ),
+            (
+                "max_json_primitive_bytes",
+                TUNNEL_MAX_JSON_PRIMITIVE_BYTES + 1,
+            ),
+            ("max_response_headers", TUNNEL_MAX_RESPONSE_HEADERS + 1),
+        ];
+
+        for (field, value) in incompatible_fields {
+            let mut response = v2_join_contract();
+            response["framing"][field] = serde_json::json!(value);
+            assert!(validate_framing_contract(&response).is_err(), "{field}");
+        }
+
+        let mut response = v2_join_contract();
+        response["limits"]["max_response_header_items"] =
+            serde_json::json!(TUNNEL_MAX_RESPONSE_HEADERS + 1);
+        assert!(validate_framing_contract(&response).is_err());
     }
 
     #[test]
@@ -3737,6 +5657,26 @@ mod tests {
                 ("set-cookie".to_string(), "second=2".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn test_v2_response_header_item_limit_counts_repeated_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append("set-cookie", "first=1".parse().unwrap());
+        headers.append("set-cookie", "second=2".parse().unwrap());
+        let mut limits = TunnelLimits::from_join_response(&serde_json::json!({
+            "limits": {"max_response_header_items": 1}
+        }));
+        limits.max_response_header_bytes = usize::MAX;
+
+        assert!(
+            response_header_limit_error(&headers, limits)
+                .unwrap()
+                .contains("item limit")
+        );
+
+        limits.max_response_header_items = 2;
+        assert!(response_header_limit_error(&headers, limits).is_none());
     }
 
     #[tokio::test]
@@ -3792,8 +5732,9 @@ mod tests {
     fn test_tunnel_limits_clamp_join_response_contract_to_local_maxima() {
         let response = serde_json::json!({
             "limits": {
-                "max_body_bytes": 268_435_456,
+                "max_body_bytes": u64::MAX,
                 "max_response_header_bytes": 16_777_216,
+                "max_response_header_items": 2_048,
                 "response_headers_format": "ordered_pairs"
             }
         });
@@ -3806,6 +5747,7 @@ mod tests {
             limits.max_response_header_bytes,
             LOCAL_MAX_RESPONSE_HEADER_BYTES
         );
+        assert_eq!(limits.max_response_header_items, 2_048);
         assert!(limits.ordered_response_headers);
     }
 
@@ -3814,7 +5756,8 @@ mod tests {
         let response = serde_json::json!({
             "limits": {
                 "max_body_bytes": u64::MAX,
-                "max_response_header_bytes": u64::MAX
+                "max_response_header_bytes": u64::MAX,
+                "max_response_header_items": u64::MAX
             }
         });
 
@@ -3831,6 +5774,10 @@ mod tests {
             limits.max_response_header_bytes,
             LOCAL_MAX_RESPONSE_HEADER_BYTES
         );
+        assert_eq!(
+            limits.max_response_header_items,
+            TUNNEL_MAX_RESPONSE_HEADERS
+        );
     }
 
     #[test]
@@ -3845,6 +5792,10 @@ mod tests {
         assert_eq!(
             limits.max_response_header_bytes,
             LEGACY_MAX_RESPONSE_HEADER_BYTES
+        );
+        assert_eq!(
+            limits.max_response_header_items,
+            TUNNEL_MAX_RESPONSE_HEADERS
         );
         assert!(!limits.ordered_response_headers);
     }
@@ -4349,6 +6300,197 @@ mod tests {
         writer_task.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn protocol_v3_reaps_completed_workers_before_sustained_ingress() {
+        let limits = test_streaming_limits();
+        let capacity = limits.max_active_local_forwards;
+        let mut runtime = V3RelayRuntime::new("tunnel:connect".to_string(), limits).unwrap();
+        let (writer, _control_rx, _response_rx) = test_priority_writer();
+        let (ingress_tx, mut ingress_rx) = mpsc::channel(1);
+        ingress_tx.send(0usize).await.unwrap();
+        let mut peak_active_deliveries = 0;
+
+        for wave in 0..256usize {
+            for _worker in 0..capacity {
+                let stream_id = Uuid::new_v4();
+                let work_permit = runtime
+                    .work_count
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("bounded local-forward capacity");
+                let (response_tx, _response_rx) = mpsc::channel(1);
+                let phase = Arc::new(AtomicU8::new(DELIVERY_TERMINAL));
+                let abort = runtime.workers.spawn(async move {
+                    let _work_permit = work_permit;
+                    tokio::task::yield_now().await;
+                    (stream_id, Ok(()))
+                });
+
+                runtime.active_deliveries.insert(
+                    stream_id,
+                    ActiveV3Delivery {
+                        abort,
+                        phase,
+                        response_tx,
+                    },
+                );
+            }
+
+            peak_active_deliveries = peak_active_deliveries.max(runtime.active_deliveries.len());
+            assert_eq!(runtime.active_deliveries.len(), capacity);
+            assert_eq!(
+                ingress_rx.len(),
+                1,
+                "ingress must remain continuously ready"
+            );
+
+            while !runtime.workers.is_empty() {
+                if reap_ready_v3_workers(&mut runtime, &writer, "tunnel:connect")
+                    .await
+                    .unwrap()
+                    == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            assert!(runtime.active_deliveries.is_empty());
+            assert_eq!(ingress_rx.recv().await, Some(wave));
+            ingress_tx.send(wave + 1).await.unwrap();
+        }
+
+        assert_eq!(peak_active_deliveries, capacity);
+        assert_eq!(runtime.work_count.available_permits(), capacity);
+    }
+
+    #[tokio::test]
+    async fn protocol_v2_reaps_completed_workers_before_sustained_ingress() {
+        let mut runtime = RelayRuntime::new();
+        let (ingress_tx, mut ingress_rx) = mpsc::channel(1);
+        ingress_tx.send(0usize).await.unwrap();
+        let mut peak_active_deliveries = 0;
+
+        for wave in 0..256usize {
+            for worker in 0..LOCAL_WORK_MAX_COUNT {
+                let request_id = format!("{wave}-{worker}");
+                let permit = runtime
+                    .work_budget
+                    .try_acquire(1)
+                    .expect("bounded local-forward capacity");
+                let task_request_id = request_id.clone();
+                let phase = Arc::new(AtomicU8::new(DELIVERY_TERMINAL));
+                let abort = runtime.workers.spawn(async move {
+                    let _permit = permit;
+                    tokio::task::yield_now().await;
+                    (task_request_id, Ok(()))
+                });
+
+                runtime
+                    .active_deliveries
+                    .insert(request_id, ActiveDelivery { abort, phase });
+            }
+
+            peak_active_deliveries = peak_active_deliveries.max(runtime.active_deliveries.len());
+            assert_eq!(runtime.active_deliveries.len(), LOCAL_WORK_MAX_COUNT);
+            assert_eq!(
+                ingress_rx.len(),
+                1,
+                "ingress must remain continuously ready"
+            );
+
+            while !runtime.workers.is_empty() {
+                if reap_ready_tunnel_workers(&mut runtime) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            assert!(runtime.active_deliveries.is_empty());
+            assert_eq!(ingress_rx.recv().await, Some(wave));
+            ingress_tx.send(wave + 1).await.unwrap();
+        }
+
+        assert_eq!(peak_active_deliveries, LOCAL_WORK_MAX_COUNT);
+        assert_eq!(runtime.work_budget.available_count(), LOCAL_WORK_MAX_COUNT);
+        assert_eq!(runtime.work_budget.available_bytes(), LOCAL_WORK_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn protocol_v2_stream_error_aborts_active_delivery_and_releases_inbound_reservation() {
+        let address = "127.0.0.1:9".parse().unwrap();
+        let (forwarder, mut event_rx) = forwarder_for_local_address(address).await;
+        let (writer, _control_rx, _response_rx) = test_priority_writer();
+        let mut runtime = RelayRuntime::new();
+        let request_id = "stream-error-delivery".to_string();
+        let assembler = TunnelStreamAssembler::from_start(
+            &serde_json::json!({
+                "version": TUNNEL_PROTOCOL_VERSION,
+                "direction": "request",
+                "stream_id": request_id,
+                "deadline_unix_ms": unix_time_ms() + 30_000,
+                "total_bytes": 17,
+                "frame_count": 1,
+            }),
+            "request",
+        )
+        .unwrap();
+        runtime.inbound_reserved_bytes = assembler.total_bytes;
+        runtime
+            .inbound_streams
+            .insert(request_id.clone(), assembler);
+
+        let task_request_id = request_id.clone();
+        let phase = Arc::new(AtomicU8::new(DELIVERY_STARTED));
+        let abort = runtime.workers.spawn(async move {
+            std::future::pending::<()>().await;
+            (task_request_id, Ok(()))
+        });
+        runtime
+            .active_deliveries
+            .insert(request_id.clone(), ActiveDelivery { abort, phase });
+
+        let message = serde_json::to_string(&ChannelMessage {
+            topic: "tunnel:connect".to_string(),
+            event: "tunnel_stream_error".to_string(),
+            payload: serde_json::json!({
+                "stream_id": request_id,
+                "code": "deadline_exceeded",
+            }),
+            reference: None,
+        })
+        .unwrap();
+
+        forwarder
+            .handle_tunnel_message(
+                &message,
+                &writer,
+                "tunnel:connect",
+                TunnelLimits::from_join_response(&serde_json::json!({})),
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(!runtime.active_deliveries.contains_key(&request_id));
+        assert!(!runtime.inbound_streams.contains_key(&request_id));
+        assert_eq!(runtime.inbound_reserved_bytes, 0);
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TunnelEvent::RequestFailed {
+                request_id: failed_request_id,
+                error,
+            }) if failed_request_id == request_id && error == "deadline_exceeded"
+        ));
+        assert!(
+            runtime
+                .workers
+                .join_next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+    }
+
     fn test_priority_writer() -> (
         PriorityWriter,
         mpsc::Receiver<OutboundItem>,
@@ -4372,6 +6514,50 @@ mod tests {
             panic!("expected text channel message");
         };
         serde_json::from_str(&text).unwrap()
+    }
+
+    fn protocol_v3_control(item: OutboundItem) -> tunnel_v3::ControlMessage {
+        let Message::Text(text) = item.message else {
+            panic!("expected protocol v3 text control");
+        };
+        tunnel_v3::decode_server_control(&text).unwrap()
+    }
+
+    fn protocol_v3_client_chunk(item: OutboundItem, max_chunk_bytes: usize) -> (Uuid, Vec<u8>) {
+        let Message::Binary(encoded) = item.message else {
+            panic!("expected protocol v3 binary response chunk");
+        };
+        assert!(encoded.len() >= 5);
+        assert_eq!(encoded[0], 0);
+        let metadata_bytes = encoded[1..5]
+            .iter()
+            .map(|length| usize::from(*length))
+            .sum::<usize>();
+        let payload_offset = 5 + metadata_bytes;
+        let chunk = tunnel_v3::decode_chunk(&encoded[payload_offset..], max_chunk_bytes).unwrap();
+        (chunk.stream_id, chunk.data.to_vec())
+    }
+
+    fn test_streaming_limits() -> tunnel_v3::StreamingLimits {
+        tunnel_v3::StreamingLimits {
+            max_request_body_bytes: 256 * 1024,
+            max_response_body_bytes: 256 * 1024,
+            max_start_metadata_bytes: 55_000,
+            max_control_payload_bytes: 63_000,
+            max_websocket_frame_bytes: TUNNEL_MAX_FRAME_BYTES,
+            max_chunk_bytes: 16 * 1024,
+            stream_window_bytes: 32 * 1024,
+            stream_window_items: 2,
+            connection_window_bytes: 64 * 1024,
+            connection_window_items: 4,
+            websocket_admission_bytes: 128 * 1024,
+            websocket_admission_items: 32,
+            service_ingress_admission_bytes: 64 * 1024,
+            service_ingress_admission_items: 4,
+            max_concurrent_streams: 4,
+            max_active_local_forwards: 4,
+            request_timeout_ms: 80_000,
+        }
     }
 
     async fn forwarder_for_local_address(
@@ -4399,6 +6585,195 @@ mod tests {
             ),
             event_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn protocol_v3_early_local_response_drains_large_request_and_relays_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let local_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 5\r\nConnection: close\r\n\r\nearly",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            socket.shutdown().await.unwrap();
+        });
+
+        let (forwarder, mut event_rx) = forwarder_for_local_address(address).await;
+        let (writer, mut control_rx, mut outbound_response_rx) = test_priority_writer();
+        let limits = test_streaming_limits();
+        let stream_id = Uuid::new_v4();
+        let request_bytes = limits.stream_window_bytes * 4;
+        let request_connection = tunnel_v3::ConnectionBudget::new(
+            limits.connection_window_bytes,
+            limits.connection_window_items,
+        )
+        .unwrap();
+        let (mut request_stream, request_body) = tunnel_v3::RequestStreamReceiver::new(
+            stream_id,
+            Some(request_bytes as u64),
+            limits,
+            request_connection,
+        )
+        .unwrap();
+        let incoming = tunnel_v3::IncomingRequest {
+            start: tunnel_v3::RequestStart {
+                stream_id,
+                deadline_unix_ms: unix_time_ms() + 10_000,
+                timeout_ms: 10_000,
+                method: "POST".to_string(),
+                path: "/early".to_string(),
+                query_string: String::new(),
+                headers: vec![(
+                    "content-type".to_string(),
+                    "application/octet-stream".to_string(),
+                )],
+                content_length: Some(request_bytes as u64),
+                replay: false,
+            },
+            body: request_body,
+        };
+        let phase = Arc::new(AtomicU8::new(DELIVERY_QUEUED));
+        let (response_window_tx, response_window_rx) =
+            mpsc::channel(limits.stream_window_items + 1);
+        let work_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let forward_task = tokio::spawn({
+            let forwarder = forwarder.clone();
+            let writer = writer.clone();
+            let phase = phase.clone();
+            async move {
+                forwarder
+                    .forward_v3_request(
+                        incoming,
+                        phase,
+                        writer,
+                        "tunnel:connect".to_string(),
+                        limits,
+                        tunnel_v3::ConnectionSendWindow::new(
+                            limits.connection_window_bytes,
+                            limits.connection_window_items,
+                        ),
+                        response_window_rx,
+                        work_permit,
+                    )
+                    .await
+            }
+        });
+
+        let request_chunk = vec![0xa5; limits.max_chunk_bytes];
+        let mut request_hasher = Sha256::new();
+        let mut offset = 0usize;
+        let mut sequence = 0u32;
+
+        while offset < request_bytes {
+            let bytes = (request_bytes - offset).min(request_chunk.len());
+            let encoded = tunnel_v3::encode_chunk(
+                stream_id,
+                sequence,
+                offset as u64,
+                &request_chunk[..bytes],
+                limits.max_chunk_bytes,
+            )
+            .unwrap();
+            request_stream.accept_frame(&encoded).unwrap();
+            request_hasher.update(&request_chunk[..bytes]);
+            offset += bytes;
+            sequence += 1;
+
+            let window = protocol_v3_control(
+                tokio::time::timeout(Duration::from_secs(2), control_rx.recv())
+                    .await
+                    .expect("request body did not keep draining after the early response")
+                    .unwrap(),
+            );
+            assert_eq!(window.event, "tunnel_stream_window");
+            assert_eq!(window.payload["direction"], "request");
+            assert_eq!(window.payload["consumed_bytes"], offset as u64);
+            assert_eq!(window.payload["consumed_items"], u64::from(sequence));
+        }
+
+        let checksum = request_hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        request_stream
+            .finish(request_bytes as u64, &checksum)
+            .unwrap();
+
+        let mut response_bytes = Vec::new();
+        let mut response_items = 0u64;
+        let mut saw_response_start = false;
+        let mut saw_response_end = false;
+
+        while !saw_response_end {
+            let item = tokio::time::timeout(Duration::from_secs(2), outbound_response_rx.recv())
+                .await
+                .expect("early local response was not relayed")
+                .unwrap();
+
+            match &item.message {
+                Message::Text(_) => {
+                    let control = protocol_v3_control(item);
+                    match control.event.as_str() {
+                        "tunnel_response_start" => {
+                            saw_response_start = true;
+                            assert_eq!(control.payload["status"], 413);
+                            assert_eq!(control.payload["content_length"], 5);
+                        }
+                        "tunnel_response_end" => {
+                            saw_response_end = true;
+                            assert_eq!(control.payload["total_bytes"], 5);
+                        }
+                        event => panic!("unexpected protocol v3 response control: {event}"),
+                    }
+                }
+                Message::Binary(_) => {
+                    let (chunk_stream_id, data) =
+                        protocol_v3_client_chunk(item, limits.max_chunk_bytes);
+                    assert_eq!(chunk_stream_id, stream_id);
+                    response_bytes.extend_from_slice(&data);
+                    response_items += 1;
+                    response_window_tx
+                        .send(tunnel_v3::WindowUpdate {
+                            consumed_bytes: response_bytes.len() as u64,
+                            consumed_items: response_items,
+                        })
+                        .await
+                        .unwrap();
+                }
+                message => panic!("unexpected protocol v3 response message: {message:?}"),
+            }
+        }
+
+        assert!(saw_response_start);
+        assert_eq!(response_bytes, b"early");
+        tokio::time::timeout(Duration::from_secs(2), forward_task)
+            .await
+            .expect("early response forwarding did not complete")
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase.load(Ordering::Acquire), DELIVERY_TERMINAL);
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TunnelEvent::RequestForwarded { status: 413, .. })
+        ));
+        local_server.await.unwrap();
     }
 
     fn test_delivery(deadline_unix_ms: u64) -> LocalDelivery {
@@ -4465,11 +6840,23 @@ mod tests {
 
         let cases: &[(&[u8], TunnelLimits, &str)] = &[
             (
+                b"HTTP/1.1 200 OK\r\nX-One: 1\r\nX-Two: 2\r\nContent-Length: 0\r\n\r\n",
+                TunnelLimits {
+                    max_request_body_bytes: 1024,
+                    max_response_body_bytes: 1024,
+                    max_response_header_bytes: 1024,
+                    max_response_header_items: 1,
+                    ordered_response_headers: true,
+                },
+                "response_headers_too_large",
+            ),
+            (
                 b"HTTP/1.1 200 OK\r\nX-Large: 1234567890\r\nContent-Length: 0\r\n\r\n",
                 TunnelLimits {
                     max_request_body_bytes: 1024,
                     max_response_body_bytes: 1024,
                     max_response_header_bytes: 8,
+                    max_response_header_items: TUNNEL_MAX_RESPONSE_HEADERS,
                     ordered_response_headers: true,
                 },
                 "response_headers_too_large",
@@ -4480,6 +6867,7 @@ mod tests {
                     max_request_body_bytes: 1024,
                     max_response_body_bytes: 4,
                     max_response_header_bytes: 1024,
+                    max_response_header_items: TUNNEL_MAX_RESPONSE_HEADERS,
                     ordered_response_headers: true,
                 },
                 "response_body_too_large",
@@ -4490,6 +6878,7 @@ mod tests {
                     max_request_body_bytes: 1024,
                     max_response_body_bytes: 1024,
                     max_response_header_bytes: 1024,
+                    max_response_header_items: TUNNEL_MAX_RESPONSE_HEADERS,
                     ordered_response_headers: true,
                 },
                 "response_read_failed",
@@ -4713,6 +7102,7 @@ mod tests {
             max_request_body_bytes: 1024,
             max_response_body_bytes: 1024,
             max_response_header_bytes: 1024,
+            max_response_header_items: TUNNEL_MAX_RESPONSE_HEADERS,
             ordered_response_headers: true,
         };
         let response_budget = ResponseBufferBudget::new();
