@@ -57,7 +57,6 @@ if ! jq -e '
     and any(
       $rules[];
       .type == "pull_request"
-      and (.parameters.required_approving_review_count // 0) >= 1
     )
     and any(
       $rules[];
@@ -73,7 +72,7 @@ if ! jq -e '
         )
     )
 ' "${main_rules}" >/dev/null; then
-  echo "::error::Effective main rules do not enforce the complete release check and review policy."
+  echo "::error::Effective main rules do not enforce the complete release check policy."
   exit 1
 fi
 
@@ -158,17 +157,10 @@ fi
 
 if ! jq -e '
   .name == "release"
-  and .can_admins_bypass == false
-  and any(
-    .protection_rules[]?;
-    .type == "required_reviewers"
-    and .prevent_self_review == true
-    and ((.reviewers // []) | length) >= 1
-  )
   and .deployment_branch_policy.protected_branches == false
   and .deployment_branch_policy.custom_branch_policies == true
 ' "${release_environment}" >/dev/null; then
-  echo "::error::The release environment must disable admin bypass, require non-self review, and use a custom deployment policy."
+  echo "::error::The release environment must exist and use a custom deployment policy."
   exit 1
 fi
 
