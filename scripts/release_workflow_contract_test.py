@@ -24,6 +24,7 @@ HOMEBREW_RENDERER = ROOT / ".github/scripts/render-homebrew-formula.py"
 V3_TEST_INVENTORY = ROOT / "fixtures/tunnel_v3_release_test_inventory.txt"
 V3_TEST_GATE = ROOT / "scripts/verify_tunnel_v3_release_tests.py"
 NPM_PUBLISH_SCRIPT = ROOT / "npm/scripts/publish-npm.sh"
+NPM_VERIFY_SCRIPT = ROOT / "npm/scripts/verify-package.js"
 
 EXPECTED_CHECKS = [
     "Rustfmt",
@@ -1069,6 +1070,22 @@ class ReleaseWorkflowTest(unittest.TestCase):
             'npm publish "${PACKAGE_TARBALL}"',
             publish_script,
         )
+
+    def test_npm_launcher_mode_is_verified_in_ci_and_before_publish(self) -> None:
+        verify_command = "node npm/scripts/verify-package.js"
+        self.assertIn(verify_command, job_body(self.ci, "test"))
+        self.assertIn(verify_command, job_body(self.release, "verify"))
+
+        publish = job_body(self.release, "publish-npm")
+        pack = publish.find("npm pack")
+        verify = publish.find(verify_command, pack)
+        registry_read = publish.find("registry.npmjs.org", verify)
+        self.assertGreaterEqual(pack, 0)
+        self.assertGreater(verify, pack)
+        self.assertGreater(registry_read, verify)
+
+        verifier = source(NPM_VERIFY_SCRIPT)
+        self.assertIn('["bin/hooklistener.js", 0o755]', verifier)
 
     def test_operator_governance_queries_are_paginated(self) -> None:
         contributing = source(ROOT / "CONTRIBUTING.md")
