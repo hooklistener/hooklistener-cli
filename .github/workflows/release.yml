@@ -183,7 +183,7 @@ jobs:
           fi
 
       - name: Test npm installer
-        run: node --test npm/packages/hooklistener/scripts/install.test.js
+        run: node --test npm/packages/hooklistener/scripts/install.test.js npm/scripts/verify-package.test.js
 
       - name: Validate crates.io package
         run: cargo publish --dry-run --locked
@@ -194,49 +194,7 @@ jobs:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-
-          npm pack \
-            --dry-run \
-            --json \
-            --ignore-scripts \
-            ./npm/packages/hooklistener > "${RUNNER_TEMP}/npm-pack.json"
-
-          TAG_VERSION="${TAG_VERSION#v}" \
-            PACK_JSON="${RUNNER_TEMP}/npm-pack.json" \
-            node <<'NODE'
-          const fs = require("node:fs");
-
-          const report = JSON.parse(fs.readFileSync(process.env.PACK_JSON, "utf8"));
-          if (!Array.isArray(report) || report.length !== 1) {
-            throw new Error("npm pack must produce exactly one package");
-          }
-
-          const packageReport = report[0];
-          if (
-            packageReport.name !== "hooklistener" ||
-            packageReport.version !== process.env.TAG_VERSION
-          ) {
-            throw new Error(
-              `unexpected npm package identity: ${packageReport.name}@${packageReport.version}`,
-            );
-          }
-
-          const expectedFiles = [
-            "README.md",
-            "bin/hooklistener.js",
-            "package.json",
-            "scripts/install.js",
-          ];
-          const actualFiles = packageReport.files
-            .map(({ path }) => path)
-            .sort();
-
-          if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
-            throw new Error(
-              `unexpected npm package contents: ${actualFiles.join(", ")}`,
-            );
-          }
-          NODE
+          node npm/scripts/verify-package.js "${TAG_VERSION#v}"
 
       - name: Build and smoke-test release binary
         shell: bash
@@ -947,6 +905,9 @@ jobs:
             echo "::error::npm pack did not produce the expected regular tarball."
             exit 1
           fi
+          node npm/scripts/verify-package.js \
+            "${VERSION}" \
+            "${RUNNER_TEMP}/npm-pack.json"
           mapfile -t package_files < <(
             find "${package_directory}" \
               -mindepth 1 \

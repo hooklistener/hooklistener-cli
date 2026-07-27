@@ -1,6 +1,6 @@
 {
   "name": "hooklistener",
-  "version": "1.8.4",
+  "version": "1.8.5",
   "description": "A fast, terminal-based CLI for browsing webhooks, forwarding events, and exposing local servers",
   "license": "MIT",
   "repository": {
