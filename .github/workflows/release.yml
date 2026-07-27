@@ -249,8 +249,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Keyed on the runner image, not just `runner.os`. ubuntu-22.04 (pinned
+      # above for the glibc floor) and CI's ubuntu-latest both report "Linux",
+      # so a shared key let this job restore aws-lc-sys objects compiled against
+      # glibc 2.38+ and fail to link against 2.35 on undefined __isoc23_*.
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.os }}
 
       - name: Build (cargo)
         run: cargo build --release --target ${{ matrix.target }} --locked
