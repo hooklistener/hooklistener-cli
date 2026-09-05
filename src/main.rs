@@ -559,17 +559,15 @@ enum CasesAction {
     Run {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Target URL, saved target ID, or "cli"
-        #[arg(long, conflicts_with_all = ["target_url", "target_id"])]
+        /// Target: a URL, a saved target ID, or cli for the running listen session
+        #[arg(long, value_name = "TARGET", conflicts_with_all = ["target_url", "target_id"])]
         target: Option<String>,
-        /// Explicit target URL to replay cases to
-        #[arg(long, conflicts_with_all = ["target", "target_id"])]
+        #[arg(long, hide = true, value_name = "URL", conflicts_with_all = ["target", "target_id"])]
         target_url: Option<String>,
-        /// Explicit saved replay target ID
-        #[arg(long, conflicts_with_all = ["target", "target_url"])]
+        #[arg(long, hide = true, value_name = "TARGET_ID", conflicts_with_all = ["target", "target_url"])]
         target_id: Option<String>,
-        /// Optional display name for the target
-        #[arg(long)]
+        /// Display name recorded for the target
+        #[arg(long, value_name = "NAME")]
         target_name: Option<String>,
         /// Wait for the run to complete before returning
         #[arg(long)]
@@ -765,13 +763,17 @@ enum MonitorAction {
         /// Consecutive failures before alerting
         #[arg(long, value_name = "N", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
         failure_threshold: u32,
-        /// Enable or disable email notifications (true or false)
+        /// Disable email notifications for this monitor
+        #[arg(long, conflicts_with = "email")]
+        no_email: bool,
         #[arg(
             long,
+            hide = true,
             default_value_t = true,
             action = ArgAction::Set,
             num_args = 0..=1,
-            default_missing_value = "true"
+            default_missing_value = "true",
+            conflicts_with = "no_email"
         )]
         email: bool,
         /// Organization ID override (falls back to configured default)
@@ -811,8 +813,13 @@ enum MonitorAction {
         /// Check interval
         #[arg(long, value_enum, ignore_case = true)]
         interval: Option<MonitorInterval>,
-        /// Enable or disable the monitor
-        #[arg(long)]
+        /// Resume checks for this monitor
+        #[arg(long, conflicts_with_all = ["disable", "enabled"])]
+        enable: bool,
+        /// Pause checks for this monitor
+        #[arg(long, conflicts_with_all = ["enable", "enabled"])]
+        disable: bool,
+        #[arg(long, hide = true, value_name = "BOOL")]
         enabled: Option<bool>,
         /// Consecutive failures before alerting
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
@@ -1128,11 +1135,29 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
         }
     } else {
         return Err(anyhow!(
-            "Target is required. Use --target, --target-url, or --target-id."
+            "Target is required. Use --target <URL|TARGET_ID|cli>."
         ));
     }
 
     Ok(params)
+}
+
+/// Effective email setting for `monitor create`: `--no-email` wins over the
+/// hidden `--email <BOOL>` shape (clap already rejects supplying both).
+fn monitor_email_enabled(email: bool, no_email: bool) -> bool {
+    email && !no_email
+}
+
+/// Effective `enabled` update for `monitor update`: `--enable` / `--disable`
+/// take precedence over the hidden `--enabled <BOOL>` shape.
+fn monitor_enabled_update(enable: bool, disable: bool, enabled: Option<bool>) -> Option<bool> {
+    if enable {
+        Some(true)
+    } else if disable {
+        Some(false)
+    } else {
+        enabled
+    }
 }
 
 fn case_run_failed(result: &api::CaseRunResult) -> bool {
@@ -3308,6 +3333,7 @@ async fn run(cli: Cli) -> Result<()> {
                 body_contains,
                 body,
                 failure_threshold,
+                no_email,
                 email,
                 org,
             } => {
@@ -3316,6 +3342,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
 
+                let email_enabled = monitor_email_enabled(email, no_email);
                 let mut params = serde_json::json!({
                     "name": name,
                     "url": url,
@@ -3323,7 +3350,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "expected_status_code": expected_status,
                     "check_interval": interval.minutes(),
                     "failure_threshold": failure_threshold,
-                    "email_enabled": email,
+                    "email_enabled": email_enabled,
                 });
                 if let Some(bc) = body_contains {
                     params["body_contains"] = serde_json::Value::String(bc);
@@ -3384,10 +3411,13 @@ async fn run(cli: Cli) -> Result<()> {
                 method,
                 expected_status,
                 interval,
+                enable,
+                disable,
                 enabled,
                 failure_threshold,
                 org,
             } => {
+                let enabled = monitor_enabled_update(enable, disable, enabled);
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
@@ -3421,7 +3451,7 @@ async fn run(cli: Cli) -> Result<()> {
 
                 if params.is_empty() {
                     return Err(anyhow!(
-                        "No fields to update. Use --name, --url, --method, --expected-status, --interval, --enabled, or --failure-threshold."
+                        "No fields to update. Use --name, --url, --method, --expected-status, --interval, --enable, --disable, or --failure-threshold."
                     ));
                 }
 
@@ -7844,6 +7874,210 @@ mod tests {
             }) => assert!(!email),
             _ => panic!("expected monitor create command"),
         }
+    }
+
+    #[test]
+    fn monitor_no_email_disables_notifications() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--no-email",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Monitor {
+                action:
+                    MonitorAction::Create {
+                        email, no_email, ..
+                    },
+            }) => {
+                assert!(email);
+                assert!(no_email);
+                assert!(!monitor_email_enabled(email, no_email));
+            }
+            _ => panic!("expected monitor create command"),
+        }
+
+        assert!(monitor_email_enabled(true, false));
+        assert!(!monitor_email_enabled(false, false));
+    }
+
+    #[test]
+    fn monitor_email_and_no_email_conflict() {
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "monitor",
+                "create",
+                "API",
+                "https://example.com/health",
+                "--email",
+                "--no-email",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn monitor_update_enable_disable_conflict() {
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "monitor",
+                "update",
+                "mon_1",
+                "--enable",
+                "--disable",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "monitor",
+                "update",
+                "mon_1",
+                "--enable",
+                "--enabled",
+                "true",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn monitor_update_enable_and_disable_set_enabled() {
+        for (flag, expected) in [("--enable", Some(true)), ("--disable", Some(false))] {
+            let cli =
+                Cli::try_parse_from(["hooklistener", "monitor", "update", "mon_1", flag]).unwrap();
+            match cli.command {
+                Some(Commands::Monitor {
+                    action:
+                        MonitorAction::Update {
+                            enable,
+                            disable,
+                            enabled,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(enable, expected == Some(true));
+                    assert_eq!(disable, expected == Some(false));
+                    assert_eq!(enabled, None);
+                    assert_eq!(monitor_enabled_update(enable, disable, enabled), expected);
+                }
+                _ => panic!("expected monitor update command"),
+            }
+        }
+
+        assert_eq!(monitor_enabled_update(false, false, None), None);
+    }
+
+    #[test]
+    fn monitor_update_enabled_hidden_flag_still_parses() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "update",
+            "mon_1",
+            "--enabled",
+            "false",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Monitor {
+                action:
+                    MonitorAction::Update {
+                        enable,
+                        disable,
+                        enabled,
+                        ..
+                    },
+            }) => {
+                assert!(!enable);
+                assert!(!disable);
+                assert_eq!(enabled, Some(false));
+                assert_eq!(
+                    monitor_enabled_update(enable, disable, enabled),
+                    Some(false)
+                );
+            }
+            _ => panic!("expected monitor update command"),
+        }
+    }
+
+    #[test]
+    fn cases_run_hidden_target_flags_still_parse() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_123",
+            "--target-url",
+            "http://localhost:3000",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cases {
+                action:
+                    CasesAction::Run {
+                        target,
+                        target_url,
+                        target_id,
+                        ..
+                    },
+            }) => {
+                assert_eq!(target, None);
+                assert_eq!(target_url.as_deref(), Some("http://localhost:3000"));
+                assert_eq!(target_id, None);
+            }
+            _ => panic!("expected cases run command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_123",
+            "--target-id",
+            "t_1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cases {
+                action:
+                    CasesAction::Run {
+                        target,
+                        target_url,
+                        target_id,
+                        ..
+                    },
+            }) => {
+                assert_eq!(target, None);
+                assert_eq!(target_url, None);
+                assert_eq!(target_id.as_deref(), Some("t_1"));
+            }
+            _ => panic!("expected cases run command"),
+        }
+    }
+
+    #[test]
+    fn cases_run_help_shows_only_the_target_flag() {
+        let mut cmd = Cli::command();
+        let run = cmd
+            .find_subcommand_mut("cases")
+            .unwrap()
+            .find_subcommand_mut("run")
+            .unwrap();
+        let help = run.render_help().to_string();
+        assert!(help.contains("--target <TARGET>"));
+        assert!(!help.contains("--target-url"));
+        assert!(!help.contains("--target-id"));
+        assert!(help.contains("--target-name <NAME>"));
     }
 
     #[test]
