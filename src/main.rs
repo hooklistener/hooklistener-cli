@@ -346,7 +346,7 @@ enum TunnelAction {
         /// Keep polling for new events until interrupted
         #[arg(long)]
         follow: bool,
-        /// Poll interval while following, such as 500ms, 2s, or 1m
+        /// Poll interval for --follow, such as 500ms, 1s, or 5s
         #[arg(long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration)]
         interval: Duration,
         #[arg(long, hide = true, value_name = "MS", conflicts_with = "interval")]
@@ -7269,6 +7269,22 @@ mod tests {
     #[test]
     fn help_snapshot_anon() {
         insta::assert_snapshot!("help_anon", render_help_snapshot(&["anon"]));
+    }
+
+    #[test]
+    fn help_snapshot_anon_create() {
+        insta::assert_snapshot!(
+            "help_anon_create",
+            render_help_snapshot(&["anon", "create"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_anon_tunnel() {
+        insta::assert_snapshot!(
+            "help_anon_tunnel",
+            render_help_snapshot(&["anon", "tunnel"])
+        );
     }
 
     #[test]

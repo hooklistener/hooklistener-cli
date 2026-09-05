@@ -12,8 +12,7 @@ Options:
       --capture-id <CAPTURE_ID>  Only events for this capture
       --attempt-id <ATTEMPT_ID>  Only events for this delivery attempt
       --follow                   Keep polling for new events until interrupted
-      --interval <DURATION>      Poll interval while following, such as 500ms, 2s, or 1m [default:
-                                 1s]
+      --interval <DURATION>      Poll interval for --follow, such as 500ms, 1s, or 5s [default: 1s]
   -o, --org <ORG_ID>             Organization ID (overrides the configured default)
   -h, --help                     Print help
 

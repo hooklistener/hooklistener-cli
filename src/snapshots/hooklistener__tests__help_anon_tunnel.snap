@@ -1,0 +1,25 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"anon\", \"tunnel\"])"
+---
+Expose a local HTTP server without signing in
+
+Usage: hooklistener anon tunnel [OPTIONS]
+
+Options:
+  -p, --port <PORT>         Local port to forward requests to [default: 3000]
+      --host <HOST>         Local host to forward to [default: localhost]
+      --name <NAME>         Stable public route name
+      --ttl <DURATION>      Route lifetime, such as 300, 10m, or 30m [default: 15m]
+      --allow-non-loopback  Allow forwarding to a host that resolves outside loopback
+  -h, --help                Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout
