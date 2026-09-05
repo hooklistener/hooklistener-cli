@@ -49,10 +49,10 @@ use tunnel::TunnelEvent;
 
 #[derive(Parser)]
 #[command(name = "hooklistener")]
-#[command(about = "A CLI tool for debugging webhooks")]
+#[command(about = "Inspect webhooks, replay failures, and expose localhost from your terminal")]
 #[command(version)]
 #[command(
-    after_help = "COMMAND GROUPS:\n  Capture and delivery: listen, tunnel, endpoint, static-tunnel, anon\n  Review and automation: cases, share, monitor\n  Account and settings: login, logout, org, config\n  Maintenance: diagnostics, clean-logs, completions, update\n\nCOMMON WORKFLOWS:\n  Inspect an existing debug endpoint:\n    hooklistener listen <endpoint> --target http://localhost:3000\n\n  Expose a local HTTP server:\n    hooklistener tunnel --port 3000\n\n  Create and inspect hosted captures:\n    hooklistener endpoint create <name>\n    hooklistener endpoint requests <endpoint-id>"
+    after_help = "COMMAND GROUPS:\n  Capture and delivery: listen, tunnel, endpoint, static-tunnel, anon\n  Review and automation: cases, share, monitor\n  Account and settings: login, logout, org, config\n  Maintenance: diagnostics, clean-logs, completions, update\n\nCOMMON WORKFLOWS:\n  Sign in:\n    hooklistener login\n\n  Forward an existing debug endpoint:\n    hooklistener listen <endpoint-slug> --target http://localhost:3000\n\n  Expose a local HTTP server:\n    hooklistener tunnel --port 3000\n\n  Create and inspect hosted captures:\n    hooklistener endpoint create <name>\n    hooklistener endpoint list-requests <endpoint-id>"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -130,13 +130,7 @@ impl LogLevel {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authenticate with Hooklistener via the device flow
-    Login {
-        /// Start a new authentication even if a valid token already exists
-        #[arg(long)]
-        force: bool,
-    },
-    /// Connect an existing debug endpoint and forward its WebSocket events
+    /// Forward events from a debug endpoint to a local URL
     Listen {
         /// Debug endpoint slug to listen to
         endpoint: String,
@@ -157,68 +151,6 @@ enum Commands {
         #[arg(long)]
         insecure_tls: bool,
     },
-    /// Generate a diagnostic bundle for support
-    Diagnostics {
-        /// Output directory for the diagnostic bundle
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
-    },
-    /// Clean up old log files
-    CleanLogs {
-        /// Maximum number of log files to keep
-        #[arg(short, long, default_value = "10")]
-        keep: usize,
-    },
-    /// Manage CLI configuration
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
-    /// Sign out and clear locally stored token
-    Logout,
-    /// Organization helpers
-    Org {
-        #[command(subcommand)]
-        action: OrgAction,
-    },
-    /// Debug endpoint helpers
-    Endpoint {
-        #[command(subcommand)]
-        action: EndpointAction,
-    },
-    /// Saved endpoint case helpers
-    Cases {
-        #[command(subcommand)]
-        action: CasesAction,
-    },
-    /// Static tunnel slug management
-    StaticTunnel {
-        #[command(subcommand)]
-        action: StaticTunnelAction,
-    },
-    /// Anonymous temporary debug endpoints (no login required)
-    Anon {
-        #[command(subcommand)]
-        action: AnonAction,
-    },
-    /// Share captured requests via public links
-    Share {
-        #[command(subcommand)]
-        action: ShareAction,
-    },
-    /// Uptime monitoring for your endpoints
-    Monitor {
-        #[command(subcommand)]
-        action: MonitorAction,
-    },
-    /// Generate shell completion scripts
-    Completions {
-        /// Target shell
-        #[arg(value_enum)]
-        shell: CompletionShell,
-    },
-    /// Update hooklistener to the latest version
-    Update,
     /// Expose a local HTTP server on a public Hooklistener URL
     Tunnel {
         #[command(subcommand)]
@@ -227,6 +159,74 @@ enum Commands {
         #[command(flatten)]
         target: TunnelTargetArgs,
     },
+    /// Manage debug endpoints and their captured requests
+    Endpoint {
+        #[command(subcommand)]
+        action: EndpointAction,
+    },
+    /// Reserve and manage static tunnel slugs
+    StaticTunnel {
+        #[command(subcommand)]
+        action: StaticTunnelAction,
+    },
+    /// Create temporary endpoints and tunnels (no login required)
+    Anon {
+        #[command(subcommand)]
+        action: AnonAction,
+    },
+    /// Run saved replay cases against a target
+    Cases {
+        #[command(subcommand)]
+        action: CasesAction,
+    },
+    /// Create, inspect, and revoke public links to captured requests
+    Share {
+        #[command(subcommand)]
+        action: ShareAction,
+    },
+    /// Create and inspect uptime monitors
+    Monitor {
+        #[command(subcommand)]
+        action: MonitorAction,
+    },
+    /// Sign in with the device flow
+    Login {
+        /// Start a new sign-in even if a valid token exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sign out and delete the stored token
+    Logout,
+    /// List organizations and set the default one
+    Org {
+        #[command(subcommand)]
+        action: OrgAction,
+    },
+    /// Show and set CLI configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Write a diagnostic bundle for support
+    Diagnostics {
+        /// Output directory for the diagnostic bundle
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+    },
+    /// Delete old log files
+    CleanLogs {
+        /// Maximum number of log files to keep
+        #[arg(short, long, default_value = "10")]
+        keep: usize,
+    },
+    /// Print a shell completion script
+    Completions {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+    /// Update hooklistener to the latest release
+    Update,
 }
 
 #[derive(Args, Clone, Default)]
@@ -371,7 +371,7 @@ enum CompletionShell {
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Display current configuration
+    /// Show the current configuration
     Show,
     /// Set a configuration value
     Set {
@@ -386,7 +386,7 @@ enum ConfigAction {
 enum OrgAction {
     /// List organizations available to your account
     List,
-    /// Set the default organization used by CLI commands
+    /// Set the default organization
     Use {
         /// Organization ID
         id: String,
@@ -552,7 +552,7 @@ enum StaticTunnelAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// Create a new static tunnel slug
+    /// Reserve a static tunnel slug
     Create {
         /// Slug to reserve
         slug: String,
@@ -563,7 +563,7 @@ enum StaticTunnelAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// Delete a static tunnel slug by ID
+    /// Release a static tunnel slug
     Delete {
         /// Static tunnel ID
         slug_id: String,
@@ -575,13 +575,13 @@ enum StaticTunnelAction {
 
 #[derive(Subcommand)]
 enum AnonAction {
-    /// Create a temporary anonymous endpoint (no login required)
+    /// Create a temporary anonymous endpoint
     Create {
         /// Time-to-live in seconds (default: 86400 = 24 hours)
         #[arg(long)]
         ttl: Option<u64>,
     },
-    /// Show status of an anonymous endpoint
+    /// Show an anonymous endpoint
     Show {
         /// Anonymous endpoint ID
         id: String,
@@ -628,7 +628,7 @@ enum AnonAction {
         #[arg(long)]
         allow_non_loopback: bool,
     },
-    /// Claim an anonymous route into an authenticated organization
+    /// Claim an anonymous route into an organization
     Claim {
         route_id: String,
         #[arg(long)]
@@ -640,7 +640,7 @@ enum AnonAction {
 
 #[derive(Subcommand)]
 enum ShareAction {
-    /// Create a shareable link for a captured request
+    /// Create a public link for a captured request
     Create {
         /// Debug request ID to share
         debug_request_id: String,
@@ -657,7 +657,7 @@ enum ShareAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// List all shares for a captured request
+    /// List links for a captured request
     List {
         /// Debug request ID
         debug_request_id: String,
@@ -665,12 +665,12 @@ enum ShareAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// View a shared request by its share token (public, no login required)
+    /// Show a shared request by token (no login required)
     Show {
         /// Share token
         token: String,
     },
-    /// Revoke a shared request link
+    /// Revoke a public link
     Revoke {
         /// Share token to revoke
         token: String,
@@ -682,7 +682,7 @@ enum ShareAction {
 
 #[derive(Subcommand)]
 enum MonitorAction {
-    /// Create a new uptime monitor
+    /// Create an uptime monitor
     Create {
         /// Monitor display name
         name: String,
@@ -719,13 +719,13 @@ enum MonitorAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// List all uptime monitors
+    /// List uptime monitors
     List {
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
         org: Option<String>,
     },
-    /// Show details of an uptime monitor
+    /// Show an uptime monitor
     Show {
         /// Monitor ID
         id: String,
@@ -770,7 +770,7 @@ enum MonitorAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// Show recent check history for a monitor
+    /// List recent checks for a monitor
     Checks {
         /// Monitor ID
         id: String,
@@ -6931,6 +6931,41 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn top_level_commands_are_listed_in_grouped_order() {
+        let command = Cli::command();
+        let names: Vec<&str> = command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                "listen",
+                "tunnel",
+                "endpoint",
+                "static-tunnel",
+                "anon",
+                "cases",
+                "share",
+                "monitor",
+                "login",
+                "logout",
+                "org",
+                "config",
+                "diagnostics",
+                "clean-logs",
+                "completions",
+                "update",
+            ]
+        );
+        assert_eq!(
+            command.get_about().map(ToString::to_string).as_deref(),
+            Some("Inspect webhooks, replay failures, and expose localhost from your terminal")
+        );
     }
 
     #[test]
