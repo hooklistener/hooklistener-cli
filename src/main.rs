@@ -59,32 +59,73 @@ struct Cli {
     command: Option<Commands>,
 
     /// Output supported command responses or event streams as JSON
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     json: bool,
 
     /// Styling policy for human output
-    #[arg(long, global = true, value_enum, default_value_t)]
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t,
+        help_heading = "Global options"
+    )]
     color: ColorMode,
 
     /// Confirm destructive commands without an interactive prompt
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     yes: bool,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info", value_parser = validate_log_level)]
-    log_level: String,
+    /// Log level
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        ignore_case = true,
+        default_value_t = LogLevel::Info,
+        value_name = "LEVEL",
+        help_heading = "Global options"
+    )]
+    log_level: LogLevel,
 
-    /// Custom directory for log files
-    #[arg(long)]
+    /// Directory for log files
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        help_heading = "Global options"
+    )]
     log_dir: Option<PathBuf>,
 
-    /// Output logs to stdout in addition to files (for debugging)
-    #[arg(long)]
+    /// Also write logs to stdout
+    #[arg(long, global = true, help_heading = "Global options")]
     log_stdout: bool,
 
     /// Allow a non-loopback cleartext Hooklistener server (development only)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     allow_insecure_dev_server: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -743,16 +784,6 @@ enum MonitorAction {
         #[arg(long)]
         org: Option<String>,
     },
-}
-
-fn validate_log_level(s: &str) -> Result<String, String> {
-    match s.to_lowercase().as_str() {
-        "trace" | "debug" | "info" | "warn" | "error" => Ok(s.to_string()),
-        _ => Err(format!(
-            "Invalid log level: {}. Valid levels are: trace, debug, info, warn, error",
-            s
-        )),
-    }
 }
 
 fn normalize_http_method(method: Option<String>) -> Result<Option<String>> {
@@ -2091,7 +2122,7 @@ async fn run(cli: Cli) -> Result<()> {
     match command {
         Commands::Login { force } => {
             let log_config = LogConfig {
-                level: log_level.clone(),
+                level: log_level.as_str().to_string(),
                 output_to_stdout: log_stdout,
                 directory: log_dir
                     .clone()
@@ -2111,7 +2142,7 @@ async fn run(cli: Cli) -> Result<()> {
             let ws_url = effective_listen_ws_url(ws_url.as_deref())?;
             // Initialize logging for tunnel
             let log_config = LogConfig {
-                level: log_level.clone(),
+                level: log_level.as_str().to_string(),
                 output_to_stdout: false, // Disable stdout logging for TUI
                 directory: log_dir
                     .clone()
@@ -3262,7 +3293,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Tunnel { action, target } => {
             // Initialize logging for tunnel
             let log_config = LogConfig {
-                level: log_level.clone(),
+                level: log_level.as_str().to_string(),
                 output_to_stdout: false, // Disable stdout logging for TUI
                 directory: log_dir
                     .clone()
@@ -6895,6 +6926,94 @@ mod tests {
         .unwrap();
 
         assert!(cli.allow_insecure_dev_server);
+    }
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn log_level_is_global_after_tunnel_subcommand() {
+        let cli =
+            Cli::try_parse_from(["hooklistener", "tunnel", "--log-level", "debug", "prepare"])
+                .unwrap();
+
+        assert_eq!(cli.log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn log_flags_are_global_after_endpoint_list() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "list",
+            "--log-stdout",
+            "--log-dir",
+            "/tmp/x",
+        ])
+        .unwrap();
+
+        assert!(cli.log_stdout);
+        assert_eq!(cli.log_dir, Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn log_level_ignores_case() {
+        let cli = Cli::try_parse_from(["hooklistener", "--log-level", "WARN", "endpoint", "list"])
+            .unwrap();
+
+        assert_eq!(cli.log_level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn log_level_defaults_to_info() {
+        let cli = Cli::try_parse_from(["hooklistener", "endpoint", "list"]).unwrap();
+
+        assert_eq!(cli.log_level, LogLevel::Info);
+        assert_eq!(cli.log_level.as_str(), "info");
+    }
+
+    #[test]
+    fn log_level_rejects_unknown_value() {
+        let result =
+            Cli::try_parse_from(["hooklistener", "--log-level", "verbose", "endpoint", "list"]);
+
+        match result {
+            Ok(_) => panic!("expected --log-level verbose to be rejected"),
+            Err(error) => assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue),
+        }
+    }
+
+    #[test]
+    fn insecure_dev_server_flag_is_hidden_from_help() {
+        let mut command = Cli::command().term_width(100);
+        let help = command.render_help().to_string();
+
+        assert!(!help.contains("insecure"), "{help}");
+        assert_eq!(help.matches("Global options:").count(), 1, "{help}");
+        for flag in [
+            "--json",
+            "--color",
+            "--yes",
+            "--log-level",
+            "--log-dir",
+            "--log-stdout",
+        ] {
+            assert!(help.contains(flag), "missing {flag} in {help}");
+        }
+
+        let mut root = Cli::command().term_width(100);
+        root.build();
+        let help = root
+            .find_subcommand_mut("endpoint")
+            .and_then(|endpoint| endpoint.find_subcommand_mut("list"))
+            .expect("endpoint list command")
+            .render_help()
+            .to_string();
+
+        assert!(!help.contains("insecure"), "{help}");
+        assert_eq!(help.matches("Global options:").count(), 1, "{help}");
     }
 
     #[test]
