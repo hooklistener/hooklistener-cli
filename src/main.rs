@@ -2511,9 +2511,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Diagnostics { output } => {
             // Initialize minimal logging for diagnostics
             let log_config = LogConfig {
-                level: "info".to_string(),
+                level: log_level.as_str().to_string(),
                 // Keep machine-readable output clean when --json is enabled.
                 output_to_stdout: !json,
+                directory: log_dir
+                    .clone()
+                    .unwrap_or_else(|| LogConfig::default().directory),
                 ..Default::default()
             };
             let logger = Logger::new(log_config)?;
@@ -7813,6 +7816,28 @@ mod tests {
 
         assert!(cli.log_stdout);
         assert_eq!(cli.log_dir, Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn log_flags_are_global_after_diagnostics() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "diagnostics",
+            "--log-level",
+            "debug",
+            "--log-dir",
+            "/tmp/x",
+            "--output",
+            "/tmp/bundle",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.log_level, LogLevel::Debug);
+        assert_eq!(cli.log_dir, Some(PathBuf::from("/tmp/x")));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Diagnostics { ref output }) if output == &PathBuf::from("/tmp/bundle")
+        ));
     }
 
     #[test]
