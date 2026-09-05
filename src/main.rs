@@ -39,7 +39,7 @@ use tokio::{
     task::JoinHandle,
     time::sleep,
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use api::ApiClient;
 use app::{App, AppState, FeedbackKind};
@@ -3967,7 +3967,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
         config.save()?;
     }
 
-    let mut device_flow = auth::DeviceCodeFlow::new(api::default_base_url()?);
+    let mut device_flow = auth::DeviceCodeFlow::new(api::default_base_url()?)?;
 
     let user_code = device_flow.initiate_device_flow().await?;
     let display_code = device_flow
@@ -3997,19 +3997,21 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
             Ok(Some(token_response)) => {
                 execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
                 let access_expires_at = match token_response.expires_in {
-                    Some(secs) => Utc::now() + ChronoDuration::seconds(secs as i64),
+                    Some(secs) => token_expiry_from_now(secs)?,
                     None => Utc::now() + ChronoDuration::days(SESSION_TOKEN_VALIDITY_DAYS),
                 };
                 let refresh_expires_at = token_response
                     .refresh_expires_in
-                    .map(|secs| Utc::now() + ChronoDuration::seconds(secs as i64));
-                config.set_tokens(
+                    .map(token_expiry_from_now)
+                    .transpose()?;
+                save_login_tokens(
+                    &config,
                     token_response.access_token,
                     access_expires_at,
                     token_response.refresh_token,
                     refresh_expires_at,
-                );
-                config.save()?;
+                    None,
+                )?;
                 print_status(OutputStatus::Ok, "AUTHENTICATION COMPLETE");
                 println!();
                 print_field(
@@ -4232,23 +4234,35 @@ async fn refresh_access_token_from_config_with(
     }
 
     let response = api::refresh_access_token(&refresh_token, base_url).await?;
-    let expires_at = Utc::now() + ChronoDuration::seconds(response.expires_in as i64);
+    let expires_at = token_expiry_from_now(response.expires_in)?;
 
-    let mut updated = config::Config {
-        access_token: config.access_token.clone(),
-        token_expires_at: config.token_expires_at,
-        refresh_token: config.refresh_token.clone(),
-        refresh_token_expires_at: config.refresh_token_expires_at,
-        selected_organization_id: config.selected_organization_id.clone(),
-        last_update_check: config.last_update_check,
-        latest_known_version: config.latest_known_version.clone(),
+    // Other processes (`org use`, `config set`, `login --force`, `logout`) may
+    // have saved the config since this copy was loaded. Persist only the fields
+    // this refresh owns on top of what is currently on disk, so their changes
+    // (including a rotated refresh token) survive.
+    let mut updated = match load_saved_config(save_path) {
+        Ok(Some(on_disk)) => on_disk,
+        Ok(None) => in_memory_config_copy(config),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to reload config before saving refreshed token; saving in-memory copy"
+            );
+            in_memory_config_copy(config)
+        }
     };
-    updated.set_tokens(
-        response.access_token.clone(),
-        expires_at,
-        Some(refresh_token),
-        config.refresh_token_expires_at,
-    );
+
+    if updated.refresh_token.is_none() {
+        // The user logged out in another process. Do not resurrect the session
+        // on disk: the fresh access token is handed back for this process to
+        // finish its current work, and `config` mirrors the logged-out state so
+        // the background refresh loop stops on its next iteration.
+        *config = updated;
+        return Ok(response.access_token);
+    }
+
+    updated.access_token = Some(response.access_token.clone());
+    updated.token_expires_at = Some(expires_at);
     if let Some(path) = save_path {
         updated.save_to(path)?;
     } else {
@@ -4257,6 +4271,76 @@ async fn refresh_access_token_from_config_with(
     *config = updated;
 
     Ok(response.access_token)
+}
+
+/// Persists freshly issued login tokens on top of the config currently on disk.
+///
+/// The device-authorization wait can last minutes, so `loaded` (the copy taken
+/// when `login` started) may be stale: `org use`, `config set`, or an update
+/// check in another process may have saved since. Only the token fields belong
+/// to the login, so everything else is taken from disk and `loaded` is used
+/// solely as a fallback when no config file exists any more.
+fn save_login_tokens(
+    loaded: &config::Config,
+    access_token: String,
+    access_expires_at: chrono::DateTime<Utc>,
+    refresh_token: Option<String>,
+    refresh_expires_at: Option<chrono::DateTime<Utc>>,
+    save_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let mut updated = match load_saved_config(save_path) {
+        Ok(Some(on_disk)) => on_disk,
+        Ok(None) => in_memory_config_copy(loaded),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to reload config before saving login tokens; saving in-memory copy"
+            );
+            in_memory_config_copy(loaded)
+        }
+    };
+    updated.set_tokens(
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+    );
+    match save_path {
+        Some(path) => updated.save_to(path),
+        None => updated.save(),
+    }
+}
+
+/// Loads the config currently on disk, or `None` when no config file exists.
+fn load_saved_config(path: Option<&std::path::Path>) -> Result<Option<config::Config>> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => config::Config::config_path()?,
+    };
+    match std::fs::symlink_metadata(&path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+        Ok(_) => config::Config::load_from(&path).map(Some),
+    }
+}
+
+fn in_memory_config_copy(config: &config::Config) -> config::Config {
+    config::Config {
+        access_token: config.access_token.clone(),
+        token_expires_at: config.token_expires_at,
+        refresh_token: config.refresh_token.clone(),
+        refresh_token_expires_at: config.refresh_token_expires_at,
+        selected_organization_id: config.selected_organization_id.clone(),
+        last_update_check: config.last_update_check,
+        latest_known_version: config.latest_known_version.clone(),
+    }
+}
+
+/// Converts a server-supplied token lifetime into an absolute expiry, failing
+/// cleanly instead of panicking on absurd values.
+fn token_expiry_from_now(seconds: u64) -> Result<chrono::DateTime<Utc>> {
+    auth::expiry_from_now(seconds)
+        .map_err(|err| anyhow!("Authorization server returned an invalid token lifetime ({err})"))
 }
 
 fn require_organization(cli_org: Option<String>, config: &config::Config) -> Result<String> {
@@ -5204,7 +5288,8 @@ fn print_shared_request_full(data: &serde_json::Value) {
             let status = fwd
                 .get("status_code")
                 .and_then(|v| v.as_u64())
-                .map(|c| style_status_code(c as u16))
+                .and_then(|c| u16::try_from(c).ok())
+                .map(style_status_code)
                 .unwrap_or_else(|| "-".to_string());
             let duration = fwd
                 .get("duration_ms")
@@ -6305,6 +6390,163 @@ mod tests {
                 .unwrap_err();
         assert!(!err.to_string().is_empty());
         assert_eq!(config.access_token.as_deref(), Some("old-token"));
+    }
+
+    async fn mock_refresh_success(server: &mut mockito::Server) -> mockito::Mock {
+        server
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(200)
+            .with_body(r#"{"access_token":"new-token","expires_in":3600}"#)
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_organization_selected_by_another_process() {
+        let mut server = mockito::Server::new_async().await;
+        mock_refresh_success(&mut server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = refreshable_config();
+        config.selected_organization_id = Some("org-a".into());
+        config.save_to(&path).unwrap();
+
+        let mut other_process = config::Config::load_from(&path).unwrap();
+        other_process.selected_organization_id = Some("org-b".into());
+        other_process.save_to(&path).unwrap();
+
+        refresh_access_token_from_config_with(&mut config, &server.url(), Some(&path))
+            .await
+            .unwrap();
+
+        let saved = config::Config::load_from(&path).unwrap();
+        assert_eq!(saved.selected_organization_id.as_deref(), Some("org-b"));
+        assert_eq!(saved.access_token.as_deref(), Some("new-token"));
+        assert_eq!(config.selected_organization_id.as_deref(), Some("org-b"));
+        assert_eq!(config.access_token.as_deref(), Some("new-token"));
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_refresh_token_rotated_by_another_process() {
+        let mut server = mockito::Server::new_async().await;
+        mock_refresh_success(&mut server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = refreshable_config();
+        config.save_to(&path).unwrap();
+
+        let rotated_expiry = Utc::now() + ChronoDuration::days(30);
+        let mut other_process = config::Config::load_from(&path).unwrap();
+        other_process.set_tokens(
+            "relogin-token".into(),
+            Utc::now() + ChronoDuration::hours(1),
+            Some("rotated-refresh".into()),
+            Some(rotated_expiry),
+        );
+        other_process.save_to(&path).unwrap();
+
+        refresh_access_token_from_config_with(&mut config, &server.url(), Some(&path))
+            .await
+            .unwrap();
+
+        let saved = config::Config::load_from(&path).unwrap();
+        assert_eq!(saved.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(saved.refresh_token_expires_at, Some(rotated_expiry));
+        assert_eq!(saved.access_token.as_deref(), Some("new-token"));
+        assert_eq!(config.refresh_token.as_deref(), Some("rotated-refresh"));
+    }
+
+    #[tokio::test]
+    async fn refresh_does_not_resurrect_session_after_logout_elsewhere() {
+        let mut server = mockito::Server::new_async().await;
+        mock_refresh_success(&mut server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = refreshable_config();
+        config.selected_organization_id = Some("org-a".into());
+        config.save_to(&path).unwrap();
+
+        let mut other_process = config::Config::load_from(&path).unwrap();
+        other_process.clear_token();
+        other_process.save_to(&path).unwrap();
+
+        let token = refresh_access_token_from_config_with(&mut config, &server.url(), Some(&path))
+            .await
+            .unwrap();
+
+        assert_eq!(token, "new-token");
+        let saved = config::Config::load_from(&path).unwrap();
+        assert_eq!(saved.access_token, None);
+        assert_eq!(saved.refresh_token, None);
+        assert_eq!(saved.selected_organization_id.as_deref(), Some("org-a"));
+        assert_eq!(config.refresh_token, None);
+    }
+
+    #[tokio::test]
+    async fn refresh_writes_in_memory_config_when_file_is_missing() {
+        let mut server = mockito::Server::new_async().await;
+        mock_refresh_success(&mut server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = refreshable_config();
+        config.selected_organization_id = Some("org-a".into());
+
+        refresh_access_token_from_config_with(&mut config, &server.url(), Some(&path))
+            .await
+            .unwrap();
+
+        let saved = config::Config::load_from(&path).unwrap();
+        assert_eq!(saved.access_token.as_deref(), Some("new-token"));
+        assert_eq!(saved.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(saved.selected_organization_id.as_deref(), Some("org-a"));
+    }
+
+    #[tokio::test]
+    async fn refresh_falls_back_to_in_memory_config_when_file_is_corrupt() {
+        let mut server = mockito::Server::new_async().await;
+        mock_refresh_success(&mut server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let mut config = refreshable_config();
+        config.selected_organization_id = Some("org-a".into());
+
+        let token = refresh_access_token_from_config_with(&mut config, &server.url(), Some(&path))
+            .await
+            .unwrap();
+
+        assert_eq!(token, "new-token");
+        let saved = config::Config::load_from(&path).unwrap();
+        assert_eq!(saved.access_token.as_deref(), Some("new-token"));
+        assert_eq!(saved.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(saved.selected_organization_id.as_deref(), Some("org-a"));
+        assert_eq!(config.access_token.as_deref(), Some("new-token"));
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_absurd_expires_in_with_clear_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(200)
+            .with_body(r#"{"access_token":"new-token","expires_in":18446744073709551615}"#)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = refreshable_config();
+
+        let err = refresh_access_token_from_config_with(&mut config, &server.url(), Some(&path))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Authorization server returned an invalid token lifetime"),
+            "{err}"
+        );
+        assert_eq!(config.access_token.as_deref(), Some("old-token"));
+        assert!(!path.exists());
     }
 
     fn parsed_tunnel_target(args: &[&str]) -> TunnelTarget {
@@ -7558,5 +7800,164 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_findings {
+    //! Regression tests for the 2026-09 security audit findings.
+    //! Run with: cargo test audit_findings
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    fn mock_refresh(server: &mut mockito::ServerGuard, body: &str) -> mockito::Mock {
+        server
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create()
+    }
+
+    fn config_with_refresh_token() -> config::Config {
+        config::Config {
+            access_token: Some("old-access".to_string()),
+            token_expires_at: Some(Utc::now() - ChronoDuration::minutes(1)),
+            refresh_token: Some("refresh-1".to_string()),
+            refresh_token_expires_at: Some(Utc::now() + ChronoDuration::days(1)),
+            selected_organization_id: Some("org-a".to_string()),
+            ..config::Config::default()
+        }
+    }
+
+    /// Regression test for finding 3: the background refresh loop (and
+    /// `ensure_valid_token`) used to rebuild the whole config from the copy
+    /// loaded at process start and write it back, silently reverting anything
+    /// another process saved in the meantime (`org use`, `login --force`,
+    /// `config set`). The refresh must now only touch the fields it owns.
+    #[tokio::test]
+    async fn token_refresh_preserves_config_changes_made_by_other_processes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        let mut server = mockito::Server::new_async().await;
+        let _mock = mock_refresh(
+            &mut server,
+            r#"{"access_token":"new-access","expires_in":3600}"#,
+        );
+
+        // Long-running process loads its config at startup.
+        let mut in_memory = config_with_refresh_token();
+        in_memory.save_to(&path).unwrap();
+
+        // Meanwhile another process changes the selected organization and
+        // rotates the credentials via `hooklistener login --force`.
+        let mut other_process = config::Config::load_from(&path).unwrap();
+        other_process.selected_organization_id = Some("org-b".to_string());
+        other_process.set_tokens(
+            "relogin-access".to_string(),
+            Utc::now() + ChronoDuration::hours(1),
+            Some("refresh-2".to_string()),
+            Some(Utc::now() + ChronoDuration::days(30)),
+        );
+        other_process.save_to(&path).unwrap();
+
+        refresh_access_token_from_config_with(&mut in_memory, &server.url(), Some(&path))
+            .await
+            .unwrap();
+
+        let on_disk = config::Config::load_from(&path).unwrap();
+        assert_eq!(on_disk.selected_organization_id.as_deref(), Some("org-b"));
+        assert_eq!(on_disk.refresh_token.as_deref(), Some("refresh-2"));
+    }
+
+    /// Regression test for the login-path instance of finding 3:
+    /// `run_login_flow` used to save the config copy it loaded before the
+    /// minutes-long device-authorization wait, reverting anything another
+    /// process (`org use`, `config set`, an update check) saved meanwhile.
+    /// The login must now write only the token fields on top of what is on
+    /// disk.
+    #[test]
+    fn login_preserves_config_changes_made_by_other_processes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+
+        // `hooklistener login` loads its config before waiting on the browser.
+        let loaded = config::Config {
+            selected_organization_id: Some("org-a".to_string()),
+            ..config::Config::default()
+        };
+        loaded.save_to(&path).unwrap();
+
+        // Meanwhile another process switches organizations and records an
+        // update check.
+        let mut other_process = config::Config::load_from(&path).unwrap();
+        other_process.selected_organization_id = Some("org-b".to_string());
+        other_process.latest_known_version = Some("9.9.9".to_string());
+        other_process.save_to(&path).unwrap();
+
+        save_login_tokens(
+            &loaded,
+            "new-access".to_string(),
+            Utc::now() + ChronoDuration::hours(1),
+            Some("new-refresh".to_string()),
+            Some(Utc::now() + ChronoDuration::days(30)),
+            Some(&path),
+        )
+        .unwrap();
+
+        let on_disk = config::Config::load_from(&path).unwrap();
+        assert_eq!(on_disk.selected_organization_id.as_deref(), Some("org-b"));
+        assert_eq!(on_disk.latest_known_version.as_deref(), Some("9.9.9"));
+        assert_eq!(on_disk.access_token.as_deref(), Some("new-access"));
+        assert_eq!(on_disk.refresh_token.as_deref(), Some("new-refresh"));
+    }
+
+    #[test]
+    fn login_saves_tokens_when_config_file_was_removed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        let loaded = config::Config {
+            selected_organization_id: Some("org-a".to_string()),
+            ..config::Config::default()
+        };
+
+        save_login_tokens(
+            &loaded,
+            "new-access".to_string(),
+            Utc::now() + ChronoDuration::hours(1),
+            None,
+            None,
+            Some(&path),
+        )
+        .unwrap();
+
+        let on_disk = config::Config::load_from(&path).unwrap();
+        assert_eq!(on_disk.selected_organization_id.as_deref(), Some("org-a"));
+        assert_eq!(on_disk.access_token.as_deref(), Some("new-access"));
+    }
+
+    /// Regression test for finding 7 (second site):
+    /// `refresh_access_token_from_config_with` used to cast the
+    /// server-supplied `expires_in` with `as i64` and add it to now, which
+    /// panicked for large values. It must now fail with a clean error.
+    #[tokio::test]
+    async fn token_refresh_survives_absurd_expires_in() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        let mut server = mockito::Server::new_async().await;
+        let _mock = mock_refresh(
+            &mut server,
+            r#"{"access_token":"new-access","expires_in":9000000000000000000}"#,
+        );
+        let mut in_memory = config_with_refresh_token();
+        let base_url = server.url();
+
+        let result = tokio::task::spawn(async move {
+            refresh_access_token_from_config_with(&mut in_memory, &base_url, Some(&path)).await
+        })
+        .await
+        .expect("token refresh must not panic");
+
+        let _ = result;
     }
 }

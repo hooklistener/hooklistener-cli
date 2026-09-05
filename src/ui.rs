@@ -2575,11 +2575,7 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .take(5) // Limit to first 5 headers
                 .map(|(key, value)| {
-                    let value_display = if value.len() > 50 {
-                        format!("{}...", &value[..50])
-                    } else {
-                        value.clone()
-                    };
+                    let value_display = truncate_table_value(value, 50);
                     Row::new(vec![
                         Cell::from(key.clone()).style(
                             Style::default()
@@ -2623,10 +2619,10 @@ fn draw_forward_result(frame: &mut Frame, app: &App, area: Rect) {
         let body_text = if result.success {
             if result.body.is_empty() {
                 "(empty response)"
-            } else if result.body.len() > 500 {
+            } else if result.body.chars().count() > 500 {
                 &format!(
-                    "{}...\n\n[Truncated - showing first 500 characters]",
-                    &result.body[..500]
+                    "{}\n\n[Truncated - showing first 500 characters]",
+                    truncate_table_value(&result.body, 500)
                 )
             } else {
                 &result.body
@@ -4118,5 +4114,58 @@ mod tests {
 
         assert!(logo_frame_lines(&app, Rect::new(0, 0, 1, 5), 1).is_empty());
         assert!(logo_frame_lines(&app, Rect::new(0, 0, 10, 2), 1).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audit_findings {
+    //! Regression tests for the 2026-09 security audit findings.
+    //! Run with: cargo test audit_findings
+    use super::*;
+    use crate::models::ForwardResponse;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::collections::HashMap;
+
+    /// Regression test for finding 2: `draw_forward_result` used to slice the
+    /// response body with `&result.body[..500]`, a byte index, so a local
+    /// response whose UTF-8 text had a multi-byte character straddling byte
+    /// 500 panicked the TUI. Truncation now counts characters.
+    #[test]
+    fn forward_result_renders_multibyte_bodies_without_panicking() {
+        let mut app = App::new().expect("app");
+        app.state = AppState::ForwardResult;
+        app.forward_result = Some(ForwardResponse {
+            success: true,
+            status_code: Some(200),
+            headers: HashMap::new(),
+            body: format!("x{}", "é".repeat(300)), // 601 bytes; byte 500 splits an "é"
+            error_message: None,
+            target_url: "http://localhost:3000".to_string(),
+            duration_ms: 12,
+        });
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("rendering a forward result must not panic");
+
+        // A body longer than the 500-character preview exercises the
+        // truncation branch itself with multi-byte characters.
+        app.forward_result.as_mut().expect("forward result").body = "é".repeat(600);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("rendering a truncated multi-byte body must not panic");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Truncated"),
+            "long body should render the truncation notice"
+        );
     }
 }

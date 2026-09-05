@@ -1,13 +1,21 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
+use reqwest::redirect::Policy;
 use serde::Deserialize;
 use std::time::Duration as StdDuration;
 use tokio::time::Instant;
 
 const DEFAULT_POLL_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const SLOW_DOWN_INCREMENT: StdDuration = StdDuration::from_secs(5);
+/// Upper bound on a single device-flow request so a stalled authorization
+/// server cannot hang `hooklistener login` forever.
+const DEVICE_FLOW_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const MAX_AUTH_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_ERROR_DETAIL_CHARS: usize = 240;
+/// Longest server-supplied `expires_in` (in seconds) the CLI accepts: ten years.
+/// Anything beyond that is treated as a malformed response rather than a real
+/// expiry, which also keeps the chrono arithmetic far away from overflow.
+pub(crate) const MAX_EXPIRY_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
 pub struct DeviceCodeResponse {
@@ -46,16 +54,27 @@ pub struct DeviceCodeFlow {
 }
 
 impl DeviceCodeFlow {
-    pub fn new(base_url: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    /// Build a flow whose HTTP client never follows redirects and times out.
+    ///
+    /// The poll request carries the device code in the URL and the response
+    /// body carries the issued tokens, so a redirect from the authorization
+    /// server must surface as a failed poll rather than be followed to
+    /// whatever origin the `Location` header names.
+    pub fn new(base_url: String) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .timeout(DEVICE_FLOW_REQUEST_TIMEOUT)
+            .build()
+            .context("Failed to build authorization HTTP client")?;
+        Ok(Self {
+            client,
             base_url,
             device_code: None,
             user_code: None,
             expires_at: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
             next_poll_at: None,
-        }
+        })
     }
 
     pub async fn initiate_device_flow(&mut self) -> Result<String> {
@@ -83,7 +102,7 @@ impl DeviceCodeFlow {
 
         self.device_code = Some(device_response.device_code.clone());
         self.user_code = Some(device_response.user_code.clone());
-        self.expires_at = Some(Utc::now() + Duration::seconds(device_response.expires_in as i64));
+        self.expires_at = Some(expiry_from_now(device_response.expires_in)?);
         self.poll_interval = StdDuration::from_secs(
             device_response
                 .interval
@@ -244,8 +263,12 @@ impl DeviceCodeFlow {
 
     pub fn format_user_code(&self) -> Option<String> {
         self.user_code.as_ref().map(|code| {
-            if code.len() == 8 {
-                format!("{}-{}", &code[0..4], &code[4..8])
+            if code.chars().count() == 8 {
+                let (head, tail): (String, String) = (
+                    code.chars().take(4).collect(),
+                    code.chars().skip(4).collect(),
+                );
+                format!("{head}-{tail}")
             } else {
                 code.clone()
             }
@@ -264,6 +287,22 @@ impl DeviceCodeFlow {
     }
 }
 
+/// Converts a server-supplied `expires_in` (seconds from now) into an absolute
+/// expiry without any panicking arithmetic. Values above
+/// [`MAX_EXPIRY_SECONDS`] are rejected as malformed.
+pub(crate) fn expiry_from_now(seconds: u64) -> Result<DateTime<Utc>> {
+    if seconds > MAX_EXPIRY_SECONDS {
+        return Err(anyhow!(
+            "Authorization server returned an unreasonable expiry of {seconds} seconds"
+        ));
+    }
+    i64::try_from(seconds)
+        .ok()
+        .and_then(Duration::try_seconds)
+        .and_then(|lifetime| Utc::now().checked_add_signed(lifetime))
+        .ok_or_else(|| anyhow!("Authorization server returned an unrepresentable expiry"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,7 +318,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         let user_code = flow.initiate_device_flow().await.unwrap();
         assert_eq!(user_code, "ABCD1234");
         assert_eq!(flow.device_code.as_deref(), Some("dev123"));
@@ -296,7 +335,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         let result = flow.initiate_device_flow().await;
         assert!(result.is_err());
         mock.assert_async().await;
@@ -315,7 +354,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.initiate_device_flow().await.unwrap();
 
         assert_eq!(
@@ -336,7 +375,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.initiate_device_flow().await.unwrap();
 
         assert_eq!(flow.poll_interval, DEFAULT_POLL_INTERVAL);
@@ -354,7 +393,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.device_code = Some("dev123".to_string());
         let result = flow.poll_for_authorization().await.unwrap();
         assert!(result.is_none());
@@ -372,7 +411,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.device_code = Some("dev123".to_string());
         let result = flow.poll_for_authorization().await.unwrap();
         let token_response = result.unwrap();
@@ -398,11 +437,62 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.device_code = Some(device_code.to_string());
         flow.poll_for_authorization().await.unwrap();
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn poll_for_authorization_does_not_follow_redirects() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/api/v1/device?device_code=dev123")
+            .with_status(302)
+            .with_header("location", "/unexpected")
+            .create_async()
+            .await;
+        let unexpected = server
+            .mock("GET", "/unexpected")
+            .expect(0)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token":"leaked"}"#)
+            .create_async()
+            .await;
+
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
+        flow.device_code = Some("dev123".to_string());
+        let error = flow.poll_for_authorization().await.unwrap_err();
+
+        assert!(error.to_string().contains("302"), "{error}");
+        redirect.assert_async().await;
+        unexpected.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn initiate_device_flow_does_not_follow_redirects() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("POST", "/api/v1/device")
+            .with_status(307)
+            .with_header("location", "/unexpected")
+            .create_async()
+            .await;
+        let unexpected = server
+            .mock("POST", "/unexpected")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
+        let error = flow.initiate_device_flow().await.unwrap_err();
+
+        assert!(error.to_string().contains("307"), "{error}");
+        redirect.assert_async().await;
+        unexpected.assert_async().await;
     }
 
     #[tokio::test]
@@ -416,7 +506,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.device_code = Some("dev123".to_string());
         let result = flow.poll_for_authorization().await.unwrap();
 
@@ -433,7 +523,7 @@ mod tests {
 
     #[test]
     fn repeated_slow_down_responses_keep_increasing_poll_interval() {
-        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
 
         flow.handle_authorization_error("slow_down").unwrap();
         flow.handle_authorization_error("slow_down").unwrap();
@@ -443,7 +533,7 @@ mod tests {
 
     #[test]
     fn authorization_pending_preserves_poll_interval() {
-        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
         flow.poll_interval = StdDuration::from_secs(9);
 
         flow.handle_authorization_error("authorization_pending")
@@ -465,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn poll_transport_error_does_not_expose_device_code() {
         let device_code = "sensitive-device-code";
-        let mut flow = DeviceCodeFlow::new("://invalid-base-url".to_string());
+        let mut flow = DeviceCodeFlow::new("://invalid-base-url".to_string()).unwrap();
         flow.device_code = Some(device_code.to_string());
 
         let error = flow.poll_for_authorization().await.unwrap_err().to_string();
@@ -478,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_before_deadline_returns_without_sending_request() {
-        let mut flow = DeviceCodeFlow::new("://invalid-base-url".to_string());
+        let mut flow = DeviceCodeFlow::new("://invalid-base-url".to_string()).unwrap();
         flow.device_code = Some("dev123".to_string());
         flow.next_poll_at = Some(Instant::now() + StdDuration::from_secs(60));
 
@@ -498,7 +588,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.device_code = Some("dev123".to_string());
         let error = flow.poll_for_authorization().await.unwrap_err().to_string();
 
@@ -518,7 +608,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.device_code = Some("dev123".to_string());
         let error = flow.poll_for_authorization().await.unwrap_err().to_string();
 
@@ -539,7 +629,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.device_code = Some("dev123".to_string());
         let error = flow.poll_for_authorization().await.unwrap_err().to_string();
 
@@ -556,7 +646,7 @@ mod tests {
             .create_async()
             .await;
 
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         flow.device_code = Some("dev123".to_string());
         let result = flow.poll_for_authorization().await;
         assert!(result.is_err());
@@ -567,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_without_device_code_errors() {
         let server = mockito::Server::new_async().await;
-        let mut flow = DeviceCodeFlow::new(server.url());
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
         let result = flow.poll_for_authorization().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No device code"));
@@ -575,27 +665,27 @@ mod tests {
 
     #[test]
     fn test_format_user_code_8_chars() {
-        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
         flow.user_code = Some("ABCD1234".to_string());
         assert_eq!(flow.format_user_code(), Some("ABCD-1234".to_string()));
     }
 
     #[test]
     fn test_format_user_code_other_length() {
-        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
         flow.user_code = Some("ABC".to_string());
         assert_eq!(flow.format_user_code(), Some("ABC".to_string()));
     }
 
     #[test]
     fn test_format_user_code_none() {
-        let flow = DeviceCodeFlow::new("http://localhost".to_string());
+        let flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
         assert_eq!(flow.format_user_code(), None);
     }
 
     #[test]
     fn test_time_remaining_future() {
-        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
         flow.expires_at = Some(Utc::now() + Duration::minutes(5));
         let remaining = flow.time_remaining().unwrap();
         assert!(remaining > Duration::zero());
@@ -603,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_time_remaining_past() {
-        let mut flow = DeviceCodeFlow::new("http://localhost".to_string());
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
         flow.expires_at = Some(Utc::now() - Duration::minutes(5));
         let remaining = flow.time_remaining().unwrap();
         assert_eq!(remaining, Duration::zero());
@@ -611,7 +701,84 @@ mod tests {
 
     #[test]
     fn test_time_remaining_not_set() {
-        let flow = DeviceCodeFlow::new("http://localhost".to_string());
+        let flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
         assert!(flow.time_remaining().is_none());
+    }
+
+    #[test]
+    fn expiry_from_now_accepts_normal_and_zero_lifetimes() {
+        let before = Utc::now();
+        let expires_at = expiry_from_now(3600).unwrap();
+        assert!(expires_at >= before + Duration::seconds(3600));
+        assert!(expires_at <= Utc::now() + Duration::seconds(3600));
+
+        let immediate = expiry_from_now(0).unwrap();
+        assert!(immediate >= before);
+        assert!(immediate <= Utc::now());
+    }
+
+    #[test]
+    fn expiry_from_now_accepts_the_ceiling_and_rejects_beyond_it() {
+        assert!(expiry_from_now(MAX_EXPIRY_SECONDS).is_ok());
+        assert!(expiry_from_now(MAX_EXPIRY_SECONDS + 1).is_err());
+    }
+
+    #[test]
+    fn expiry_from_now_rejects_absurd_lifetimes_without_panicking() {
+        for seconds in [u64::MAX, i64::MAX as u64, i64::MAX as u64 / 1000 + 1] {
+            let error = expiry_from_now(seconds).unwrap_err();
+            assert!(error.to_string().contains("unreasonable expiry"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_findings {
+    //! Regression tests for the 2026-09 security audit findings.
+    //! Run with: cargo test audit_findings
+    use super::*;
+
+    /// Regression test for finding 6: `format_user_code` used to slice bytes
+    /// at index 4 whenever the code was 8 bytes long, which panicked when a
+    /// multi-byte character straddled that boundary. The code is
+    /// server-supplied, so it must be split by chars, never by bytes.
+    #[test]
+    fn format_user_code_tolerates_non_ascii_eight_byte_codes() {
+        let mut flow = DeviceCodeFlow::new("http://localhost".to_string()).unwrap();
+        flow.user_code = Some("abcéabc".to_string()); // 7 chars, 8 bytes
+        assert_eq!(flow.user_code.as_deref().map(str::len), Some(8));
+
+        let formatted = flow.format_user_code();
+
+        assert!(formatted.is_some());
+    }
+
+    /// Regression test for finding 7: `expires_in` used to be cast with
+    /// `as i64` and fed to `chrono::Duration::seconds`, which panics past
+    /// i64::MAX / 1000, and the following `Utc::now() + duration` panicked on
+    /// overflow as well. Absurd values must now yield a clean error.
+    #[tokio::test]
+    async fn initiate_device_flow_rejects_absurd_expires_in_without_panicking() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/v1/device")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"device_code":"dev123","user_code":"ABCD1234","expires_in":9000000000000000000}"#,
+            )
+            .create_async()
+            .await;
+
+        let mut flow = DeviceCodeFlow::new(server.url()).unwrap();
+        let result = tokio::task::spawn(async move { flow.initiate_device_flow().await })
+            .await
+            .expect("initiate_device_flow must not panic");
+
+        let error = result.expect_err("an absurd expires_in must be rejected");
+        assert!(
+            error.to_string().contains("unreasonable expiry"),
+            "unexpected error: {error}"
+        );
     }
 }
