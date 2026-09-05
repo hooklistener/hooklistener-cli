@@ -273,7 +273,7 @@ pub struct Organization {
     pub name: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct RelayTicket {
     pub ticket: String,
     pub scope: String,
@@ -287,7 +287,7 @@ fn default_tunnel_protocol_versions() -> Vec<u64> {
     vec![2]
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AnonymousTunnelRouteCreated {
     pub id: String,
     pub slug: String,
@@ -612,16 +612,11 @@ pub struct StaticTunnelCreateResponse {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelLifecycleContract {
     pub id: String,
     pub version: String,
     pub schema: TunnelSchemaVersion,
-    pub receipts: Value,
-    pub events: Value,
-    pub resources: Value,
-    pub lifecycle: Value,
-    pub exit_codes: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -703,7 +698,7 @@ pub struct TunnelAttemptResource {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelLifecycleEvent {
     pub id: String,
     pub position: u64,
@@ -728,13 +723,13 @@ pub struct TunnelCollection<T> {
     pub meta: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelEventPage {
     pub data: Vec<TunnelLifecycleEvent>,
     pub meta: TunnelEventPageMeta,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelEventPageMeta {
     pub cursor: String,
     pub has_more: bool,
@@ -742,23 +737,18 @@ pub struct TunnelEventPageMeta {
     pub resync: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelReconnectDescriptor {
-    pub session: TunnelSessionResource,
-    pub topic: String,
     pub resume_token: String,
-    pub resume_token_expires_in: u64,
-    pub cursor: String,
-    pub ownership: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MessageResponse {
     #[serde(default)]
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DataResponse<T> {
     data: T,
 }
@@ -911,7 +901,7 @@ pub struct UptimeChecksResponse {
     pub stats: Option<UptimeChecksStats>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TokenRefreshResponse {
     pub access_token: String,
     pub expires_in: u64,
@@ -2519,7 +2509,6 @@ mod tests {
             .reconnect_tunnel_session("session-123")
             .await
             .unwrap();
-        assert_eq!(reconnect.cursor, "opaque");
         assert_eq!(reconnect.resume_token, "secret-resume-token");
         contract_mock.assert_async().await;
         session_mock.assert_async().await;

@@ -5791,16 +5791,7 @@ fn style_status_code(code: u16) -> String {
 }
 
 fn error_hint(err: &anyhow::Error) -> Option<&str> {
-    if let Some(e) = err.downcast_ref::<errors::ApiError>() {
-        return e.hint();
-    }
-    if let Some(e) = err.downcast_ref::<errors::TunnelError>() {
-        return e.hint();
-    }
     if let Some(e) = err.downcast_ref::<errors::TunnelLifecycleError>() {
-        return e.hint();
-    }
-    if let Some(e) = err.downcast_ref::<errors::ConfigError>() {
         return e.hint();
     }
     if let Some(e) = err.downcast_ref::<errors::UpdateError>() {
@@ -5821,14 +5812,8 @@ fn error_hint(err: &anyhow::Error) -> Option<&str> {
 }
 
 fn error_code(err: &anyhow::Error) -> String {
-    if err.downcast_ref::<errors::ApiError>().is_some() {
-        "api_error".to_string()
-    } else if err.downcast_ref::<errors::TunnelError>().is_some() {
-        "tunnel_error".to_string()
-    } else if let Some(error) = err.downcast_ref::<errors::TunnelLifecycleError>() {
+    if let Some(error) = err.downcast_ref::<errors::TunnelLifecycleError>() {
         error.code().to_string()
-    } else if err.downcast_ref::<errors::ConfigError>().is_some() {
-        "config_error".to_string()
     } else if err.downcast_ref::<errors::UpdateError>().is_some() {
         "update_error".to_string()
     } else {
@@ -6375,11 +6360,6 @@ mod tests {
             id: "hooklistener.tunnel.lifecycle".to_string(),
             version: format!("{major}.0.0"),
             schema: api::TunnelSchemaVersion { major, minor: 0 },
-            receipts: serde_json::json!({}),
-            events: serde_json::json!({}),
-            resources: serde_json::json!({}),
-            lifecycle: serde_json::json!({}),
-            exit_codes: serde_json::json!({}),
         }
     }
 

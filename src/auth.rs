@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::Duration as StdDuration;
 use tokio::time::Instant;
 
@@ -9,7 +9,7 @@ const SLOW_DOWN_INCREMENT: StdDuration = StdDuration::from_secs(5);
 const MAX_AUTH_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_ERROR_DETAIL_CHARS: usize = 240;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct DeviceCodeResponse {
     pub device_code: String,
     pub user_code: String,
@@ -18,7 +18,7 @@ pub struct DeviceCodeResponse {
     pub interval: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -29,7 +29,7 @@ pub struct TokenResponse {
     pub refresh_expires_in: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct PendingResponse {
     pub error: String,
 }

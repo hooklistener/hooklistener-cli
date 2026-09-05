@@ -1,6 +1,5 @@
 use crate::api::ApiClient;
 use crate::config::Config;
-use crate::errors::ApiError;
 use crate::models::{ForwardResponse, WebhookRequest};
 use crate::syntax::JsonHighlighter;
 use anyhow::{Result, anyhow};
@@ -119,10 +118,6 @@ pub struct TunnelStats {
     pub status_4xx: u64,
     pub status_5xx: u64,
     pub total_duration_ms: u64,
-    #[allow(dead_code)]
-    pub bytes_in: u64,
-    #[allow(dead_code)]
-    pub bytes_out: u64,
 }
 
 impl TunnelStats {
@@ -1432,12 +1427,9 @@ impl App {
                     self.state = AppState::ForwardResult;
                 }
                 Err(e) => {
-                    let hint = e
-                        .downcast_ref::<ApiError>()
-                        .and_then(|ae| ae.hint().map(String::from));
                     self.state = AppState::Error {
                         message: format!("Failed to forward request: {}", e),
-                        hint,
+                        hint: None,
                     };
                 }
             }

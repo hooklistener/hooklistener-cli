@@ -16,8 +16,6 @@ pub struct LogConfig {
     pub directory: PathBuf,
     pub output_to_stdout: bool,
     pub max_log_files: usize,
-    #[allow(dead_code)] // Reserved for future log file size management
-    pub max_file_size_mb: u64,
 }
 
 impl Default for LogConfig {
@@ -32,7 +30,6 @@ impl Default for LogConfig {
             directory: log_dir,
             output_to_stdout: false,
             max_log_files: 10,
-            max_file_size_mb: 10,
         }
     }
 }
@@ -112,11 +109,6 @@ impl Logger {
             session_id,
             _guard: guard,
         })
-    }
-
-    #[allow(dead_code)] // Reserved for external session tracking
-    pub fn session_id(&self) -> &Uuid {
-        &self.session_id
     }
 
     pub fn cleanup_old_logs(log_dir: &Path, max_files: usize) -> Result<usize> {

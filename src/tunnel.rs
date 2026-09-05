@@ -1836,7 +1836,7 @@ fn validate_join_mode(response: &serde_json::Value, expected: &str) -> Result<()
 }
 
 /// Webhook request received from the server (Tunnel format)
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelWebhookRequest {
     pub id: String,
     #[serde(default)]
