@@ -132,15 +132,20 @@ impl LogLevel {
 enum Commands {
     /// Forward events from a debug endpoint to a local URL
     Listen {
-        /// Debug endpoint slug to listen to
-        endpoint: String,
+        /// Debug endpoint slug (from `endpoint list`)
+        endpoint_slug: String,
 
         /// Local URL to forward requests to
-        #[arg(short, long, default_value = "http://localhost:3000")]
+        #[arg(
+            short,
+            long,
+            value_name = "URL",
+            default_value = "http://localhost:3000"
+        )]
         target: String,
 
         /// WebSocket server URL; requires wss except for approved development use
-        #[arg(long, value_name = "WSS_URL")]
+        #[arg(long, value_name = "URL")]
         ws_url: Option<String>,
 
         /// Allow forwarding to a target that resolves outside loopback
@@ -212,20 +217,20 @@ enum Commands {
     },
     /// Write a diagnostic bundle for support
     Diagnostics {
-        /// Output directory for the diagnostic bundle
-        #[arg(short, long, default_value = ".")]
+        /// Directory for the diagnostic bundle
+        #[arg(short, long, value_name = "DIR", default_value = ".")]
         output: PathBuf,
     },
     /// Delete old log files
     CleanLogs {
-        /// Maximum number of log files to keep
-        #[arg(short, long, default_value = "10")]
+        /// Number of log files to keep
+        #[arg(short, long, value_name = "N", default_value = "10")]
         keep: usize,
     },
     /// Print a shell completion script
     Completions {
         /// Shell to generate completions for
-        #[arg(value_enum, value_name = "SHELL")]
+        #[arg(value_enum, ignore_case = true, value_name = "SHELL")]
         shell: CompletionShell,
     },
     /// Update hooklistener to the latest release
@@ -245,8 +250,8 @@ struct TunnelTargetArgs {
     #[arg(long)]
     host: Option<String>,
 
-    /// Organization ID override (falls back to configured default)
-    #[arg(short, long, value_name = "ORG_ID")]
+    /// Organization ID (overrides the configured default)
+    #[arg(short = 'o', long, value_name = "ORG_ID")]
     org: Option<String>,
 
     /// Static tunnel slug to attach (from `static-tunnel create`)
@@ -399,6 +404,7 @@ enum CompletionShell {
     Bash,
     Zsh,
     Fish,
+    #[value(name = "powershell", alias = "power-shell")]
     PowerShell,
     Elvish,
 }
@@ -412,7 +418,7 @@ enum ConfigAction {
         /// Configuration key
         #[arg(value_enum)]
         key: ConfigKey,
-        /// New value (`none` clears the key)
+        /// New value
         value: String,
     },
 }
@@ -429,8 +435,8 @@ enum OrgAction {
     List,
     /// Set the default organization
     Use {
-        /// Organization ID
-        id: String,
+        /// Organization ID (from `org list`)
+        org_id: String,
     },
     /// Clear the default organization
     Clear,
@@ -442,33 +448,33 @@ enum EndpointAction {
     Create {
         /// Endpoint display name
         name: String,
-        /// Optional custom slug
+        /// Custom slug
         #[arg(long)]
         slug: Option<String>,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// List debug endpoints for an organization
     List {
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Show a single debug endpoint by ID
     Show {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Delete a debug endpoint by ID
     Delete {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// List captured requests for an endpoint
@@ -482,8 +488,8 @@ enum EndpointAction {
         /// Results per page
         #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Show a captured request
@@ -491,29 +497,30 @@ enum EndpointAction {
     ShowRequest {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Debug request ID
+        /// Captured request ID
         request_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Delete a captured request
     DeleteRequest {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Debug request ID
+        /// Captured request ID
         request_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Replay a captured request to a target URL
     ForwardRequest {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Debug request ID
+        /// Captured request ID
         request_id: String,
-        /// Target URL to replay to
+        /// URL to replay the request to
+        #[arg(value_name = "URL")]
         target_url: String,
         /// HTTP method override
         #[arg(long, value_enum, ignore_case = true)]
@@ -521,8 +528,8 @@ enum EndpointAction {
         /// Validate scope and print the forward plan without queueing delivery
         #[arg(long)]
         dry_run: bool,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// List forwards of a captured request
@@ -530,7 +537,7 @@ enum EndpointAction {
     ListForwards {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Debug request ID
+        /// Captured request ID
         request_id: String,
         /// Page number
         #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
@@ -538,8 +545,8 @@ enum EndpointAction {
         /// Results per page
         #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Show a forward by ID
@@ -547,8 +554,8 @@ enum EndpointAction {
     ShowForward {
         /// Forward ID
         forward_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -582,8 +589,8 @@ enum CasesAction {
         interval: Option<Duration>,
         #[arg(long, hide = true, value_name = "MS", conflicts_with = "interval")]
         interval_ms: Option<u64>,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -592,27 +599,27 @@ enum CasesAction {
 enum StaticTunnelAction {
     /// List reserved static tunnel slugs
     List {
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Reserve a static tunnel slug
     Create {
         /// Slug to reserve
         slug: String,
-        /// Optional display name
+        /// Display name
         #[arg(long)]
         name: Option<String>,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Release a static tunnel slug
     Delete {
-        /// Static tunnel ID
-        slug_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Static tunnel ID (from `static-tunnel list`)
+        static_tunnel_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -627,16 +634,16 @@ enum AnonAction {
     },
     /// Show an anonymous endpoint
     Show {
-        /// Anonymous endpoint ID
-        id: String,
+        /// Anonymous endpoint ID (from `anon create`)
+        endpoint_id: String,
     },
     /// List captured events for an anonymous endpoint
     #[command(name = "list-events", visible_alias = "events")]
     ListEvents {
-        /// Anonymous endpoint ID
+        /// Anonymous endpoint ID (from `anon create`)
         endpoint_id: String,
-        /// Viewer token (returned when the endpoint was created)
-        #[arg(long)]
+        /// Viewer token (from `anon create`)
+        #[arg(long, value_name = "VIEWER_TOKEN")]
         token: String,
         /// Page number
         #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
@@ -648,12 +655,12 @@ enum AnonAction {
     /// Show a captured event
     #[command(name = "show-event", visible_alias = "event")]
     ShowEvent {
-        /// Anonymous endpoint ID
+        /// Anonymous endpoint ID (from `anon create`)
         endpoint_id: String,
-        /// Event ID
+        /// Event ID (from `anon events`)
         event_id: String,
-        /// Viewer token (returned when the endpoint was created)
-        #[arg(long)]
+        /// Viewer token (from `anon create`)
+        #[arg(long, value_name = "VIEWER_TOKEN")]
         token: String,
     },
     /// Expose a local HTTP server without signing in
@@ -664,7 +671,7 @@ enum AnonAction {
         /// Local host to forward to
         #[arg(long, default_value = "localhost")]
         host: String,
-        /// Optional stable public route name
+        /// Stable public route name
         #[arg(long)]
         name: Option<String>,
         /// Route lifetime, such as 300, 10m, or 30m
@@ -697,42 +704,42 @@ enum AnonAction {
 enum ShareAction {
     /// Create a public link for a captured request
     Create {
-        /// Debug request ID to share
-        debug_request_id: String,
+        /// Captured request ID (from `endpoint list-requests`)
+        request_id: String,
         /// Link lifetime in whole hours, such as 24h, 86400, or 7d
         #[arg(long, value_name = "DURATION", value_parser = parse_whole_hours)]
         expires_in: Option<Duration>,
         #[arg(long, hide = true, value_name = "HOURS", conflicts_with = "expires_in")]
         expires_in_hours: Option<u64>,
-        /// Optional password to protect the share
+        /// Password required to open the link
         #[arg(long)]
         password: Option<String>,
         /// Include forwards in the shared view
         #[arg(long)]
         include_forwards: bool,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// List links for a captured request
     List {
-        /// Debug request ID
-        debug_request_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Captured request ID (from `endpoint list-requests`)
+        request_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Show a shared request by token (no login required)
     Show {
-        /// Share token
-        token: String,
+        /// Share token (from `share create`)
+        share_token: String,
     },
     /// Revoke a public link
     Revoke {
-        /// Share token to revoke
-        token: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Share token (from `share create`)
+        share_token: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -743,7 +750,7 @@ enum MonitorAction {
     Create {
         /// Monitor display name
         name: String,
-        /// URL to monitor (must be http:// or https://)
+        /// URL to check (http:// or https://)
         url: String,
         /// HTTP method
         #[arg(long, value_enum, ignore_case = true, default_value_t = MonitorMethod::Get)]
@@ -754,10 +761,10 @@ enum MonitorAction {
         /// Check interval
         #[arg(long, value_enum, default_value = "5m", ignore_case = true)]
         interval: MonitorInterval,
-        /// String the response body must contain
-        #[arg(long)]
+        /// Text the response body must contain
+        #[arg(long, value_name = "TEXT")]
         body_contains: Option<String>,
-        /// Request body to send (for POST/PUT/PATCH)
+        /// Request body to send with POST, PUT, or PATCH
         #[arg(long)]
         body: Option<String>,
         /// Consecutive failures before alerting
@@ -776,28 +783,28 @@ enum MonitorAction {
             conflicts_with = "no_email"
         )]
         email: bool,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// List uptime monitors
     List {
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Show an uptime monitor
     Show {
-        /// Monitor ID
-        id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Monitor ID (from `monitor list`)
+        monitor_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Update an uptime monitor
     Update {
-        /// Monitor ID
-        id: String,
+        /// Monitor ID (from `monitor list`)
+        monitor_id: String,
         /// New name
         #[arg(long)]
         name: Option<String>,
@@ -824,30 +831,30 @@ enum MonitorAction {
         /// Consecutive failures before alerting
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         failure_threshold: Option<u32>,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Delete an uptime monitor
     Delete {
-        /// Monitor ID
-        id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Monitor ID (from `monitor list`)
+        monitor_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// List recent checks for a monitor
     Checks {
-        /// Monitor ID
-        id: String,
+        /// Monitor ID (from `monitor list`)
+        monitor_id: String,
         /// Page number
         #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
         /// Results per page
         #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -2377,7 +2384,7 @@ async fn run(cli: Cli) -> Result<()> {
             run_login_flow(force).await?;
         }
         Commands::Listen {
-            endpoint,
+            endpoint_slug,
             target,
             ws_url,
             allow_non_loopback,
@@ -2403,7 +2410,7 @@ async fn run(cli: Cli) -> Result<()> {
             if json {
                 run_listen_json(
                     access_token_rx,
-                    endpoint,
+                    endpoint_slug,
                     target,
                     ws_url,
                     selected_organization_id,
@@ -2424,7 +2431,7 @@ async fn run(cli: Cli) -> Result<()> {
 
                 // Set app state to listening
                 app.state = AppState::Listening;
-                app.listening_endpoint = endpoint.clone();
+                app.listening_endpoint = endpoint_slug.clone();
                 app.listening_target = target.clone();
 
                 // Create channel for tunnel events
@@ -2433,7 +2440,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // Create and spawn tunnel client
                 let tunnel_client = tunnel::TunnelClient::new(
                     access_token_rx,
-                    endpoint.clone(),
+                    endpoint_slug.clone(),
                     target_policy,
                     Some(ws_url),
                     event_tx,
@@ -2648,25 +2655,28 @@ async fn run(cli: Cli) -> Result<()> {
                     print_organizations(&organizations, config.selected_organization_id.as_deref());
                 }
             }
-            OrgAction::Use { id } => {
+            OrgAction::Use { org_id } => {
                 let mut config = config::Config::load()?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, None)?;
                 let organizations = client.list_organizations().await?;
                 let organization_name = organizations
                     .iter()
-                    .find(|org| org.id == id)
+                    .find(|org| org.id == org_id)
                     .map(|org| org.name.clone())
                     .ok_or_else(|| {
-                        anyhow!("Organization not found or not accessible with id: {}", id)
+                        anyhow!(
+                            "Organization not found or not accessible with id: {}",
+                            org_id
+                        )
                     })?;
 
-                config.selected_organization_id = Some(id.clone());
+                config.selected_organization_id = Some(org_id.clone());
                 config.save()?;
                 if json {
                     print_json(&serde_json::json!({
                         "status": "ok",
-                        "selected_organization_id": id,
+                        "selected_organization_id": org_id,
                         "organization_name": organization_name
                     }))?;
                 } else {
@@ -2675,7 +2685,7 @@ async fn run(cli: Cli) -> Result<()> {
                         "ORGANIZATION SELECTED",
                         &[
                             output_field("NAME", organization_name.bold()),
-                            output_field("ORGANIZATION", id.dim()),
+                            output_field("ORGANIZATION", org_id.dim()),
                         ],
                     );
                 }
@@ -3024,12 +3034,15 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            StaticTunnelAction::Delete { slug_id, org } => {
+            StaticTunnelAction::Delete {
+                static_tunnel_id,
+                org,
+            } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 if !confirm_destructive_action(
                     "DELETE STATIC TUNNEL?",
-                    &format!("static tunnel {slug_id}"),
+                    &format!("static tunnel {static_tunnel_id}"),
                     &organization_id,
                     yes,
                     json,
@@ -3039,19 +3052,19 @@ async fn run(cli: Cli) -> Result<()> {
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let response = client
-                    .delete_static_tunnel(&organization_id, &slug_id)
+                    .delete_static_tunnel(&organization_id, &static_tunnel_id)
                     .await?;
                 if json {
                     print_json(&serde_json::json!({
                         "organization_id": organization_id,
-                        "slug_id": slug_id,
+                        "slug_id": static_tunnel_id,
                         "status": "deleted",
                         "message": response.message
                     }))?;
                 } else {
                     print_status(OutputStatus::Ok, "STATIC TUNNEL DELETED");
                     println!();
-                    print_field("SLUG/ID", slug_id);
+                    print_field("SLUG/ID", static_tunnel_id);
                     print_field("ORGANIZATION", organization_id.dim());
                     if let Some(message) = response.message {
                         print_field("MESSAGE", message.dim());
@@ -3079,9 +3092,9 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            AnonAction::Show { id } => {
+            AnonAction::Show { endpoint_id } => {
                 let client = ApiClient::unauthenticated()?;
-                let status = client.get_anon_endpoint(&id).await?;
+                let status = client.get_anon_endpoint(&endpoint_id).await?;
                 if json {
                     print_json(&status)?;
                 } else {
@@ -3200,7 +3213,7 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Commands::Share { action } => match action {
             ShareAction::Create {
-                debug_request_id,
+                request_id,
                 expires_in,
                 expires_in_hours,
                 password,
@@ -3217,7 +3230,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let shared = client
                     .create_shared_request(
-                        &debug_request_id,
+                        &request_id,
                         expires_in_hours,
                         password.as_deref(),
                         include_forwards,
@@ -3246,30 +3259,27 @@ async fn run(cli: Cli) -> Result<()> {
                     print_field("INCLUDE FWDS", shared.include_forwards);
                 }
             }
-            ShareAction::List {
-                debug_request_id,
-                org,
-            } => {
+            ShareAction::List { request_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let shares = client.list_shared_requests(&debug_request_id).await?;
+                let shares = client.list_shared_requests(&request_id).await?;
                 if json {
                     print_json(&serde_json::json!({
                         "organization_id": organization_id,
-                        "debug_request_id": debug_request_id,
+                        "debug_request_id": request_id,
                         "shares": shares
                     }))?;
                 } else {
                     print_context("Organization:", &organization_id);
-                    print_context("Request:", &debug_request_id);
+                    print_context("Request:", &request_id);
                     print_shared_requests(&shares);
                 }
             }
-            ShareAction::Show { token } => {
+            ShareAction::Show { share_token } => {
                 let client = ApiClient::unauthenticated()?;
-                let data = client.get_shared_request(&token).await?;
+                let data = client.get_shared_request(&share_token).await?;
                 if json {
                     print_json(&data)?;
                 } else {
@@ -3289,12 +3299,12 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            ShareAction::Revoke { token, org } => {
+            ShareAction::Revoke { share_token, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 if !confirm_destructive_action(
                     "REVOKE SHARED LINK?",
-                    &format!("share {token}"),
+                    &format!("share {share_token}"),
                     &organization_id,
                     yes,
                     json,
@@ -3304,19 +3314,19 @@ async fn run(cli: Cli) -> Result<()> {
                 let access_token = ensure_valid_token(&mut config).await?;
                 let client =
                     ApiClient::with_organization(access_token, Some(organization_id.clone()))?;
-                client.revoke_shared_request(&token).await?;
+                client.revoke_shared_request(&share_token).await?;
                 if json {
                     print_json(&serde_json::json!({
                         "status": "revoked",
                         "organization_id": organization_id,
-                        "share_token": token
+                        "share_token": share_token
                     }))?;
                 } else {
                     print_status_block(
                         OutputStatus::Ok,
                         "SHARE REVOKED",
                         &[
-                            output_field("SHARE TOKEN", token.bold()),
+                            output_field("SHARE TOKEN", share_token.bold()),
                             output_field("ORGANIZATION", organization_id.dim()),
                         ],
                     );
@@ -3388,12 +3398,12 @@ async fn run(cli: Cli) -> Result<()> {
                     print_monitors(&monitors);
                 }
             }
-            MonitorAction::Show { id, org } => {
+            MonitorAction::Show { monitor_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let monitor = client.get_uptime_monitor(&id).await?;
+                let monitor = client.get_uptime_monitor(&monitor_id).await?;
                 if json {
                     print_json(&serde_json::json!({
                         "organization_id": organization_id,
@@ -3405,7 +3415,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             MonitorAction::Update {
-                id,
+                monitor_id,
                 name,
                 url,
                 method,
@@ -3456,7 +3466,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
 
                 let monitor = client
-                    .update_uptime_monitor(&id, &serde_json::Value::Object(params))
+                    .update_uptime_monitor(&monitor_id, &serde_json::Value::Object(params))
                     .await?;
                 if json {
                     print_json(&serde_json::json!({
@@ -3470,12 +3480,12 @@ async fn run(cli: Cli) -> Result<()> {
                     print_field("ORGANIZATION", &organization_id);
                 }
             }
-            MonitorAction::Delete { id, org } => {
+            MonitorAction::Delete { monitor_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 if !confirm_destructive_action(
                     "DELETE MONITOR?",
-                    &format!("monitor {id}"),
+                    &format!("monitor {monitor_id}"),
                     &organization_id,
                     yes,
                     json,
@@ -3484,26 +3494,26 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                client.delete_uptime_monitor(&id).await?;
+                client.delete_uptime_monitor(&monitor_id).await?;
                 if json {
                     print_json(&serde_json::json!({
                         "status": "deleted",
                         "organization_id": organization_id,
-                        "monitor_id": id
+                        "monitor_id": monitor_id
                     }))?;
                 } else {
                     print_status_block(
                         OutputStatus::Ok,
                         "MONITOR DELETED",
                         &[
-                            output_field("MONITOR", id.bold()),
+                            output_field("MONITOR", monitor_id.bold()),
                             output_field("ORGANIZATION", organization_id.dim()),
                         ],
                     );
                 }
             }
             MonitorAction::Checks {
-                id,
+                monitor_id,
                 page,
                 page_size,
                 org,
@@ -3512,16 +3522,18 @@ async fn run(cli: Cli) -> Result<()> {
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let response = client.list_uptime_checks(&id, page, page_size).await?;
+                let response = client
+                    .list_uptime_checks(&monitor_id, page, page_size)
+                    .await?;
                 if json {
                     print_json(&serde_json::json!({
                         "organization_id": organization_id,
-                        "monitor_id": id,
+                        "monitor_id": monitor_id,
                         "checks": response
                     }))?;
                 } else {
                     print_context("Organization:", &organization_id);
-                    print_context("Monitor:", &id);
+                    print_context("Monitor:", &monitor_id);
                     print_uptime_checks(&response);
                 }
             }
@@ -7186,6 +7198,119 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn org_flag_accepts_short_o_on_every_command() {
+        let cli = Cli::try_parse_from(["hooklistener", "endpoint", "list", "-o", "org_1"])
+            .expect("endpoint list -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Endpoint {
+                action: EndpointAction::List { ref org },
+            }) if org.as_deref() == Some("org_1")
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "monitor", "list", "-o", "org_1"])
+            .expect("monitor list -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Monitor {
+                action: MonitorAction::List { ref org },
+            }) if org.as_deref() == Some("org_1")
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "share", "list", "req_1", "-o", "org_1"])
+            .expect("share list -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Share {
+                action: ShareAction::List { ref request_id, ref org },
+            }) if request_id == "req_1" && org.as_deref() == Some("org_1")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "static-tunnel",
+            "delete",
+            "st_1",
+            "-o",
+            "org_1",
+        ])
+        .expect("static-tunnel delete -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StaticTunnel {
+                action: StaticTunnelAction::Delete { ref static_tunnel_id, ref org },
+            }) if static_tunnel_id == "st_1" && org.as_deref() == Some("org_1")
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "cases", "run", "ep_1", "-o", "org_1"])
+            .expect("cases run -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Cases {
+                action: CasesAction::Run { ref org, .. },
+            }) if org.as_deref() == Some("org_1")
+        ));
+    }
+
+    #[test]
+    fn completions_power_shell_is_alias_of_powershell() {
+        for spelling in ["powershell", "power-shell", "PowerShell"] {
+            let cli = Cli::try_parse_from(["hooklistener", "completions", spelling])
+                .unwrap_or_else(|err| panic!("completions {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Completions {
+                        shell: CompletionShell::PowerShell,
+                    })
+                ),
+                "completions {spelling} must yield PowerShell"
+            );
+        }
+    }
+
+    #[test]
+    fn renamed_positionals_keep_their_positions() {
+        let cli = Cli::try_parse_from(["hooklistener", "listen", "my-endpoint"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Listen { ref endpoint_slug, .. }) if endpoint_slug == "my-endpoint"
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "org", "use", "org_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Org {
+                action: OrgAction::Use { ref org_id },
+            }) if org_id == "org_1"
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "anon", "show", "ep_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Anon {
+                action: AnonAction::Show { ref endpoint_id },
+            }) if endpoint_id == "ep_1"
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "share", "show", "tok_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Share {
+                action: ShareAction::Show { ref share_token },
+            }) if share_token == "tok_1"
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "monitor", "show", "mon_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Monitor {
+                action: MonitorAction::Show { ref monitor_id, .. },
+            }) if monitor_id == "mon_1"
+        ));
     }
 
     #[test]
