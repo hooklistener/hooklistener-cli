@@ -34,11 +34,13 @@ Please note that this project is released with a [Code of Conduct](CODE_OF_CONDU
    - Add tests for new functionality
    - Update documentation as needed
 4. **Test your changes**:
+
    ```bash
    cargo test --all-targets --all-features --locked
    cargo fmt --all -- --check
    cargo clippy --all-targets --all-features -- -D warnings
    ```
+
 5. **Submit a Pull Request**:
    - Reference any related issues
    - Describe your changes in detail
@@ -61,6 +63,12 @@ Please note that this project is released with a [Code of Conduct](CODE_OF_CONDU
 - Ensure all tests pass before submitting PR
 - Aim for good test coverage
 
+### Build size and compilation time
+
+See [Build footprint](docs/build-footprint.md) for the dependency/release-profile
+choices and an isolated measurement tool. Measure clean builds, no-op builds,
+and source rebuilds separately; do not compare a warm build with a cold one.
+
 ### Documentation
 
 - Update README.md if adding new features
@@ -71,6 +79,7 @@ Please note that this project is released with a [Code of Conduct](CODE_OF_CONDU
 ### Commit Messages
 
 Follow conventional commit format:
+
 ```
 type(scope): description
 
@@ -80,6 +89,7 @@ type(scope): description
 ```
 
 Types:
+
 - `feat`: New feature
 - `fix`: Bug fix
 - `docs`: Documentation changes
@@ -89,6 +99,7 @@ Types:
 - `chore`: Maintenance tasks
 
 Example:
+
 ```
 feat(ui): add search functionality
 
@@ -193,6 +204,7 @@ all four agree, treat it as an incomplete release.
 ## Recognition
 
 Contributors will be recognized in:
+
 - The project README
 - Release notes
 - GitHub's contributor graph
