@@ -7317,6 +7317,20 @@ mod tests {
     }
 
     #[test]
+    fn help_snapshot_completions() {
+        let help = render_help_snapshot(&["completions"]);
+        assert!(
+            help.contains("[possible values: bash, zsh, fish, powershell, elvish]"),
+            "completions help must list the visible shell names:\n{help}"
+        );
+        assert!(
+            !help.contains("power-shell"),
+            "power-shell is a hidden alias and must not appear in help:\n{help}"
+        );
+        insta::assert_snapshot!("help_completions", help);
+    }
+
+    #[test]
     fn org_flag_accepts_short_o_on_every_command() {
         let cli = Cli::try_parse_from(["hooklistener", "endpoint", "list", "-o", "org_1"])
             .expect("endpoint list -o parses");
