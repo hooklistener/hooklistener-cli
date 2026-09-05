@@ -341,9 +341,11 @@ enum TunnelAction {
         /// Keep polling for new events until interrupted
         #[arg(long)]
         follow: bool,
-        /// Poll interval in milliseconds while following
-        #[arg(long, value_name = "MS", default_value = "1000")]
-        interval_ms: u64,
+        /// Poll interval while following, such as 500ms, 2s, or 1m
+        #[arg(long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration)]
+        interval: Duration,
+        #[arg(long, hide = true, value_name = "MS", conflicts_with = "interval")]
+        interval_ms: Option<u64>,
         /// Organization ID (overrides the configured default)
         #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
@@ -572,14 +574,15 @@ enum CasesAction {
         /// Wait for the run to complete before returning
         #[arg(long)]
         wait: bool,
-        /// Timeout for --wait, such as 60, 60s, 2m, or 1h
-        #[arg(long, conflicts_with = "timeout_ms")]
-        timeout: Option<String>,
-        /// Timeout for --wait in milliseconds
-        #[arg(long, conflicts_with = "timeout")]
+        /// Timeout for --wait, such as 60, 2m, or 1h
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        timeout: Option<Duration>,
+        #[arg(long, hide = true, value_name = "MS", conflicts_with = "timeout")]
         timeout_ms: Option<u64>,
-        /// Poll interval for --wait in milliseconds
-        #[arg(long)]
+        /// Poll interval for --wait, such as 500ms, 2s, or 10s
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        interval: Option<Duration>,
+        #[arg(long, hide = true, value_name = "MS", conflicts_with = "interval")]
         interval_ms: Option<u64>,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
@@ -620,9 +623,9 @@ enum StaticTunnelAction {
 enum AnonAction {
     /// Create a temporary anonymous endpoint
     Create {
-        /// Time-to-live in seconds (default: 86400 = 24 hours)
-        #[arg(long)]
-        ttl: Option<u64>,
+        /// Endpoint lifetime, such as 3600, 1h, or 24h
+        #[arg(long, value_name = "DURATION", default_value = "24h", value_parser = parse_duration)]
+        ttl: Duration,
     },
     /// Show an anonymous endpoint
     Show {
@@ -666,9 +669,14 @@ enum AnonAction {
         /// Optional stable public route name
         #[arg(long)]
         name: Option<String>,
-        /// Route lifetime in seconds
-        #[arg(long, default_value = "900", value_parser = clap::value_parser!(u64).range(60..=1800))]
-        ttl: u64,
+        /// Route lifetime, such as 300, 10m, or 30m
+        #[arg(
+            long,
+            value_name = "DURATION",
+            default_value = "15m",
+            value_parser = parse_duration_within(Duration::from_secs(60), Duration::from_secs(1800))
+        )]
+        ttl: Duration,
         /// Allow forwarding to a host that resolves outside loopback
         #[arg(long)]
         allow_non_loopback: bool,
@@ -693,8 +701,10 @@ enum ShareAction {
     Create {
         /// Debug request ID to share
         debug_request_id: String,
-        /// Expiration in hours (e.g. 24)
-        #[arg(long)]
+        /// Link lifetime in whole hours, such as 24h, 86400, or 7d
+        #[arg(long, value_name = "DURATION", value_parser = parse_whole_hours)]
+        expires_in: Option<Duration>,
+        #[arg(long, hide = true, value_name = "HOURS", conflicts_with = "expires_in")]
         expires_in_hours: Option<u64>,
         /// Optional password to protect the share
         #[arg(long)]
@@ -743,9 +753,9 @@ enum MonitorAction {
         /// Expected HTTP status code
         #[arg(long, value_name = "CODE", default_value_t = 200, value_parser = clap::value_parser!(u16).range(100..=599))]
         expected_status: u16,
-        /// Check interval in minutes (1, 5, 10, 30, 60)
-        #[arg(long, default_value = "5")]
-        interval: u32,
+        /// Check interval
+        #[arg(long, value_enum, default_value = "5m", ignore_case = true)]
+        interval: MonitorInterval,
         /// String the response body must contain
         #[arg(long)]
         body_contains: Option<String>,
@@ -798,9 +808,9 @@ enum MonitorAction {
         /// Expected HTTP status code
         #[arg(long, value_name = "CODE", value_parser = clap::value_parser!(u16).range(100..=599))]
         expected_status: Option<u16>,
-        /// Check interval in minutes (1, 5, 10, 30, 60)
-        #[arg(long)]
-        interval: Option<u32>,
+        /// Check interval
+        #[arg(long, value_enum, ignore_case = true)]
+        interval: Option<MonitorInterval>,
         /// Enable or disable the monitor
         #[arg(long)]
         enabled: Option<bool>,
@@ -905,19 +915,47 @@ impl std::fmt::Display for MonitorMethod {
     }
 }
 
-fn parse_timeout_ms(timeout: Option<String>, timeout_ms: Option<u64>) -> Result<Option<u64>> {
-    match (timeout, timeout_ms) {
-        (Some(_), Some(_)) => Err(anyhow!("Use either --timeout or --timeout-ms, not both.")),
-        (None, None) => Ok(None),
-        (None, Some(ms)) => Ok(Some(ms)),
-        (Some(raw), None) => parse_duration_to_ms(&raw).map(Some),
+/// Check interval accepted by the monitor API, in minutes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum MonitorInterval {
+    #[value(name = "1m", alias = "1")]
+    M1,
+    #[value(name = "5m", alias = "5")]
+    M5,
+    #[value(name = "10m", alias = "10")]
+    M10,
+    #[value(name = "30m", alias = "30")]
+    M30,
+    #[value(name = "60m", alias = "60", alias = "1h")]
+    M60,
+}
+
+impl MonitorInterval {
+    /// Wire value for `check_interval`.
+    fn minutes(self) -> u32 {
+        match self {
+            MonitorInterval::M1 => 1,
+            MonitorInterval::M5 => 5,
+            MonitorInterval::M10 => 10,
+            MonitorInterval::M30 => 30,
+            MonitorInterval::M60 => 60,
+        }
     }
 }
 
-fn parse_duration_to_ms(raw: &str) -> Result<u64> {
+const MILLIS_PER_SECOND: u64 = 1_000;
+const MILLIS_PER_MINUTE: u64 = 60 * MILLIS_PER_SECOND;
+const MILLIS_PER_HOUR: u64 = 60 * MILLIS_PER_MINUTE;
+const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
+
+/// Parses a duration such as `60`, `1500ms`, `2m`, `1h`, or `7d`.
+///
+/// A bare integer is seconds. Unit names are case-insensitive and may be
+/// separated from the number by whitespace.
+fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
     let value = raw.trim();
     if value.is_empty() {
-        return Err(anyhow!("Timeout cannot be empty."));
+        return Err("Duration cannot be empty.".to_string());
     }
 
     let split_at = value
@@ -925,24 +963,109 @@ fn parse_duration_to_ms(raw: &str) -> Result<u64> {
         .unwrap_or(value.len());
     let (number, unit) = value.split_at(split_at);
     if number.is_empty() {
-        return Err(anyhow!("Timeout must start with a number."));
+        return Err("Duration must start with a number.".to_string());
     }
-    let amount: u64 = number.parse()?;
-    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| "Duration is too large.".to_string())?;
+    let millis_per_unit = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => MILLIS_PER_SECOND,
         "ms" | "millisecond" | "milliseconds" => 1,
-        "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
-        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+        "m" | "min" | "mins" | "minute" | "minutes" => MILLIS_PER_MINUTE,
+        "h" | "hr" | "hrs" | "hour" | "hours" => MILLIS_PER_HOUR,
+        "d" | "day" | "days" => MILLIS_PER_DAY,
         other => {
-            return Err(anyhow!(
-                "Invalid timeout unit '{}'. Use ms, s, m, or h.",
-                other
+            return Err(format!(
+                "Invalid duration unit '{other}'. Use ms, s, m, h, or d."
             ));
         }
     };
     amount
-        .checked_mul(multiplier)
-        .ok_or_else(|| anyhow!("Timeout is too large."))
+        .checked_mul(millis_per_unit)
+        .map(Duration::from_millis)
+        .ok_or_else(|| "Duration is too large.".to_string())
+}
+
+/// Value parser for a duration flag that must fall within `min..=max`.
+fn parse_duration_within(
+    min: Duration,
+    max: Duration,
+) -> impl clap::builder::TypedValueParser<Value = Duration> {
+    move |raw: &str| -> std::result::Result<Duration, String> {
+        let duration = parse_duration(raw)?;
+        if duration < min || duration > max {
+            return Err(format!(
+                "must be between {} and {}",
+                format_duration(min),
+                format_duration(max)
+            ));
+        }
+        Ok(duration)
+    }
+}
+
+/// Value parser for a duration flag whose API field counts whole hours.
+fn parse_whole_hours(raw: &str) -> std::result::Result<Duration, String> {
+    let duration = parse_duration(raw)?;
+    let millis = duration_millis(duration);
+    if millis == 0 || !millis.is_multiple_of(MILLIS_PER_HOUR) {
+        return Err("must be a whole number of hours, such as 24h, 86400, or 7d".to_string());
+    }
+    Ok(duration)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duration_hours(duration: Duration) -> u64 {
+    duration.as_secs() / (MILLIS_PER_HOUR / MILLIS_PER_SECOND)
+}
+
+/// Renders a duration in the largest unit that expresses it exactly.
+fn format_duration(duration: Duration) -> String {
+    let millis = duration_millis(duration);
+    if millis == 0 {
+        return "0s".to_string();
+    }
+    for (unit, per_unit) in [
+        ("d", MILLIS_PER_DAY),
+        ("h", MILLIS_PER_HOUR),
+        ("m", MILLIS_PER_MINUTE),
+        ("s", MILLIS_PER_SECOND),
+    ] {
+        if millis.is_multiple_of(per_unit) {
+            return format!("{}{unit}", millis / per_unit);
+        }
+    }
+    format!("{millis}ms")
+}
+
+/// Prints the single stderr notice for a hidden compatibility flag.
+fn warn_deprecated_flag(old: &str, new: &str, example: &str) {
+    eprintln!("warning: --{old} is deprecated; use --{new} {example}");
+}
+
+/// Resolves a canonical duration flag against its hidden `--<flag>-ms` twin.
+///
+/// The hidden flag wins when given (clap already rejects supplying both
+/// explicitly; a defaulted canonical flag must not mask it) and prints a
+/// deprecation notice.
+fn resolve_millis_flag(
+    duration: Option<Duration>,
+    legacy_ms: Option<u64>,
+    old_flag: &str,
+    new_flag: &str,
+) -> Option<u64> {
+    if let Some(ms) = legacy_ms {
+        warn_deprecated_flag(
+            old_flag,
+            new_flag,
+            &format_duration(Duration::from_millis(ms)),
+        );
+        return Some(ms);
+    }
+    duration.map(duration_millis)
 }
 
 struct CaseRunInput {
@@ -951,8 +1074,9 @@ struct CaseRunInput {
     target_id: Option<String>,
     target_name: Option<String>,
     wait: bool,
-    timeout: Option<String>,
+    timeout: Option<Duration>,
     timeout_ms: Option<u64>,
+    interval: Option<Duration>,
     interval_ms: Option<u64>,
 }
 
@@ -965,6 +1089,7 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
         wait,
         timeout,
         timeout_ms,
+        interval,
         interval_ms,
     } = input;
 
@@ -984,8 +1109,8 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
         target: None,
         target_name,
         wait: wait.then_some(true),
-        timeout_ms: parse_timeout_ms(timeout, timeout_ms)?,
-        interval_ms,
+        timeout_ms: timeout.map(duration_millis).or(timeout_ms),
+        interval_ms: interval.map(duration_millis).or(interval_ms),
     };
 
     if let Some(target_url) = target_url {
@@ -2794,9 +2919,13 @@ async fn run(cli: Cli) -> Result<()> {
                 wait,
                 timeout,
                 timeout_ms,
+                interval,
                 interval_ms,
                 org,
             } => {
+                let timeout_ms = resolve_millis_flag(timeout, timeout_ms, "timeout-ms", "timeout");
+                let interval_ms =
+                    resolve_millis_flag(interval, interval_ms, "interval-ms", "interval");
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
@@ -2806,8 +2935,9 @@ async fn run(cli: Cli) -> Result<()> {
                     target_id,
                     target_name,
                     wait,
-                    timeout,
+                    timeout: None,
                     timeout_ms,
+                    interval: None,
                     interval_ms,
                 })?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
@@ -2907,7 +3037,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Anon { action } => match action {
             AnonAction::Create { ttl } => {
                 let client = ApiClient::unauthenticated()?;
-                let endpoint = client.create_anon_endpoint(ttl).await?;
+                let endpoint = client.create_anon_endpoint(Some(ttl.as_secs())).await?;
                 if json {
                     print_json(&endpoint)?;
                 } else {
@@ -2998,7 +3128,7 @@ async fn run(cli: Cli) -> Result<()> {
                     host,
                     port,
                     name,
-                    ttl,
+                    ttl.as_secs(),
                     allow_non_loopback,
                     json,
                     &mut update_handle,
@@ -3046,11 +3176,16 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Share { action } => match action {
             ShareAction::Create {
                 debug_request_id,
+                expires_in,
                 expires_in_hours,
                 password,
                 include_forwards,
                 org,
             } => {
+                if let Some(hours) = expires_in_hours {
+                    warn_deprecated_flag("expires-in-hours", "expires-in", &format!("{hours}h"));
+                }
+                let expires_in_hours = expires_in_hours.or(expires_in.map(duration_hours));
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
@@ -3186,7 +3321,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "url": url,
                     "method": method.as_lowercase(),
                     "expected_status_code": expected_status,
-                    "check_interval": interval,
+                    "check_interval": interval.minutes(),
                     "failure_threshold": failure_threshold,
                     "email_enabled": email,
                 });
@@ -3275,7 +3410,7 @@ async fn run(cli: Cli) -> Result<()> {
                     params.insert("expected_status_code".into(), v.into());
                 }
                 if let Some(v) = interval {
-                    params.insert("check_interval".into(), v.into());
+                    params.insert("check_interval".into(), v.minutes().into());
                 }
                 if let Some(v) = enabled {
                     params.insert("enabled".into(), serde_json::Value::Bool(v));
@@ -3691,9 +3826,13 @@ async fn run_tunnel_lifecycle_command(
             capture_id,
             attempt_id,
             follow,
+            interval,
             interval_ms,
             org,
         }) => {
+            let interval_ms =
+                resolve_millis_flag(Some(interval), interval_ms, "interval-ms", "interval")
+                    .unwrap_or(MILLIS_PER_SECOND);
             let context = tunnel_lifecycle_context(org).await?;
             run_tunnel_lifecycle_events(
                 &context,
@@ -6826,10 +6965,10 @@ mod tests {
                 action: AnonAction::Tunnel {
                     port: 4000,
                     name: Some(name),
-                    ttl: 1200,
+                    ttl,
                     ..
                 }
-            }) if name == "stable-demo"
+            }) if name == "stable-demo" && ttl == Duration::from_secs(1200)
         ));
 
         let claim = Cli::try_parse_from([
@@ -7406,15 +7545,23 @@ mod tests {
         assert_eq!(help.matches("Global options:").count(), 1, "{help}");
     }
 
-    fn parse_error_kind<I, T>(args: I) -> clap::error::ErrorKind
+    fn parse_error<I, T>(args: I) -> clap::Error
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
         match Cli::try_parse_from(args) {
             Ok(_) => panic!("expected argument parsing to fail"),
-            Err(err) => err.kind(),
+            Err(err) => err,
         }
+    }
+
+    fn parse_error_kind<I, T>(args: I) -> clap::error::ErrorKind
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        parse_error(args).kind()
     }
 
     #[test]
@@ -7808,8 +7955,9 @@ mod tests {
             target_id: None,
             target_name: None,
             wait: true,
-            timeout: Some("60s".to_string()),
+            timeout: Some(Duration::from_secs(60)),
             timeout_ms: None,
+            interval: None,
             interval_ms: None,
         })
         .unwrap();
@@ -7828,6 +7976,7 @@ mod tests {
             wait: false,
             timeout: None,
             timeout_ms: None,
+            interval: None,
             interval_ms: Some(500),
         })
         .unwrap();
@@ -7843,6 +7992,7 @@ mod tests {
             wait: false,
             timeout: None,
             timeout_ms: None,
+            interval: None,
             interval_ms: None,
         })
         .unwrap();
@@ -7859,6 +8009,7 @@ mod tests {
             wait: false,
             timeout: None,
             timeout_ms: None,
+            interval: None,
             interval_ms: None,
         })
         .unwrap_err();
@@ -7872,6 +8023,7 @@ mod tests {
             wait: false,
             timeout: None,
             timeout_ms: None,
+            interval: None,
             interval_ms: None,
         })
         .unwrap_err();
@@ -7879,12 +8031,474 @@ mod tests {
     }
 
     #[test]
-    fn cases_run_timeout_parser_accepts_seconds_and_units() {
-        assert_eq!(parse_duration_to_ms("60").unwrap(), 60_000);
-        assert_eq!(parse_duration_to_ms("60s").unwrap(), 60_000);
-        assert_eq!(parse_duration_to_ms("2m").unwrap(), 120_000);
-        assert_eq!(parse_duration_to_ms("1500ms").unwrap(), 1_500);
-        assert!(parse_timeout_ms(Some("1s".to_string()), Some(1_000)).is_err());
+    fn parse_duration_accepts_bare_seconds_and_units() {
+        assert_eq!(parse_duration("60").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(
+            parse_duration("1500ms").unwrap(),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3_600));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(
+            parse_duration(" 2 Hours ").unwrap(),
+            Duration::from_secs(7_200)
+        );
+    }
+
+    #[test]
+    fn parse_duration_reports_errors_in_cli_voice() {
+        assert_eq!(parse_duration("").unwrap_err(), "Duration cannot be empty.");
+        assert_eq!(
+            parse_duration("abc").unwrap_err(),
+            "Duration must start with a number."
+        );
+        assert_eq!(
+            parse_duration("5w").unwrap_err(),
+            "Invalid duration unit 'w'. Use ms, s, m, h, or d."
+        );
+        assert_eq!(
+            parse_duration("99999999999999999999").unwrap_err(),
+            "Duration is too large."
+        );
+        assert_eq!(
+            parse_duration("9999999999999999d").unwrap_err(),
+            "Duration is too large."
+        );
+    }
+
+    #[test]
+    fn format_duration_uses_the_largest_exact_unit() {
+        assert_eq!(format_duration(Duration::from_millis(1_500)), "1500ms");
+        assert_eq!(format_duration(Duration::from_secs(1)), "1s");
+        assert_eq!(format_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(format_duration(Duration::from_secs(1_800)), "30m");
+        assert_eq!(format_duration(Duration::from_secs(86_400)), "1d");
+        assert_eq!(format_duration(Duration::from_secs(90_000)), "25h");
+    }
+
+    #[test]
+    fn parse_whole_hours_rejects_partial_hours_and_zero() {
+        assert_eq!(
+            parse_whole_hours("24h").unwrap(),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            parse_whole_hours("86400").unwrap(),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            parse_whole_hours("7d").unwrap(),
+            Duration::from_secs(604_800)
+        );
+        for raw in ["90m", "0", "3601s", "500ms"] {
+            assert!(
+                parse_whole_hours(raw)
+                    .unwrap_err()
+                    .contains("whole number of hours"),
+                "{raw}"
+            );
+        }
+    }
+
+    fn cases_run_args(cli: Cli) -> (Option<Duration>, Option<u64>, Option<Duration>, Option<u64>) {
+        match cli.command {
+            Some(Commands::Cases {
+                action:
+                    CasesAction::Run {
+                        timeout,
+                        timeout_ms,
+                        interval,
+                        interval_ms,
+                        ..
+                    },
+            }) => (timeout, timeout_ms, interval, interval_ms),
+            _ => panic!("expected cases run command"),
+        }
+    }
+
+    #[test]
+    fn cases_run_duration_flags_replace_millisecond_flags() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_1",
+            "--target",
+            "cli",
+            "--timeout",
+            "2m",
+            "--interval",
+            "500ms",
+        ])
+        .unwrap();
+        assert_eq!(
+            cases_run_args(cli),
+            (
+                Some(Duration::from_secs(120)),
+                None,
+                Some(Duration::from_millis(500)),
+                None
+            )
+        );
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_1",
+            "--target",
+            "cli",
+            "--timeout",
+            "60",
+        ])
+        .unwrap();
+        assert_eq!(cases_run_args(cli).0, Some(Duration::from_secs(60)));
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_1",
+            "--target",
+            "cli",
+            "--timeout-ms",
+            "500",
+            "--interval-ms",
+            "250",
+        ])
+        .unwrap();
+        assert_eq!(cases_run_args(cli), (None, Some(500), None, Some(250)));
+
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "cases",
+                "run",
+                "ep_1",
+                "--target",
+                "cli",
+                "--timeout",
+                "1s",
+                "--timeout-ms",
+                "5",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "cases",
+                "run",
+                "ep_1",
+                "--target",
+                "cli",
+                "--interval",
+                "1s",
+                "--interval-ms",
+                "5",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn cases_run_params_convert_durations_to_milliseconds() {
+        let params = build_case_run_params(CaseRunInput {
+            target: Some("cli".to_string()),
+            target_url: None,
+            target_id: None,
+            target_name: None,
+            wait: true,
+            timeout: Some(Duration::from_secs(120)),
+            timeout_ms: None,
+            interval: Some(Duration::from_millis(500)),
+            interval_ms: None,
+        })
+        .unwrap();
+        assert_eq!(params.timeout_ms, Some(120_000));
+        assert_eq!(params.interval_ms, Some(500));
+    }
+
+    #[test]
+    fn hidden_millisecond_flags_win_over_defaulted_duration_flags() {
+        assert_eq!(
+            resolve_millis_flag(
+                Some(Duration::from_secs(1)),
+                Some(250),
+                "interval-ms",
+                "interval"
+            ),
+            Some(250)
+        );
+        assert_eq!(
+            resolve_millis_flag(
+                Some(Duration::from_secs(2)),
+                None,
+                "interval-ms",
+                "interval"
+            ),
+            Some(2_000)
+        );
+        assert_eq!(
+            resolve_millis_flag(None, None, "timeout-ms", "timeout"),
+            None
+        );
+    }
+
+    #[test]
+    fn tunnel_events_interval_accepts_durations_and_hidden_milliseconds() {
+        fn interval_args(cli: Cli) -> (Duration, Option<u64>) {
+            match cli.command {
+                Some(Commands::Tunnel {
+                    action:
+                        Some(TunnelAction::Events {
+                            interval,
+                            interval_ms,
+                            ..
+                        }),
+                    ..
+                }) => (interval, interval_ms),
+                _ => panic!("expected tunnel events command"),
+            }
+        }
+
+        let cli = Cli::try_parse_from(["hooklistener", "tunnel", "events"]).unwrap();
+        assert_eq!(interval_args(cli), (Duration::from_secs(1), None));
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "tunnel",
+            "events",
+            "--follow",
+            "--interval",
+            "2s",
+        ])
+        .unwrap();
+        assert_eq!(interval_args(cli), (Duration::from_secs(2), None));
+
+        let cli = Cli::try_parse_from(["hooklistener", "tunnel", "events", "--interval-ms", "250"])
+            .unwrap();
+        let (interval, interval_ms) = interval_args(cli);
+        assert_eq!(interval_ms, Some(250));
+        assert_eq!(
+            resolve_millis_flag(Some(interval), interval_ms, "interval-ms", "interval"),
+            Some(250)
+        );
+
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "tunnel",
+                "events",
+                "--interval",
+                "2s",
+                "--interval-ms",
+                "1",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn anon_ttl_flags_accept_seconds_and_units() {
+        fn create_ttl(args: &[&str]) -> Duration {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Commands::Anon {
+                    action: AnonAction::Create { ttl },
+                }) => ttl,
+                _ => panic!("expected anon create command"),
+            }
+        }
+        fn tunnel_ttl(args: &[&str]) -> Duration {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Commands::Anon {
+                    action: AnonAction::Tunnel { ttl, .. },
+                }) => ttl,
+                _ => panic!("expected anon tunnel command"),
+            }
+        }
+
+        assert_eq!(
+            create_ttl(&["hooklistener", "anon", "create"]),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            create_ttl(&["hooklistener", "anon", "create", "--ttl", "3600"]),
+            Duration::from_secs(3_600)
+        );
+        assert_eq!(
+            create_ttl(&["hooklistener", "anon", "create", "--ttl", "7d"]),
+            Duration::from_secs(604_800)
+        );
+
+        assert_eq!(
+            tunnel_ttl(&["hooklistener", "anon", "tunnel"]),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            tunnel_ttl(&["hooklistener", "anon", "tunnel", "--ttl", "900"]),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            tunnel_ttl(&["hooklistener", "anon", "tunnel", "--ttl", "10m"]),
+            Duration::from_secs(600)
+        );
+
+        let error = parse_error(["hooklistener", "anon", "tunnel", "--ttl", "31m"]);
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(error.to_string().contains("between 1m and 30m"), "{error}");
+    }
+
+    #[test]
+    fn share_create_expires_in_accepts_whole_hours_and_hidden_hours_flag() {
+        fn expiry(args: &[&str]) -> (Option<Duration>, Option<u64>) {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Commands::Share {
+                    action:
+                        ShareAction::Create {
+                            expires_in,
+                            expires_in_hours,
+                            ..
+                        },
+                }) => (expires_in, expires_in_hours),
+                _ => panic!("expected share create command"),
+            }
+        }
+
+        assert_eq!(
+            expiry(&["hooklistener", "share", "create", "req_1"]),
+            (None, None)
+        );
+        assert_eq!(
+            expiry(&[
+                "hooklistener",
+                "share",
+                "create",
+                "req_1",
+                "--expires-in",
+                "24h"
+            ]),
+            (Some(Duration::from_secs(86_400)), None)
+        );
+        assert_eq!(
+            expiry(&[
+                "hooklistener",
+                "share",
+                "create",
+                "req_1",
+                "--expires-in-hours",
+                "24"
+            ]),
+            (None, Some(24))
+        );
+        assert_eq!(duration_hours(Duration::from_secs(604_800)), 168);
+
+        let error = parse_error([
+            "hooklistener",
+            "share",
+            "create",
+            "req_1",
+            "--expires-in",
+            "90m",
+        ]);
+        assert!(
+            error.to_string().contains("whole number of hours"),
+            "{error}"
+        );
+
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "share",
+                "create",
+                "req_1",
+                "--expires-in",
+                "24h",
+                "--expires-in-hours",
+                "24",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn monitor_interval_is_a_closed_set_of_minutes() {
+        fn create_interval(raw: &str) -> MonitorInterval {
+            match Cli::try_parse_from([
+                "hooklistener",
+                "monitor",
+                "create",
+                "API",
+                "https://example.com/health",
+                "--interval",
+                raw,
+            ])
+            .unwrap()
+            .command
+            {
+                Some(Commands::Monitor {
+                    action: MonitorAction::Create { interval, .. },
+                }) => interval,
+                _ => panic!("expected monitor create command"),
+            }
+        }
+
+        assert_eq!(create_interval("5"), MonitorInterval::M5);
+        assert_eq!(create_interval("1h"), MonitorInterval::M60);
+        assert_eq!(create_interval("60M"), MonitorInterval::M60);
+        assert_eq!(create_interval("10m"), MonitorInterval::M10);
+        assert_eq!(MonitorInterval::M30.minutes(), 30);
+
+        match Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Commands::Monitor {
+                action: MonitorAction::Create { interval, .. },
+            }) => assert_eq!(interval, MonitorInterval::M5),
+            _ => panic!("expected monitor create command"),
+        }
+
+        match Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "update",
+            "mon_1",
+            "--interval",
+            "10m",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Commands::Monitor {
+                action: MonitorAction::Update { interval, .. },
+            }) => assert_eq!(interval, Some(MonitorInterval::M10)),
+            _ => panic!("expected monitor update command"),
+        }
+
+        for raw in ["7", "2h", "90s"] {
+            assert_eq!(
+                parse_error_kind([
+                    "hooklistener",
+                    "monitor",
+                    "create",
+                    "API",
+                    "https://example.com/health",
+                    "--interval",
+                    raw,
+                ]),
+                clap::error::ErrorKind::InvalidValue,
+                "{raw}"
+            );
+        }
     }
 
     #[test]
@@ -7918,7 +8532,7 @@ mod tests {
                 assert_eq!(endpoint_id, "ep_123");
                 assert_eq!(target.as_deref(), Some("cli"));
                 assert!(wait);
-                assert_eq!(timeout.as_deref(), Some("60s"));
+                assert_eq!(timeout, Some(Duration::from_secs(60)));
             }
             _ => panic!("expected cases run command"),
         }
