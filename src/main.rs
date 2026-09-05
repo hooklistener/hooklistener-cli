@@ -234,27 +234,30 @@ enum Commands {
 
 #[derive(Args, Clone, Default)]
 struct TunnelTargetArgs {
-    /// Local port to forward requests to (default: 3000)
+    // `port` and `host` stay `Option` so `merge()` can distinguish "not given"
+    // from "given the default"; the default is written into the doc comment
+    // in clap's own `[default: ...]` rendering style.
+    /// Local port to forward requests to [default: 3000]
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Local host to forward to (default: localhost)
+    /// Local host to forward to [default: localhost]
     #[arg(long)]
     host: Option<String>,
 
     /// Organization ID override (falls back to configured default)
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "ORG_ID")]
     org: Option<String>,
 
-    /// Static tunnel slug (paid plans only, creates persistent subdomain)
+    /// Static tunnel slug to attach (from `static-tunnel create`)
     #[arg(short, long)]
     slug: Option<String>,
 
-    /// Allow forwarding to a host that resolves outside loopback
+    /// Allow a host that resolves outside loopback
     #[arg(long)]
     allow_non_loopback: bool,
 
-    /// Do not automatically replay requests buffered while the tunnel was offline
+    /// Do not replay requests buffered while the tunnel was offline
     #[arg(long)]
     no_replay_buffered: bool,
 }
@@ -404,11 +407,18 @@ enum ConfigAction {
     Show,
     /// Set a configuration value
     Set {
-        /// Configuration key (selected_organization_id)
-        key: String,
-        /// New value
+        /// Configuration key
+        #[arg(value_enum)]
+        key: ConfigKey,
+        /// New value (`none` clears the key)
         value: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConfigKey {
+    #[value(name = "selected_organization_id")]
+    SelectedOrganizationId,
 }
 
 #[derive(Subcommand)]
@@ -465,10 +475,10 @@ enum EndpointAction {
         /// Debug endpoint ID
         endpoint_id: String,
         /// Page number
-        #[arg(long, default_value = "1")]
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        /// Page size
-        #[arg(long, default_value = "50")]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
@@ -503,9 +513,9 @@ enum EndpointAction {
         request_id: String,
         /// Target URL to replay to
         target_url: String,
-        /// Optional HTTP method override (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)
-        #[arg(long)]
-        method: Option<String>,
+        /// HTTP method override
+        #[arg(long, value_enum, ignore_case = true)]
+        method: Option<HttpMethod>,
         /// Validate scope and print the forward plan without queueing delivery
         #[arg(long)]
         dry_run: bool,
@@ -521,10 +531,10 @@ enum EndpointAction {
         /// Debug request ID
         request_id: String,
         /// Page number
-        #[arg(long, default_value = "1")]
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        /// Page size
-        #[arg(long, default_value = "50")]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
@@ -628,10 +638,10 @@ enum AnonAction {
         #[arg(long)]
         token: String,
         /// Page number
-        #[arg(long, default_value = "1")]
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        /// Page size
-        #[arg(long, default_value = "50")]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
     },
     /// Show a captured event
@@ -727,11 +737,11 @@ enum MonitorAction {
         name: String,
         /// URL to monitor (must be http:// or https://)
         url: String,
-        /// HTTP method (get, post, put, patch, delete, head)
-        #[arg(long, default_value = "get")]
-        method: String,
+        /// HTTP method
+        #[arg(long, value_enum, ignore_case = true, default_value_t = MonitorMethod::Get)]
+        method: MonitorMethod,
         /// Expected HTTP status code
-        #[arg(long, default_value = "200")]
+        #[arg(long, value_name = "CODE", default_value_t = 200, value_parser = clap::value_parser!(u16).range(100..=599))]
         expected_status: u16,
         /// Check interval in minutes (1, 5, 10, 30, 60)
         #[arg(long, default_value = "5")]
@@ -742,8 +752,8 @@ enum MonitorAction {
         /// Request body to send (for POST/PUT/PATCH)
         #[arg(long)]
         body: Option<String>,
-        /// Number of consecutive failures before alerting
-        #[arg(long, default_value = "2")]
+        /// Consecutive failures before alerting
+        #[arg(long, value_name = "N", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
         failure_threshold: u32,
         /// Enable or disable email notifications (true or false)
         #[arg(
@@ -783,10 +793,10 @@ enum MonitorAction {
         #[arg(long)]
         url: Option<String>,
         /// HTTP method
-        #[arg(long)]
-        method: Option<String>,
+        #[arg(long, value_enum, ignore_case = true)]
+        method: Option<MonitorMethod>,
         /// Expected HTTP status code
-        #[arg(long)]
+        #[arg(long, value_name = "CODE", value_parser = clap::value_parser!(u16).range(100..=599))]
         expected_status: Option<u16>,
         /// Check interval in minutes (1, 5, 10, 30, 60)
         #[arg(long)]
@@ -794,8 +804,8 @@ enum MonitorAction {
         /// Enable or disable the monitor
         #[arg(long)]
         enabled: Option<bool>,
-        /// Number of consecutive failures before alerting
-        #[arg(long)]
+        /// Consecutive failures before alerting
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         failure_threshold: Option<u32>,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
@@ -814,10 +824,10 @@ enum MonitorAction {
         /// Monitor ID
         id: String,
         /// Page number
-        #[arg(long, default_value = "1")]
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        /// Page size
-        #[arg(long, default_value = "50")]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
         /// Organization ID override (falls back to configured default)
         #[arg(long)]
@@ -825,25 +835,74 @@ enum MonitorAction {
     },
 }
 
-fn normalize_http_method(method: Option<String>) -> Result<Option<String>> {
-    let Some(method) = method else {
-        return Ok(None);
-    };
+/// HTTP method for `endpoint forward-request` (sent uppercase on the wire).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum HttpMethod {
+    #[value(name = "GET")]
+    Get,
+    #[value(name = "POST")]
+    Post,
+    #[value(name = "PUT")]
+    Put,
+    #[value(name = "PATCH")]
+    Patch,
+    #[value(name = "DELETE")]
+    Delete,
+    #[value(name = "HEAD")]
+    Head,
+    #[value(name = "OPTIONS")]
+    Options,
+}
 
-    let normalized = method.trim().to_ascii_uppercase();
-    let valid = matches!(
-        normalized.as_str(),
-        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
-    );
-
-    if !valid {
-        return Err(anyhow!(
-            "Invalid HTTP method '{}'. Valid values: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS",
-            method
-        ));
+impl HttpMethod {
+    fn as_uppercase(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+        }
     }
+}
 
-    Ok(Some(normalized))
+/// HTTP method for uptime monitors (sent lowercase on the wire; no OPTIONS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum MonitorMethod {
+    #[value(name = "GET")]
+    Get,
+    #[value(name = "POST")]
+    Post,
+    #[value(name = "PUT")]
+    Put,
+    #[value(name = "PATCH")]
+    Patch,
+    #[value(name = "DELETE")]
+    Delete,
+    #[value(name = "HEAD")]
+    Head,
+}
+
+impl MonitorMethod {
+    fn as_lowercase(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Post => "post",
+            Self::Put => "put",
+            Self::Patch => "patch",
+            Self::Delete => "delete",
+            Self::Head => "head",
+        }
+    }
+}
+
+// Required by `default_value_t`; renders the help default as `[default: GET]`.
+impl std::fmt::Display for MonitorMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.to_possible_value().unwrap().get_name())
+    }
 }
 
 fn parse_timeout_ms(timeout: Option<String>, timeout_ms: Option<u64>) -> Result<Option<u64>> {
@@ -1790,7 +1849,7 @@ async fn run_endpoint_forward_request(
     endpoint_id: String,
     request_id: String,
     target_url: String,
-    method: Option<String>,
+    method: Option<HttpMethod>,
     dry_run: bool,
     org: Option<String>,
     json: bool,
@@ -1798,7 +1857,7 @@ async fn run_endpoint_forward_request(
     let mut config = config::Config::load()?;
     let organization_id = require_organization(org, &config)?;
     let token = ensure_valid_token(&mut config).await?;
-    let normalized_method = normalize_http_method(method)?;
+    let method = method.map(HttpMethod::as_uppercase);
     validate_forward_target_url(&target_url)?;
     let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
 
@@ -1813,7 +1872,7 @@ async fn run_endpoint_forward_request(
                 &endpoint_id,
                 &request_id,
                 &target_url,
-                normalized_method.as_deref(),
+                method,
                 &request,
             ))?;
         } else {
@@ -1822,7 +1881,7 @@ async fn run_endpoint_forward_request(
                 &endpoint_id,
                 &request_id,
                 &target_url,
-                normalized_method.as_deref(),
+                method,
                 &request,
             );
         }
@@ -1831,12 +1890,7 @@ async fn run_endpoint_forward_request(
     }
 
     let response = client
-        .forward_endpoint_request(
-            &endpoint_id,
-            &request_id,
-            &target_url,
-            normalized_method.as_deref(),
-        )
+        .forward_endpoint_request(&endpoint_id, &request_id, &target_url, method)
         .await?;
 
     if json {
@@ -2351,8 +2405,8 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            ConfigAction::Set { key, value } => match key.as_str() {
-                "selected_organization_id" => {
+            ConfigAction::Set { key, value } => match key {
+                ConfigKey::SelectedOrganizationId => {
                     let mut config = config::Config::load()?;
                     if value == "none" {
                         config.selected_organization_id = None;
@@ -2400,11 +2454,6 @@ async fn run(cli: Cli) -> Result<()> {
                             );
                         }
                     }
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Unknown config key `{key}`. Available key: selected_organization_id."
-                    ));
                 }
             },
         },
@@ -3135,7 +3184,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let mut params = serde_json::json!({
                     "name": name,
                     "url": url,
-                    "method": method.to_lowercase(),
+                    "method": method.as_lowercase(),
                     "expected_status_code": expected_status,
                     "check_interval": interval,
                     "failure_threshold": failure_threshold,
@@ -3217,7 +3266,10 @@ async fn run(cli: Cli) -> Result<()> {
                     params.insert("url".into(), serde_json::Value::String(v));
                 }
                 if let Some(v) = method {
-                    params.insert("method".into(), serde_json::Value::String(v.to_lowercase()));
+                    params.insert(
+                        "method".into(),
+                        serde_json::Value::String(v.as_lowercase().to_string()),
+                    );
                 }
                 if let Some(v) = expected_status {
                     params.insert("expected_status_code".into(), v.into());
@@ -5982,8 +6034,6 @@ fn error_code(err: &anyhow::Error) -> String {
             "authentication_required".to_string()
         } else if message.contains("No organization selected") {
             "organization_required".to_string()
-        } else if message.contains("Unknown config key") {
-            "invalid_config_key".to_string()
         } else {
             "command_failed".to_string()
         }
@@ -7356,6 +7406,279 @@ mod tests {
         assert_eq!(help.matches("Global options:").count(), 1, "{help}");
     }
 
+    fn parse_error_kind<I, T>(args: I) -> clap::error::ErrorKind
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("expected argument parsing to fail"),
+            Err(err) => err.kind(),
+        }
+    }
+
+    #[test]
+    fn forward_request_method_is_a_value_enum_rendered_uppercase() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "forward-request",
+            "ep_1",
+            "req_1",
+            "http://localhost:3000/hook",
+            "--method",
+            "post",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Endpoint {
+                action: EndpointAction::ForwardRequest { method, .. },
+            }) => {
+                assert_eq!(method, Some(HttpMethod::Post));
+                assert_eq!(method.unwrap().as_uppercase(), "POST");
+            }
+            _ => panic!("expected endpoint forward-request command"),
+        }
+    }
+
+    #[test]
+    fn forward_request_method_rejects_unknown_values() {
+        let kind = parse_error_kind([
+            "hooklistener",
+            "endpoint",
+            "forward-request",
+            "ep_1",
+            "req_1",
+            "http://localhost:3000/hook",
+            "--method",
+            "trace",
+        ]);
+        assert_eq!(kind, clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn monitor_create_method_defaults_to_get_and_accepts_any_case() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Monitor {
+                action:
+                    MonitorAction::Create {
+                        method,
+                        expected_status,
+                        failure_threshold,
+                        ..
+                    },
+            }) => {
+                assert_eq!(method, MonitorMethod::Get);
+                assert_eq!(method.as_lowercase(), "get");
+                assert_eq!(method.to_string(), "GET");
+                assert_eq!(expected_status, 200);
+                assert_eq!(failure_threshold, 2);
+            }
+            _ => panic!("expected monitor create command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--method",
+            "Post",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Monitor {
+                action: MonitorAction::Create { method, .. },
+            }) => {
+                assert_eq!(method, MonitorMethod::Post);
+                assert_eq!(method.as_lowercase(), "post");
+            }
+            _ => panic!("expected monitor create command"),
+        }
+    }
+
+    #[test]
+    fn monitor_method_rejects_options() {
+        for args in [
+            vec![
+                "hooklistener",
+                "monitor",
+                "create",
+                "API",
+                "https://example.com/health",
+                "--method",
+                "options",
+            ],
+            vec![
+                "hooklistener",
+                "monitor",
+                "update",
+                "mon_1",
+                "--method",
+                "OPTIONS",
+            ],
+        ] {
+            assert_eq!(parse_error_kind(args), clap::error::ErrorKind::InvalidValue);
+        }
+    }
+
+    #[test]
+    fn monitor_update_method_parses_case_insensitively() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "update",
+            "mon_1",
+            "--method",
+            "head",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Monitor {
+                action: MonitorAction::Update { method, .. },
+            }) => assert_eq!(method, Some(MonitorMethod::Head)),
+            _ => panic!("expected monitor update command"),
+        }
+    }
+
+    #[test]
+    fn monitor_expected_status_must_be_an_http_status_code() {
+        let kind = parse_error_kind([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--expected-status",
+            "42",
+        ]);
+        assert_eq!(kind, clap::error::ErrorKind::ValueValidation);
+
+        let kind = parse_error_kind([
+            "hooklistener",
+            "monitor",
+            "update",
+            "mon_1",
+            "--expected-status",
+            "600",
+        ]);
+        assert_eq!(kind, clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn monitor_failure_threshold_rejects_zero() {
+        let kind = parse_error_kind([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--failure-threshold",
+            "0",
+        ]);
+        assert_eq!(kind, clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn paginated_lists_reject_page_zero() {
+        for args in [
+            vec![
+                "hooklistener",
+                "endpoint",
+                "list-requests",
+                "ep_1",
+                "--page",
+                "0",
+            ],
+            vec![
+                "hooklistener",
+                "endpoint",
+                "list-forwards",
+                "ep_1",
+                "req_1",
+                "--page-size",
+                "0",
+            ],
+            vec![
+                "hooklistener",
+                "anon",
+                "list-events",
+                "ep_1",
+                "--token",
+                "t",
+                "--page",
+                "0",
+            ],
+            vec!["hooklistener", "monitor", "checks", "mon_1", "--page", "0"],
+        ] {
+            assert_eq!(
+                parse_error_kind(args.clone()),
+                clap::error::ErrorKind::ValueValidation,
+                "{args:?} must fail range validation"
+            );
+        }
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "checks",
+            "mon_1",
+            "--page",
+            "2",
+            "--page-size",
+            "10",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Monitor {
+                action:
+                    MonitorAction::Checks {
+                        page, page_size, ..
+                    },
+            }) => {
+                assert_eq!(page, 2);
+                assert_eq!(page_size, 10);
+            }
+            _ => panic!("expected monitor checks command"),
+        }
+    }
+
+    #[test]
+    fn config_set_key_is_a_value_enum() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "config",
+            "set",
+            "selected_organization_id",
+            "org_1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Set { key, value },
+            }) => {
+                assert_eq!(key, ConfigKey::SelectedOrganizationId);
+                assert_eq!(value, "org_1");
+            }
+            _ => panic!("expected config set command"),
+        }
+
+        assert_eq!(
+            parse_error_kind(["hooklistener", "config", "set", "other", "x"]),
+            clap::error::ErrorKind::InvalidValue
+        );
+    }
+
     #[test]
     fn monitor_email_accepts_explicit_false() {
         let cli = Cli::try_parse_from([
@@ -8240,22 +8563,6 @@ mod tests {
         let err = validate_forward_target_url("ftp://example.com/webhook").unwrap_err();
         assert!(
             err.to_string().contains("Use http or https"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn normalize_http_method_accepts_lowercase() {
-        let method = normalize_http_method(Some("post".to_string())).unwrap();
-        assert_eq!(method.as_deref(), Some("POST"));
-    }
-
-    #[test]
-    fn normalize_http_method_rejects_invalid_values() {
-        let err = normalize_http_method(Some("TRACE".to_string())).unwrap_err();
-        assert!(
-            err.to_string().contains("Invalid HTTP method"),
             "unexpected error: {}",
             err
         );
