@@ -409,6 +409,39 @@ enum CompletionShell {
     Elvish,
 }
 
+/// Generate the completion script for `shell` into `out`.
+///
+/// The script is rendered into memory first so that a single `write_all`
+/// carries it to `out`; a closed pipe then surfaces as one `io::Error`
+/// instead of a panic inside `clap_complete`.
+fn write_completions(shell: CompletionShell, out: &mut dyn io::Write) -> io::Result<()> {
+    use clap_complete::generate;
+    use clap_complete::shells::{Bash, Elvish, Fish, PowerShell, Zsh};
+
+    let mut command = Cli::command();
+    let bin_name = command.get_name().to_string();
+    let mut buf: Vec<u8> = Vec::new();
+
+    match shell {
+        CompletionShell::Bash => generate(Bash, &mut command, bin_name, &mut buf),
+        CompletionShell::Zsh => generate(Zsh, &mut command, bin_name, &mut buf),
+        CompletionShell::Fish => generate(Fish, &mut command, bin_name, &mut buf),
+        CompletionShell::PowerShell => generate(PowerShell, &mut command, bin_name, &mut buf),
+        CompletionShell::Elvish => generate(Elvish, &mut command, bin_name, &mut buf),
+    }
+
+    out.write_all(&buf).and_then(|_| out.flush())
+}
+
+/// Write the completion script for `shell` to `out`, treating a closed pipe
+/// (for example `completions bash | head -1`) as success.
+fn print_completions(shell: CompletionShell, out: &mut dyn io::Write) -> io::Result<()> {
+    match write_completions(shell, out) {
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Show the current configuration
@@ -3539,22 +3572,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
         Commands::Completions { shell } => {
-            use clap_complete::generate;
-            use clap_complete::shells::{Bash, Elvish, Fish, PowerShell, Zsh};
-
-            let mut command = Cli::command();
-            let bin_name = command.get_name().to_string();
-            let mut stdout = io::stdout();
-
-            match shell {
-                CompletionShell::Bash => generate(Bash, &mut command, bin_name, &mut stdout),
-                CompletionShell::Zsh => generate(Zsh, &mut command, bin_name, &mut stdout),
-                CompletionShell::Fish => generate(Fish, &mut command, bin_name, &mut stdout),
-                CompletionShell::PowerShell => {
-                    generate(PowerShell, &mut command, bin_name, &mut stdout)
-                }
-                CompletionShell::Elvish => generate(Elvish, &mut command, bin_name, &mut stdout),
-            }
+            let mut stdout = io::stdout().lock();
+            print_completions(shell, &mut stdout)?;
         }
         Commands::Update => {
             updater::run_self_update(json).await?;
@@ -7270,6 +7289,66 @@ mod tests {
                 "completions {spelling} must yield PowerShell"
             );
         }
+    }
+
+    #[test]
+    fn completions_generate_for_every_shell() {
+        for shell in CompletionShell::value_variants() {
+            let mut buf: Vec<u8> = Vec::new();
+            write_completions(*shell, &mut buf)
+                .unwrap_or_else(|err| panic!("completions {shell:?} writes: {err}"));
+            assert!(!buf.is_empty(), "completions {shell:?} must not be empty");
+            let script = String::from_utf8(buf)
+                .unwrap_or_else(|err| panic!("completions {shell:?} is UTF-8: {err}"));
+            assert!(
+                script.contains("hooklistener"),
+                "completions {shell:?} must mention the binary name"
+            );
+        }
+    }
+
+    struct BrokenPipeWriter;
+
+    impl io::Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingWriter;
+
+    impl io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("disk full"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completions_broken_pipe_is_not_an_error() {
+        for shell in CompletionShell::value_variants() {
+            let mut out = BrokenPipeWriter;
+            assert!(
+                print_completions(*shell, &mut out).is_ok(),
+                "completions {shell:?} must treat a closed pipe as success"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_other_write_errors_propagate() {
+        let mut out = FailingWriter;
+        let err = print_completions(CompletionShell::Bash, &mut out)
+            .expect_err("a non-pipe write error must propagate");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "disk full");
     }
 
     #[test]
