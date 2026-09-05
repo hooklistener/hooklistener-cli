@@ -4271,7 +4271,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
             "ACTION",
             format!(
                 "Run {} to start forwarding webhooks.",
-                "hooklistener listen <endpoint>".bold()
+                "hooklistener listen <endpoint-slug>".bold()
             ),
         );
         print_field(
@@ -4341,7 +4341,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
                     "ACTION",
                     format!(
                         "Run {} to forward webhooks.",
-                        "hooklistener listen <endpoint>".bold()
+                        "hooklistener listen <endpoint-slug>".bold()
                     ),
                 );
                 println!();
@@ -5165,7 +5165,7 @@ fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsRespon
     if response.data.is_empty() {
         print_empty_state(
             "NO FORWARDS FOUND",
-            "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <target-url>`.",
+            "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <url>`.",
         );
         return;
     }
@@ -5445,7 +5445,7 @@ fn print_anon_events(response: &api::AnonEventsResponse) {
     if response.data.is_empty() {
         print_empty_state(
             "NO EVENTS CAPTURED",
-            "Send a webhook, then run `hooklistener anon list-events <endpoint-id> --token <token>`.",
+            "Send a webhook, then run `hooklistener anon list-events <endpoint-id> --token <viewer-token>`.",
         );
     } else {
         let mut table = new_table(&["ID", "Method", "Received At"]);
@@ -9274,7 +9274,7 @@ mod tests {
                 "forward list",
                 render_empty_status(
                     "NO FORWARDS FOUND",
-                    "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <target-url>`.",
+                    "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <url>`.",
                 ),
             ),
             (
@@ -9309,7 +9309,7 @@ mod tests {
                 "anon events",
                 render_empty_status(
                     "NO EVENTS CAPTURED",
-                    "Send a webhook, then run `hooklistener anon list-events <endpoint-id> --token <token>`.",
+                    "Send a webhook, then run `hooklistener anon list-events <endpoint-id> --token <viewer-token>`.",
                 ),
             ),
         ]);

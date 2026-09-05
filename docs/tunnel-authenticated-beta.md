@@ -5,8 +5,8 @@ is in the server-managed cohort:
 
 - `hooklistener tunnel start --port 3000` gives the public caller the local
   handler's response.
-- `hooklistener listen <endpoint> --target http://localhost:3000` forwards an
-  already captured endpoint request. The endpoint's configured response, not
+- `hooklistener listen <endpoint-slug> --target http://localhost:3000` forwards
+  an already captured endpoint request. The endpoint's configured response, not
   the local handler's response, remains public.
 
 Run `hooklistener login`, select the intended organization with

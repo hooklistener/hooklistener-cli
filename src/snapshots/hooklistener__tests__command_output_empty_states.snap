@@ -1,6 +1,6 @@
 ---
 source: src/main.rs
-assertion_line: 7858
+assertion_line: 9318
 expression: output
 ---
 ENDPOINT LIST
@@ -20,7 +20,7 @@ FORWARD LIST
 [INFO] NO FORWARDS FOUND
 
 ACTION         Run `hooklistener endpoint forward-request <endpoint-id>
-               <request-id> <target-url>`.
+               <request-id> <url>`.
 
 
 SHARE LIST
@@ -52,4 +52,4 @@ ANON EVENTS
 [INFO] NO EVENTS CAPTURED
 
 ACTION         Send a webhook, then run `hooklistener anon list-events
-               <endpoint-id> --token <token>`.
+               <endpoint-id> --token <viewer-token>`.
