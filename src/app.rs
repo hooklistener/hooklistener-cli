@@ -1,6 +1,5 @@
 use crate::api::ApiClient;
 use crate::config::Config;
-use crate::errors::ApiError;
 use crate::models::{ForwardResponse, WebhookRequest};
 use crate::syntax::JsonHighlighter;
 use anyhow::{Result, anyhow};
@@ -119,10 +118,6 @@ pub struct TunnelStats {
     pub status_4xx: u64,
     pub status_5xx: u64,
     pub total_duration_ms: u64,
-    #[allow(dead_code)]
-    pub bytes_in: u64,
-    #[allow(dead_code)]
-    pub bytes_out: u64,
 }
 
 impl TunnelStats {
@@ -201,8 +196,13 @@ impl TunnelReplayRequest {
         let method = reqwest::Method::from_bytes(self.method.as_bytes())
             .map_err(|_| anyhow!("unsupported method: {}", self.method))?;
         let target = self.target_url();
+        // Never follow redirects or route through a proxy: the replay carries
+        // the captured webhook's headers and body, and a 307/308 from the local
+        // target would otherwise re-send them to whatever origin it names.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()?;
         let mut request = client.request(method, target);
 
@@ -1432,12 +1432,9 @@ impl App {
                     self.state = AppState::ForwardResult;
                 }
                 Err(e) => {
-                    let hint = e
-                        .downcast_ref::<ApiError>()
-                        .and_then(|ae| ae.hint().map(String::from));
                     self.state = AppState::Error {
                         message: format!("Failed to forward request: {}", e),
-                        hint,
+                        hint: None,
                     };
                 }
             }
@@ -2945,6 +2942,44 @@ mod tests {
             replay.target_url(),
             "http://localhost:3000/health?check=true"
         );
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_replay_send_does_not_follow_redirects() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("POST", "/webhook")
+            .with_status(307)
+            .with_header("location", "/unexpected")
+            .create_async()
+            .await;
+        let unexpected = server
+            .mock("POST", "/unexpected")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+        let (local_host, local_port) = server
+            .host_with_port()
+            .rsplit_once(':')
+            .map(|(host, port)| (host.to_string(), port.parse::<u16>().unwrap()))
+            .unwrap();
+        let replay = TunnelReplayRequest {
+            request_id: "req-1".to_string(),
+            method: "POST".to_string(),
+            path: "/webhook".to_string(),
+            query_string: String::new(),
+            headers: HashMap::from([("X-Hub-Signature-256".to_string(), "sha256=abc".to_string())]),
+            body: Some(r#"{"event":"ping"}"#.to_string()),
+            local_host,
+            local_port,
+        };
+
+        let outcome = replay.send().await.unwrap();
+
+        assert_eq!(outcome.status, 307);
+        redirect.assert_async().await;
+        unexpected.assert_async().await;
     }
 
     #[test]

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use reqwest::{
     Client, Response, StatusCode, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
+    redirect::Policy,
 };
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -273,7 +274,7 @@ pub struct Organization {
     pub name: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct RelayTicket {
     pub ticket: String,
     pub scope: String,
@@ -287,7 +288,7 @@ fn default_tunnel_protocol_versions() -> Vec<u64> {
     vec![2]
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AnonymousTunnelRouteCreated {
     pub id: String,
     pub slug: String,
@@ -612,16 +613,11 @@ pub struct StaticTunnelCreateResponse {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelLifecycleContract {
     pub id: String,
     pub version: String,
     pub schema: TunnelSchemaVersion,
-    pub receipts: Value,
-    pub events: Value,
-    pub resources: Value,
-    pub lifecycle: Value,
-    pub exit_codes: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -703,7 +699,7 @@ pub struct TunnelAttemptResource {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelLifecycleEvent {
     pub id: String,
     pub position: u64,
@@ -728,13 +724,13 @@ pub struct TunnelCollection<T> {
     pub meta: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelEventPage {
     pub data: Vec<TunnelLifecycleEvent>,
     pub meta: TunnelEventPageMeta,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelEventPageMeta {
     pub cursor: String,
     pub has_more: bool,
@@ -742,23 +738,18 @@ pub struct TunnelEventPageMeta {
     pub resync: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelReconnectDescriptor {
-    pub session: TunnelSessionResource,
-    pub topic: String,
     pub resume_token: String,
-    pub resume_token_expires_in: u64,
-    pub cursor: String,
-    pub ownership: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MessageResponse {
     #[serde(default)]
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DataResponse<T> {
     data: T,
 }
@@ -911,7 +902,7 @@ pub struct UptimeChecksResponse {
     pub stats: Option<UptimeChecksStats>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TokenRefreshResponse {
     pub access_token: String,
     pub expires_in: u64,
@@ -929,6 +920,20 @@ pub fn default_base_url() -> Result<String> {
     Ok(base_url)
 }
 
+/// Build a client for API requests that never follows redirects.
+///
+/// reqwest's default policy follows up to ten redirects, and a 307/308 keeps
+/// the request body and headers, so a credential in either (refresh token,
+/// bearer token, relay plan) would be re-sent to whatever origin the
+/// `Location` header names. The API is JSON-only and never redirects, so a
+/// 3xx surfaces as a plain non-success status instead of being followed.
+fn no_redirect_client() -> Result<Client> {
+    Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .context("Failed to build HTTP client")
+}
+
 /// Refresh an expired CLI access token using a refresh token (no auth needed).
 pub async fn refresh_access_token(
     refresh_token: &str,
@@ -938,7 +943,7 @@ pub async fn refresh_access_token(
     let url = format!("{}/api/v1/auth/refresh", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "refresh_token": refresh_token });
 
-    let client = Client::new();
+    let client = no_redirect_client()?;
     let response = client
         .post(&url)
         .timeout(TOKEN_REFRESH_REQUEST_TIMEOUT)
@@ -962,7 +967,7 @@ pub async fn revoke_refresh_token(refresh_token: &str) -> Result<()> {
     let url = format!("{}/api/v1/auth/revoke", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "refresh_token": refresh_token });
 
-    let client = Client::new();
+    let client = no_redirect_client()?;
     let _ = client.post(&url).json(&body).send().await;
     Ok(())
 }
@@ -979,7 +984,7 @@ pub async fn issue_relay_ticket(
         http_base.trim_end_matches('/')
     );
 
-    let response = Client::new()
+    let response = no_redirect_client()?
         .post(url)
         .bearer_auth(access_token)
         .json(&serde_json::json!({"plan": plan}))
@@ -1010,7 +1015,7 @@ impl ApiClient {
     pub fn for_forwarding() -> Result<Self> {
         let client = Client::builder()
             .timeout(REPLAY_REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(Policy::none())
             .no_proxy()
             .build()
             .context("Failed to build replay client")?;
@@ -1028,7 +1033,7 @@ impl ApiClient {
     pub fn unauthenticated_at(base_url: String) -> Result<Self> {
         let base_url = relay_http_base_url(&base_url)?;
         Ok(Self {
-            client: Client::new(),
+            client: no_redirect_client()?,
             base_url: Some(base_url),
         })
     }
@@ -1064,6 +1069,7 @@ impl ApiClient {
             .default_headers(headers)
             .connect_timeout(API_CONNECT_TIMEOUT)
             .timeout(API_REQUEST_TIMEOUT)
+            .redirect(Policy::none())
             .build()
             .context("Failed to build API client")?;
 
@@ -2519,7 +2525,6 @@ mod tests {
             .reconnect_tunnel_session("session-123")
             .await
             .unwrap();
-        assert_eq!(reconnect.cursor, "opaque");
         assert_eq!(reconnect.resume_token, "secret-resume-token");
         contract_mock.assert_async().await;
         session_mock.assert_async().await;
@@ -2584,5 +2589,109 @@ mod tests {
         assert!(!output.contains("authorization"));
         assert!(!output.contains("Bearer secret"));
         assert!(!output.contains("private/key"));
+    }
+
+    #[tokio::test]
+    async fn refresh_redirect_surfaces_as_a_clear_error() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(307)
+            .with_header("location", "/elsewhere")
+            .create_async()
+            .await;
+        let elsewhere = server
+            .mock("POST", "/elsewhere")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let error = refresh_access_token("refresh-secret", &server.url())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Token refresh failed (HTTP 307 Temporary Redirect)"
+        );
+        redirect.assert_async().await;
+        elsewhere.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_request_does_not_follow_redirects() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("POST", "/api/v1/tunnel/relay-tickets")
+            .with_status(308)
+            .with_header("location", "/elsewhere")
+            .create_async()
+            .await;
+        let elsewhere = server
+            .mock("POST", "/elsewhere")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let error = match issue_relay_ticket("access-secret", &server.url(), &serde_json::json!({}))
+            .await
+        {
+            Ok(_) => panic!("expected the redirect to surface as an error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Relay handshake ticket request failed (HTTP 308 Permanent Redirect)"
+        );
+        redirect.assert_async().await;
+        elsewhere.assert_async().await;
+    }
+}
+
+#[cfg(test)]
+mod audit_findings {
+    //! Regression tests for the 2026-09 security audit findings.
+    //! Run with: cargo test audit_findings
+    use super::*;
+
+    /// Regression test for finding 4: `refresh_access_token` used a default
+    /// reqwest client, which follows up to ten redirects. A 307/308 keeps the
+    /// POST body, so the refresh token was re-sent to whatever origin the
+    /// redirect named. The client now pins `Policy::none()`, like every other
+    /// credential-bearing client in this crate.
+    #[tokio::test]
+    async fn refresh_token_is_not_resent_to_a_redirect_target() {
+        let mut attacker = mockito::Server::new_async().await;
+        let leaked = attacker
+            .mock("POST", "/api/v1/auth/refresh")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"refresh_token":"refresh-secret"}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token":"stolen","expires_in":3600}"#)
+            .create_async()
+            .await;
+
+        let mut origin = mockito::Server::new_async().await;
+        let _redirect = origin
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(307)
+            .with_header(
+                "location",
+                &format!("{}/api/v1/auth/refresh", attacker.url()),
+            )
+            .create_async()
+            .await;
+
+        let _ = refresh_access_token("refresh-secret", &origin.url()).await;
+
+        assert!(
+            !leaked.matched_async().await,
+            "refresh token was forwarded to the redirect target"
+        );
     }
 }

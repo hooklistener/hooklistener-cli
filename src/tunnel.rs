@@ -1223,6 +1223,13 @@ fn decode_body_preview(
     })
 }
 
+/// Maximum number of stacked content codings accepted in a single
+/// `Content-Encoding` header. Real servers apply one coding (rarely two);
+/// each accepted coding costs a nested decoder (zstd eagerly allocates
+/// ~128 KiB of window) plus one level of recursion on every read, and the
+/// header is remote-controlled on the protocol v2 request path.
+const MAX_CONTENT_ENCODINGS: usize = 4;
+
 fn content_encodings(
     headers: &HashMap<String, String>,
 ) -> std::result::Result<Vec<String>, String> {
@@ -1230,10 +1237,21 @@ fn content_encodings(
         return Ok(Vec::new());
     };
 
-    value
+    let codings = value
         .split(',')
         .map(str::trim)
-        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"));
+
+    // Reject oversized lists before any coding is validated or any decoder is
+    // built so the cost of a hostile header stays proportional to one scan.
+    let count = codings.clone().count();
+    if count > MAX_CONTENT_ENCODINGS {
+        return Err(format!(
+            "too many content encodings ({count} > {MAX_CONTENT_ENCODINGS})"
+        ));
+    }
+
+    codings
         .map(|encoding| {
             let normalized = encoding.to_ascii_lowercase();
             match normalized.as_str() {
@@ -1836,7 +1854,7 @@ fn validate_join_mode(response: &serde_json::Value, expected: &str) -> Result<()
 }
 
 /// Webhook request received from the server (Tunnel format)
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunnelWebhookRequest {
     pub id: String,
     #[serde(default)]
@@ -1997,14 +2015,39 @@ pub fn build_forward_target(
     }
 }
 
+/// HTTP status codes that mean our credentials were rejected outright, so
+/// reconnecting with the same credentials cannot succeed.
+const FATAL_HTTP_STATUSES: [&str; 2] = ["401", "403"];
+
+/// Whether `lower` (an already lowercased error message) reports one of
+/// [`FATAL_HTTP_STATUSES`] as an HTTP status. Matches the shapes this crate
+/// actually produces: "(HTTP 403)" / "(HTTP 401 Unauthorized; ...)" from the
+/// API client and lifecycle errors, and tungstenite's "HTTP error: 401
+/// Unauthorized". Bare digits are deliberately not matched, because
+/// server-supplied detail text ("timed out after 4013 ms", "shard 403",
+/// "lease 7f401") must not stop automatic reconnection.
+fn mentions_fatal_http_status(lower: &str) -> bool {
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    tokens.iter().enumerate().any(|(index, token)| {
+        *token == "http"
+            && tokens[index + 1..]
+                .iter()
+                .find(|next| !matches!(**next, "error" | "status"))
+                .is_some_and(|code| FATAL_HTTP_STATUSES.contains(code))
+    })
+}
+
 /// Determine if an error message represents a fatal (non-retryable) error
 pub fn is_fatal_error(error_msg: &str) -> bool {
     let lower = error_msg.to_lowercase();
     lower.contains("authentication failed")
         || lower.contains("unauthorized")
         || lower.contains("forbidden")
-        || lower.contains("401")
-        || lower.contains("403")
+        || mentions_fatal_http_status(&lower)
         || lower.contains("relay handshake rejected")
         || lower.contains("endpoint not found")
         || lower.contains("channel join failed")
@@ -5923,6 +5966,26 @@ mod tests {
     }
 
     #[test]
+    fn test_content_encoding_list_is_bounded() {
+        let at_limit = preview_headers(&[("content-encoding", "gzip, br, zstd, deflate")]);
+        let over_limit = preview_headers(&[("content-encoding", "gzip, br, zstd, deflate, gzip")]);
+
+        assert_eq!(
+            content_encodings(&at_limit).unwrap().len(),
+            MAX_CONTENT_ENCODINGS
+        );
+        assert_eq!(
+            content_encodings(&over_limit).unwrap_err(),
+            "too many content encodings (5 > 4)"
+        );
+        assert!(
+            body_preview(b"encoded", &over_limit)
+                .unwrap()
+                .starts_with("[body preview unavailable: too many content encodings")
+        );
+    }
+
+    #[test]
     fn test_text_body_preview_honors_declared_charset() {
         let headers = preview_headers(&[("Content-Type", "text/plain; charset=iso-8859-1")]);
 
@@ -7286,6 +7349,21 @@ mod tests {
     }
 
     #[test]
+    fn test_http_auth_statuses_are_fatal_only_as_status_tokens() {
+        // The shapes this crate produces for a rejected credential.
+        assert!(is_fatal_error(
+            "Failed to connect to tunnel: HTTP error: 401 Unauthorized"
+        ));
+        assert!(is_fatal_error(
+            "Tunnel API request failed (token_revoked, HTTP 403): revoked"
+        ));
+        assert!(is_fatal_error("Connection failed with HTTP status: 403"));
+        // Other statuses, or the digits appearing outside an HTTP status, stay retryable.
+        assert!(!is_fatal_error("Connection failed with HTTP status: 502"));
+        assert!(!is_fatal_error("Connection refused: port 4013 unreachable"));
+    }
+
+    #[test]
     fn test_static_tunnel_lease_contention_is_retryable() {
         assert!(!is_fatal_error(
             "Tunnel join failed: This static tunnel is already in use by another connection"
@@ -7375,5 +7453,79 @@ mod tests {
         let error = decode_request_body_limited("base64", &encoded, 4).unwrap_err();
 
         assert!(error.to_string().contains("encoded body is too large"));
+    }
+}
+
+#[cfg(test)]
+mod audit_findings {
+    //! Regression tests for the 2026-09 security audit findings. Each test
+    //! asserts the safe behavior and fails on the pre-fix code.
+    //! Run with: cargo test audit_findings
+    use super::*;
+
+    fn stacked_encoding_headers(encoding: &str, layers: usize) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "content-encoding".to_string(),
+            std::iter::repeat_n(encoding, layers)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        headers.insert("content-type".to_string(), "text/plain".to_string());
+        headers
+    }
+
+    /// Regression test for finding 1: `content_encodings` used to accept an
+    /// unbounded list of stacked codings and `decode_body_preview` built one
+    /// nested decoder per entry. A single header value (remote-controlled on
+    /// the protocol v2 request path, local-server-controlled on every response
+    /// path) could therefore allocate decoder state proportional to the
+    /// header length and read through a recursion chain of the same depth.
+    /// The list is now capped at `MAX_CONTENT_ENCODINGS` before any decoder
+    /// is constructed.
+    #[test]
+    fn body_preview_bounds_stacked_content_encodings() {
+        const LAYERS: usize = 20_000; // fits comfortably in a 128 KiB header budget
+        let headers = stacked_encoding_headers("zstd", LAYERS);
+
+        let started = std::time::Instant::now();
+        let preview = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024) // tokio worker default
+            .spawn(move || body_preview(b"hello", &headers))
+            .expect("spawn")
+            .join()
+            .expect("preview must not panic or overflow the stack");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "preview took {:?} for {LAYERS} stacked codings",
+            started.elapsed()
+        );
+        let preview = preview.expect("non-empty body yields a preview");
+        assert!(
+            preview.starts_with("[body preview unavailable"),
+            "expected an early rejection, got: {preview:.80}"
+        );
+    }
+
+    /// Regression test for finding 5: `is_fatal_error` used to match the bare
+    /// substrings "401"/"403", so a transient transport error whose text
+    /// merely contained those digits (a port, a request id, a hostname)
+    /// permanently stopped reconnection. Only genuine `HTTP 401`/`HTTP 403`
+    /// status tokens are fatal now.
+    #[test]
+    fn transient_errors_containing_401_or_403_digits_are_not_fatal() {
+        for message in [
+            // Shapes produced by server_response_error / validate_join_mode /
+            // TunnelLifecycleError::Api with server-supplied detail text.
+            "Relay handshake ticket request failed (HTTP 503 Service Unavailable; code=upstream_timeout; message=gateway timed out after 4013 ms)",
+            "Tunnel join failed: relay shard 403 is draining; retry shortly",
+            "Tunnel API request failed (session_lease_busy, HTTP 409): lease 7f401 is still held",
+        ] {
+            assert!(
+                !is_fatal_error(message),
+                "transient error was classified fatal: {message}"
+            );
+        }
     }
 }
