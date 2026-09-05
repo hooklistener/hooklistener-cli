@@ -152,6 +152,9 @@ enum Commands {
         insecure_tls: bool,
     },
     /// Expose a local HTTP server on a public Hooklistener URL
+    #[command(
+        after_help = "TARGET FLAGS:\n  Flags given before a subcommand set defaults; the same flag on the subcommand overrides them.\n  hooklistener tunnel --port 3000          same as: hooklistener tunnel start --port 3000"
+    )]
     Tunnel {
         #[command(subcommand)]
         action: Option<TunnelAction>,
@@ -221,8 +224,8 @@ enum Commands {
     },
     /// Print a shell completion script
     Completions {
-        /// Target shell
-        #[arg(value_enum)]
+        /// Shell to generate completions for
+        #[arg(value_enum, value_name = "SHELL")]
         shell: CompletionShell,
     },
     /// Update hooklistener to the latest release
@@ -292,70 +295,96 @@ struct TunnelTarget {
 
 #[derive(Subcommand)]
 enum TunnelAction {
-    /// Validate authentication, schema compatibility, and the activation plan
+    /// Validate authentication, schema compatibility, and the activation plan without connecting
     Prepare(TunnelTargetArgs),
-    /// Activate a relay and keep it attached to the local target
-    Activate(TunnelTargetArgs),
-    /// Prepare and activate a relay (the default tunnel behavior)
+    /// Prepare and activate a relay (the default when no subcommand is given)
+    #[command(alias = "activate")]
     Start(TunnelTargetArgs),
-    /// List cloud-authoritative tunnel sessions
+    /// List tunnel sessions
     List {
-        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
+        /// Maximum number of sessions to return
+        #[arg(long, value_name = "N", default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
-        #[arg(long)]
+        /// Only sessions in this status, such as active or stopped
+        #[arg(long, value_name = "STATUS")]
         status: Option<String>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Read a tunnel session by canonical ID
+    /// Show a tunnel session
     Status {
+        /// Tunnel session ID (from `tunnel list`)
+        #[arg(value_name = "SESSION_ID")]
         session_id: String,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Read ordered lifecycle events, optionally following from a cursor
+    /// List lifecycle events, optionally following new ones
     Events {
-        #[arg(long)]
+        /// Resume after this cursor from an earlier events receipt
+        #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
-        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
+        /// Maximum number of events per page
+        #[arg(long, value_name = "N", default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
-        #[arg(long)]
+        /// Only events for this capture
+        #[arg(long, value_name = "CAPTURE_ID")]
         capture_id: Option<String>,
-        #[arg(long)]
+        /// Only events for this delivery attempt
+        #[arg(long, value_name = "ATTEMPT_ID")]
         attempt_id: Option<String>,
+        /// Keep polling for new events until interrupted
         #[arg(long)]
         follow: bool,
-        #[arg(long, default_value = "1000")]
+        /// Poll interval in milliseconds while following
+        #[arg(long, value_name = "MS", default_value = "1000")]
         interval_ms: u64,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Read a redacted capture projection by canonical ID
+    /// Show a redacted capture
     Capture {
+        /// Capture ID (from `tunnel events`)
+        #[arg(value_name = "CAPTURE_ID")]
         capture_id: String,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Read a delivery attempt by canonical ID
+    /// Show a delivery attempt
     Attempt {
+        /// Delivery attempt ID (from `tunnel events`)
+        #[arg(value_name = "ATTEMPT_ID")]
         attempt_id: String,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Stop a tunnel session even when its original CLI process is gone
+    /// Stop a tunnel session, even if its CLI process is gone
     Stop {
+        /// Tunnel session ID (from `tunnel list`)
+        #[arg(value_name = "SESSION_ID")]
         session_id: String,
-        #[arg(long)]
+        /// Reason recorded in the session's lifecycle events
+        #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Detach the current owner while preserving the route for recovery
+    /// Detach the current owner and keep the route for recovery
     Detach {
+        /// Tunnel session ID (from `tunnel list`)
+        #[arg(value_name = "SESSION_ID")]
         session_id: String,
-        #[arg(long)]
+        /// Reason recorded in the session's lifecycle events
+        #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -630,10 +659,14 @@ enum AnonAction {
     },
     /// Claim an anonymous route into an organization
     Claim {
+        /// Anonymous route ID (from `anon tunnel`)
+        #[arg(value_name = "ROUTE_ID")]
         route_id: String,
-        #[arg(long)]
+        /// Claim token (from `anon tunnel`)
+        #[arg(long, value_name = "CLAIM_TOKEN")]
         token: String,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -3451,7 +3484,7 @@ async fn run_tunnel_lifecycle_command(
 ) -> Result<()> {
     match action {
         None => run_tunnel_activation(default_target.resolve(), json, update_handle).await,
-        Some(TunnelAction::Start(target)) | Some(TunnelAction::Activate(target)) => {
+        Some(TunnelAction::Start(target)) => {
             run_tunnel_activation(default_target.merge(target).resolve(), json, update_handle).await
         }
         Some(TunnelAction::Prepare(target)) => {
@@ -6589,11 +6622,7 @@ mod tests {
             } => target.resolve(),
             Commands::Tunnel {
                 action:
-                    Some(
-                        TunnelAction::Start(action_target)
-                        | TunnelAction::Activate(action_target)
-                        | TunnelAction::Prepare(action_target),
-                    ),
+                    Some(TunnelAction::Start(action_target) | TunnelAction::Prepare(action_target)),
                 target,
             } => target.merge(action_target).resolve(),
             _ => panic!("expected a tunnel target command"),
@@ -6689,7 +6718,7 @@ mod tests {
         assert!(before_start.allow_non_loopback);
         assert!(before_start.no_replay_buffered);
 
-        for action in ["prepare", "activate"] {
+        for action in ["prepare", "start", "activate"] {
             let before =
                 parsed_tunnel_target(&["hooklistener", "tunnel", "--port", "4001", action]);
             let after = parsed_tunnel_target(&["hooklistener", "tunnel", action, "--port", "4001"]);
@@ -6931,6 +6960,89 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn tunnel_activate_is_alias_of_start() {
+        let cli = Cli::try_parse_from(["hooklistener", "tunnel", "activate", "--port", "5000"])
+            .expect("tunnel activate parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tunnel {
+                action: Some(TunnelAction::Start(TunnelTargetArgs {
+                    port: Some(5000),
+                    ..
+                })),
+                ..
+            })
+        ));
+
+        let alias = parsed_tunnel_target(&["hooklistener", "tunnel", "activate", "--port", "5000"]);
+        let start = parsed_tunnel_target(&["hooklistener", "tunnel", "start", "--port", "5000"]);
+        assert_eq!(alias, start);
+    }
+
+    #[test]
+    fn tunnel_list_accepts_status_limit_and_short_org() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "tunnel",
+            "list",
+            "--status",
+            "active",
+            "--limit",
+            "10",
+            "-o",
+            "org_1",
+        ])
+        .expect("tunnel list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tunnel {
+                action: Some(TunnelAction::List {
+                    limit: 10,
+                    status: Some(status),
+                    org: Some(org),
+                }),
+                ..
+            }) if status == "active" && org == "org_1"
+        ));
+    }
+
+    #[test]
+    fn tunnel_lifecycle_subcommands_accept_short_org() {
+        for args in [
+            vec!["tunnel", "status", "session-1", "-o", "org_1"],
+            vec!["tunnel", "events", "-o", "org_1"],
+            vec!["tunnel", "capture", "capture-1", "-o", "org_1"],
+            vec!["tunnel", "attempt", "attempt-1", "-o", "org_1"],
+            vec!["tunnel", "stop", "session-1", "-o", "org_1"],
+            vec!["tunnel", "detach", "session-1", "-o", "org_1"],
+            vec!["anon", "claim", "route-1", "--token", "t", "-o", "org_1"],
+        ] {
+            let mut full = vec!["hooklistener"];
+            full.extend(args.iter().copied());
+            let cli = Cli::try_parse_from(&full).unwrap_or_else(|err| panic!("{args:?}: {err}"));
+            let org = match cli.command.expect("parsed command") {
+                Commands::Tunnel {
+                    action:
+                        Some(
+                            TunnelAction::Status { org, .. }
+                            | TunnelAction::Events { org, .. }
+                            | TunnelAction::Capture { org, .. }
+                            | TunnelAction::Attempt { org, .. }
+                            | TunnelAction::Stop { org, .. }
+                            | TunnelAction::Detach { org, .. },
+                        ),
+                    ..
+                } => org,
+                Commands::Anon {
+                    action: AnonAction::Claim { org, .. },
+                } => org,
+                _ => panic!("{args:?}: unexpected command"),
+            };
+            assert_eq!(org.as_deref(), Some("org_1"), "{args:?}");
+        }
     }
 
     #[test]
