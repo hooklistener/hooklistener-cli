@@ -1,6 +1,6 @@
 ---
 source: src/main.rs
-assertion_line: 5109
+assertion_line: 7858
 expression: output
 ---
 ENDPOINT LIST
@@ -12,7 +12,7 @@ ACTION         Run `hooklistener endpoint create <name>` to create one.
 REQUEST LIST
 [INFO] NO REQUESTS FOUND
 
-ACTION         Send a webhook, then run `hooklistener endpoint requests
+ACTION         Send a webhook, then run `hooklistener endpoint list-requests
                <endpoint-id>` again.
 
 
@@ -51,5 +51,5 @@ ACTION         Run `hooklistener static-tunnel create <slug>` to reserve one.
 ANON EVENTS
 [INFO] NO EVENTS CAPTURED
 
-ACTION         Send a webhook, then run `hooklistener anon events <endpoint-id>
-               --token <token>`.
+ACTION         Send a webhook, then run `hooklistener anon list-events
+               <endpoint-id> --token <token>`.

@@ -460,7 +460,8 @@ enum EndpointAction {
         org: Option<String>,
     },
     /// List captured requests for an endpoint
-    Requests {
+    #[command(name = "list-requests", visible_alias = "requests")]
+    ListRequests {
         /// Debug endpoint ID
         endpoint_id: String,
         /// Page number
@@ -473,8 +474,9 @@ enum EndpointAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// Show a single captured request
-    Request {
+    /// Show a captured request
+    #[command(name = "show-request", visible_alias = "request")]
+    ShowRequest {
         /// Debug endpoint ID
         endpoint_id: String,
         /// Debug request ID
@@ -511,8 +513,9 @@ enum EndpointAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// List forwards created from a captured request
-    Forwards {
+    /// List forwards of a captured request
+    #[command(name = "list-forwards", visible_alias = "forwards")]
+    ListForwards {
         /// Debug endpoint ID
         endpoint_id: String,
         /// Debug request ID
@@ -527,8 +530,9 @@ enum EndpointAction {
         #[arg(long)]
         org: Option<String>,
     },
-    /// Show a single forward attempt by ID
-    Forward {
+    /// Show a forward by ID
+    #[command(name = "show-forward", visible_alias = "forward")]
+    ShowForward {
         /// Forward ID
         forward_id: String,
         /// Organization ID override (falls back to configured default)
@@ -616,7 +620,8 @@ enum AnonAction {
         id: String,
     },
     /// List captured events for an anonymous endpoint
-    Events {
+    #[command(name = "list-events", visible_alias = "events")]
+    ListEvents {
         /// Anonymous endpoint ID
         endpoint_id: String,
         /// Viewer token (returned when the endpoint was created)
@@ -629,8 +634,9 @@ enum AnonAction {
         #[arg(long, default_value = "50")]
         page_size: u32,
     },
-    /// Show a single captured event
-    Event {
+    /// Show a captured event
+    #[command(name = "show-event", visible_alias = "event")]
+    ShowEvent {
         /// Anonymous endpoint ID
         endpoint_id: String,
         /// Event ID
@@ -1050,7 +1056,7 @@ fn forward_poll_path(forward_id: &str) -> String {
 }
 
 fn forward_poll_command(forward_id: &str) -> String {
-    format!("hooklistener endpoint forward {forward_id}")
+    format!("hooklistener endpoint show-forward {forward_id}")
 }
 
 fn emitted_at() -> String {
@@ -1230,7 +1236,7 @@ fn listen_started_receipt(
         endpoint_receipt_parts(endpoint_slug, endpoint);
     let session_resource_uri = listen_session_resource_uri(endpoint_slug);
     let inspect_command = endpoint
-        .map(|endpoint| format!("hooklistener endpoint requests {}", endpoint.id))
+        .map(|endpoint| format!("hooklistener endpoint list-requests {}", endpoint.id))
         .unwrap_or_else(|| "hooklistener endpoint list --json".to_string());
 
     serde_json::json!({
@@ -1298,7 +1304,7 @@ fn listen_event_receipt(
                 "resource_uri": request_resource_uri
             });
             receipt["next_actions"] = serde_json::json!([format!(
-                "hooklistener endpoint request <endpoint-id> {}",
+                "hooklistener endpoint show-request <endpoint-id> {}",
                 request.id
             )]);
             receipt
@@ -1659,7 +1665,8 @@ fn forward_request_receipt(
     let request_forwards_resource_uri = request_forwards_resource_uri(request_id);
     let poll_url = forward_poll_path(&response.forward_id);
     let poll_command = forward_poll_command(&response.forward_id);
-    let forwards_command = format!("hooklistener endpoint forwards {endpoint_id} {request_id}");
+    let forwards_command =
+        format!("hooklistener endpoint list-forwards {endpoint_id} {request_id}");
 
     serde_json::json!({
         "status": &response.status,
@@ -2575,7 +2582,7 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            EndpointAction::Requests {
+            EndpointAction::ListRequests {
                 endpoint_id,
                 page,
                 page_size,
@@ -2600,7 +2607,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_endpoint_requests(&requests);
                 }
             }
-            EndpointAction::Request {
+            EndpointAction::ShowRequest {
                 endpoint_id,
                 request_id,
                 org,
@@ -2683,7 +2690,7 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
             }
-            EndpointAction::Forwards {
+            EndpointAction::ListForwards {
                 endpoint_id,
                 request_id,
                 page,
@@ -2711,7 +2718,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_endpoint_request_forwards(&forwards);
                 }
             }
-            EndpointAction::Forward { forward_id, org } => {
+            EndpointAction::ShowForward { forward_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
@@ -2894,7 +2901,7 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            AnonAction::Events {
+            AnonAction::ListEvents {
                 endpoint_id,
                 token,
                 page,
@@ -2914,7 +2921,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_anon_events(&response);
                 }
             }
-            AnonAction::Event {
+            AnonAction::ShowEvent {
                 endpoint_id,
                 event_id,
                 token,
@@ -4838,7 +4845,7 @@ fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
     if response.data.is_empty() {
         print_empty_state(
             "NO REQUESTS FOUND",
-            "Send a webhook, then run `hooklistener endpoint requests <endpoint-id>` again.",
+            "Send a webhook, then run `hooklistener endpoint list-requests <endpoint-id>` again.",
         );
         return;
     }
@@ -5186,7 +5193,7 @@ fn print_anon_events(response: &api::AnonEventsResponse) {
     if response.data.is_empty() {
         print_empty_state(
             "NO EVENTS CAPTURED",
-            "Send a webhook, then run `hooklistener anon events <endpoint-id> --token <token>`.",
+            "Send a webhook, then run `hooklistener anon list-events <endpoint-id> --token <token>`.",
         );
     } else {
         let mut table = new_table(&["ID", "Method", "Received At"]);
@@ -6963,6 +6970,192 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_requests_is_alias_of_list_requests() {
+        for spelling in ["requests", "list-requests"] {
+            let cli = Cli::try_parse_from(["hooklistener", "endpoint", spelling, "ep_1"])
+                .unwrap_or_else(|err| panic!("endpoint {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Endpoint {
+                        action: EndpointAction::ListRequests {
+                            ref endpoint_id,
+                            page: 1,
+                            page_size: 50,
+                            org: None,
+                        },
+                    }) if endpoint_id == "ep_1"
+                ),
+                "endpoint {spelling} must yield ListRequests"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_request_is_alias_of_show_request() {
+        for spelling in ["request", "show-request"] {
+            let cli = Cli::try_parse_from(["hooklistener", "endpoint", spelling, "ep_1", "req_1"])
+                .unwrap_or_else(|err| panic!("endpoint {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Endpoint {
+                        action: EndpointAction::ShowRequest {
+                            ref endpoint_id,
+                            ref request_id,
+                            org: None,
+                        },
+                    }) if endpoint_id == "ep_1" && request_id == "req_1"
+                ),
+                "endpoint {spelling} must yield ShowRequest"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_forwards_is_alias_of_list_forwards() {
+        for spelling in ["forwards", "list-forwards"] {
+            let cli = Cli::try_parse_from([
+                "hooklistener",
+                "endpoint",
+                spelling,
+                "ep_1",
+                "req_1",
+                "--page",
+                "2",
+            ])
+            .unwrap_or_else(|err| panic!("endpoint {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Endpoint {
+                        action: EndpointAction::ListForwards {
+                            ref endpoint_id,
+                            ref request_id,
+                            page: 2,
+                            page_size: 50,
+                            org: None,
+                        },
+                    }) if endpoint_id == "ep_1" && request_id == "req_1"
+                ),
+                "endpoint {spelling} must yield ListForwards"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_forward_is_alias_of_show_forward() {
+        for spelling in ["forward", "show-forward"] {
+            let cli = Cli::try_parse_from(["hooklistener", "endpoint", spelling, "fwd_1"])
+                .unwrap_or_else(|err| panic!("endpoint {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Endpoint {
+                        action: EndpointAction::ShowForward {
+                            ref forward_id,
+                            org: None,
+                        },
+                    }) if forward_id == "fwd_1"
+                ),
+                "endpoint {spelling} must yield ShowForward"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_forward_aliases_do_not_capture_forward_request_or_delete_request() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "forward-request",
+            "ep_1",
+            "req_1",
+            "http://localhost:3000/hook",
+        ])
+        .expect("endpoint forward-request parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Endpoint {
+                action: EndpointAction::ForwardRequest { .. },
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "delete-request",
+            "ep_1",
+            "req_1",
+        ])
+        .expect("endpoint delete-request parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Endpoint {
+                action: EndpointAction::DeleteRequest { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn anon_events_is_alias_of_list_events() {
+        for spelling in ["events", "list-events"] {
+            let cli = Cli::try_parse_from([
+                "hooklistener",
+                "anon",
+                spelling,
+                "ep_1",
+                "--token",
+                "viewer_token",
+            ])
+            .unwrap_or_else(|err| panic!("anon {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Anon {
+                        action: AnonAction::ListEvents {
+                            ref endpoint_id,
+                            ref token,
+                            page: 1,
+                            page_size: 50,
+                        },
+                    }) if endpoint_id == "ep_1" && token == "viewer_token"
+                ),
+                "anon {spelling} must yield ListEvents"
+            );
+        }
+    }
+
+    #[test]
+    fn anon_event_is_alias_of_show_event() {
+        for spelling in ["event", "show-event"] {
+            let cli = Cli::try_parse_from([
+                "hooklistener",
+                "anon",
+                spelling,
+                "ep_1",
+                "evt_1",
+                "--token",
+                "viewer_token",
+            ])
+            .unwrap_or_else(|err| panic!("anon {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Anon {
+                        action: AnonAction::ShowEvent {
+                            ref endpoint_id,
+                            ref event_id,
+                            ref token,
+                        },
+                    }) if endpoint_id == "ep_1" && event_id == "evt_1" && token == "viewer_token"
+                ),
+                "anon {spelling} must yield ShowEvent"
+            );
+        }
+    }
+
+    #[test]
     fn tunnel_activate_is_alias_of_start() {
         let cli = Cli::try_parse_from(["hooklistener", "tunnel", "activate", "--port", "5000"])
             .expect("tunnel activate parses");
@@ -7621,7 +7814,7 @@ mod tests {
                 "request list",
                 render_empty_status(
                     "NO REQUESTS FOUND",
-                    "Send a webhook, then run `hooklistener endpoint requests <endpoint-id>` again.",
+                    "Send a webhook, then run `hooklistener endpoint list-requests <endpoint-id>` again.",
                 ),
             ),
             (
@@ -7663,7 +7856,7 @@ mod tests {
                 "anon events",
                 render_empty_status(
                     "NO EVENTS CAPTURED",
-                    "Send a webhook, then run `hooklistener anon events <endpoint-id> --token <token>`.",
+                    "Send a webhook, then run `hooklistener anon list-events <endpoint-id> --token <token>`.",
                 ),
             ),
         ]);
@@ -7760,7 +7953,7 @@ mod tests {
         );
         assert_eq!(
             receipt["next_actions"][0],
-            "hooklistener endpoint forward fwd_123"
+            "hooklistener endpoint show-forward fwd_123"
         );
     }
 
