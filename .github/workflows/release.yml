@@ -251,6 +251,11 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # rust-cache keys on runner.os, not the image. Without this, a build
+          # cached on ubuntu-latest (glibc 2.39) is restored by the ubuntu-22.04
+          # release build and fails to link (__isoc23_* symbols).
+          key: ${{ matrix.os }}
 
       - name: Build (cargo)
         run: cargo build --release --target ${{ matrix.target }} --locked
