@@ -1,0 +1,29 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"anon\"])"
+---
+Create temporary endpoints and tunnels (no login required)
+
+Usage: hooklistener anon [OPTIONS] <COMMAND>
+
+Commands:
+  create       Create a temporary anonymous endpoint
+  show         Show an anonymous endpoint
+  list-events  List captured events for an anonymous endpoint [aliases: events]
+  show-event   Show a captured event [aliases: event]
+  tunnel       Expose a local HTTP server without signing in
+  claim        Claim an anonymous route into an organization
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout

@@ -1,0 +1,60 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[])"
+---
+Inspect webhooks, replay failures, and expose localhost from your terminal
+
+Usage: hooklistener [OPTIONS] [COMMAND]
+
+Commands:
+  listen         Forward events from a debug endpoint to a local URL
+  tunnel         Expose a local HTTP server on a public Hooklistener URL
+  endpoint       Manage debug endpoints and their captured requests
+  static-tunnel  Reserve and manage static tunnel slugs
+  anon           Create temporary endpoints and tunnels (no login required)
+  cases          Run saved replay cases against a target
+  share          Create, inspect, and revoke public links to captured requests
+  monitor        Create and inspect uptime monitors
+  login          Sign in with the device flow
+  logout         Sign out and delete the stored token
+  org            List organizations and set the default one
+  config         Show and set CLI configuration
+  diagnostics    Write a diagnostic bundle for support
+  clean-logs     Delete old log files
+  completions    Print a shell completion script
+  update         Update hooklistener to the latest release
+  help           Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout
+
+COMMAND GROUPS:
+  Capture and delivery: listen, tunnel, endpoint, static-tunnel, anon
+  Review and automation: cases, share, monitor
+  Account and settings: login, logout, org, config
+  Maintenance: diagnostics, clean-logs, completions, update
+
+COMMON WORKFLOWS:
+  Sign in:
+    hooklistener login
+
+  Forward an existing debug endpoint:
+    hooklistener listen <endpoint-slug> --target http://localhost:3000
+
+  Expose a local HTTP server:
+    hooklistener tunnel --port 3000
+
+  Create and inspect hosted captures:
+    hooklistener endpoint create <name>
+    hooklistener endpoint list-requests <endpoint-id>

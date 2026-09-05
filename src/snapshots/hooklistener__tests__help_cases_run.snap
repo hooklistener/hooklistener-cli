@@ -1,0 +1,29 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"cases\", \"run\"])"
+---
+Run saved cases for an endpoint
+
+Usage: hooklistener cases run [OPTIONS] <ENDPOINT_ID>
+
+Arguments:
+  <ENDPOINT_ID>  Debug endpoint ID
+
+Options:
+      --target <TARGET>      Target: a URL, a saved target ID, or cli for the running listen session
+      --target-name <NAME>   Display name recorded for the target
+      --wait                 Wait for the run to complete before returning
+      --timeout <DURATION>   Timeout for --wait, such as 60, 2m, or 1h
+      --interval <DURATION>  Poll interval for --wait, such as 500ms, 2s, or 10s
+  -o, --org <ORG_ID>         Organization ID (overrides the configured default)
+  -h, --help                 Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout

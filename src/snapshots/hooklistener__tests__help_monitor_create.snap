@@ -1,0 +1,34 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"monitor\", \"create\"])"
+---
+Create an uptime monitor
+
+Usage: hooklistener monitor create [OPTIONS] <NAME> <URL>
+
+Arguments:
+  <NAME>  Monitor display name
+  <URL>   URL to check (http:// or https://)
+
+Options:
+      --method <METHOD>         HTTP method [default: GET] [possible values: GET, POST, PUT, PATCH,
+                                DELETE, HEAD]
+      --expected-status <CODE>  Expected HTTP status code [default: 200]
+      --interval <INTERVAL>     Check interval [default: 5m] [possible values: 1m, 5m, 10m, 30m,
+                                60m]
+      --body-contains <TEXT>    Text the response body must contain
+      --body <BODY>             Request body to send with POST, PUT, or PATCH
+      --failure-threshold <N>   Consecutive failures before alerting [default: 2]
+      --no-email                Disable email notifications for this monitor
+  -o, --org <ORG_ID>            Organization ID (overrides the configured default)
+  -h, --help                    Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout

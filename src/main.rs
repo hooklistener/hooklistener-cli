@@ -7219,6 +7219,79 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    fn render_help_snapshot(path: &[&str]) -> String {
+        let mut cli = Cli::command()
+            .term_width(100)
+            .color(clap::ColorChoice::Never);
+        cli.build();
+        let mut command = &mut cli;
+        for name in path {
+            command = command
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("subcommand `{name}` exists"));
+        }
+        let help = command.render_help().to_string();
+        assert_no_emoji(&help);
+        help
+    }
+
+    #[test]
+    fn help_snapshot_top_level() {
+        insta::assert_snapshot!("help_top_level", render_help_snapshot(&[]));
+    }
+
+    #[test]
+    fn help_snapshot_endpoint() {
+        insta::assert_snapshot!("help_endpoint", render_help_snapshot(&["endpoint"]));
+    }
+
+    #[test]
+    fn help_snapshot_endpoint_list() {
+        insta::assert_snapshot!(
+            "help_endpoint_list",
+            render_help_snapshot(&["endpoint", "list"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_tunnel() {
+        insta::assert_snapshot!("help_tunnel", render_help_snapshot(&["tunnel"]));
+    }
+
+    #[test]
+    fn help_snapshot_tunnel_events() {
+        insta::assert_snapshot!(
+            "help_tunnel_events",
+            render_help_snapshot(&["tunnel", "events"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_anon() {
+        insta::assert_snapshot!("help_anon", render_help_snapshot(&["anon"]));
+    }
+
+    #[test]
+    fn help_snapshot_monitor_create() {
+        insta::assert_snapshot!(
+            "help_monitor_create",
+            render_help_snapshot(&["monitor", "create"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_cases_run() {
+        insta::assert_snapshot!("help_cases_run", render_help_snapshot(&["cases", "run"]));
+    }
+
+    #[test]
+    fn help_snapshot_share_create() {
+        insta::assert_snapshot!(
+            "help_share_create",
+            render_help_snapshot(&["share", "create"])
+        );
+    }
+
     #[test]
     fn org_flag_accepts_short_o_on_every_command() {
         let cli = Cli::try_parse_from(["hooklistener", "endpoint", "list", "-o", "org_1"])

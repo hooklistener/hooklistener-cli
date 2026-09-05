@@ -1,0 +1,28 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"tunnel\", \"events\"])"
+---
+List lifecycle events, optionally following new ones
+
+Usage: hooklistener tunnel events [OPTIONS]
+
+Options:
+      --cursor <CURSOR>          Resume after this cursor from an earlier events receipt
+      --limit <N>                Maximum number of events per page [default: 50]
+      --capture-id <CAPTURE_ID>  Only events for this capture
+      --attempt-id <ATTEMPT_ID>  Only events for this delivery attempt
+      --follow                   Keep polling for new events until interrupted
+      --interval <DURATION>      Poll interval while following, such as 500ms, 2s, or 1m [default:
+                                 1s]
+  -o, --org <ORG_ID>             Organization ID (overrides the configured default)
+  -h, --help                     Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout

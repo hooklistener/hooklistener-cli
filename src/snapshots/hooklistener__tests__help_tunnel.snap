@@ -1,0 +1,42 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"tunnel\"])"
+---
+Expose a local HTTP server on a public Hooklistener URL
+
+Usage: hooklistener tunnel [OPTIONS] [COMMAND]
+
+Commands:
+  prepare  Validate authentication, schema compatibility, and the activation plan without connecting
+  start    Prepare and activate a relay (the default when no subcommand is given)
+  list     List tunnel sessions
+  status   Show a tunnel session
+  events   List lifecycle events, optionally following new ones
+  capture  Show a redacted capture
+  attempt  Show a delivery attempt
+  stop     Stop a tunnel session, even if its CLI process is gone
+  detach   Detach the current owner and keep the route for recovery
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -p, --port <PORT>         Local port to forward requests to [default: 3000]
+      --host <HOST>         Local host to forward to [default: localhost]
+  -o, --org <ORG_ID>        Organization ID (overrides the configured default)
+  -s, --slug <SLUG>         Static tunnel slug to attach (from `static-tunnel create`)
+      --allow-non-loopback  Allow a host that resolves outside loopback
+      --no-replay-buffered  Do not replay requests buffered while the tunnel was offline
+  -h, --help                Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout
+
+TARGET FLAGS:
+  Flags given before a subcommand set defaults; the same flag on the subcommand overrides them.
+  hooklistener tunnel --port 3000          same as: hooklistener tunnel start --port 3000
