@@ -7272,6 +7272,11 @@ mod tests {
     }
 
     #[test]
+    fn help_snapshot_monitor() {
+        insta::assert_snapshot!("help_monitor", render_help_snapshot(&["monitor"]));
+    }
+
+    #[test]
     fn help_snapshot_monitor_create() {
         insta::assert_snapshot!(
             "help_monitor_create",
