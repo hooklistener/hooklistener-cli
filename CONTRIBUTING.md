@@ -63,6 +63,11 @@ Please note that this project is released with a [Code of Conduct](CODE_OF_CONDU
 - Ensure all tests pass before submitting PR
 - Aim for good test coverage
 
+Saved-case changes also have a release-profile inventory gate on Linux, macOS,
+and Windows. Run `mise exec -- make check-cases` and update the inventory when
+adding or renaming tests. See [Saved-case conformance](docs/cases-conformance.md)
+for the CI contract and per-platform evidence.
+
 ### Build size and compilation time
 
 See [Build footprint](docs/build-footprint.md) for the dependency/release-profile

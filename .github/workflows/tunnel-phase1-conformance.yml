@@ -76,6 +76,8 @@ jobs:
               exit 1
             fi
           fi
+      - name: Test saved-case conformance gate
+        run: python3 scripts/verify_cases_release_tests_test.py
       - uses: dtolnay/rust-toolchain@387aeee55b189f024a4f6d94890c5b18d73339cc # 1.92.0
         with:
           components: clippy,rustfmt
@@ -84,17 +86,26 @@ jobs:
         run: python3 scripts/verify_tunnel_v3_release_tests.py
       - name: Build release binary
         run: cargo build --release --locked
-      - name: Run release-profile authenticated human and JSON flows
+      # Uses authenticated local mock APIs; never sends traffic to the deployed service.
+      - name: Run release-profile lifecycle and saved-case contracts
         env:
           HOOKLISTENER_CONFORMANCE_BINARY: ${{ github.workspace }}/${{ matrix.binary }}
           HOOKLISTENER_CLI_GIT_SHA: ${{ inputs.source_sha || github.sha }}
           HOOKLISTENER_CONFORMANCE_OUTPUT: ${{ runner.temp }}/phase1-${{ matrix.platform }}.json
           HOOKLISTENER_CONFORMANCE_PLATFORM: ${{ matrix.platform }}
-        run: cargo test --release --locked --test tunnel_phase1_conformance -- --nocapture
+          HOOKLISTENER_CASES_CONFORMANCE_OUTPUT: ${{ runner.temp }}/cases-${{ matrix.platform }}.json
+        run: python3 scripts/verify_cases_release_tests.py
       - name: Upload platform receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: phase1-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/phase1-${{ matrix.platform }}.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload saved-case contract receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cases-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cases-${{ matrix.platform }}.json
           if-no-files-found: error
           retention-days: 30

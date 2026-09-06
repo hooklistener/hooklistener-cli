@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod auth;
+mod cases;
 mod config;
 mod errors;
 mod logger;
@@ -43,6 +44,7 @@ use tracing::{error, warn};
 
 use api::ApiClient;
 use app::{App, AppState, FeedbackKind};
+use cases::CasesAction;
 use logger::{LogConfig, Logger};
 use output::{ColorMode, Stylize};
 use tunnel::TunnelEvent;
@@ -468,42 +470,6 @@ enum EndpointAction {
 }
 
 #[derive(Subcommand)]
-enum CasesAction {
-    /// Run saved cases for an endpoint
-    Run {
-        /// Debug endpoint ID
-        endpoint_id: String,
-        /// Target URL, saved target ID, or "cli"
-        #[arg(long, conflicts_with_all = ["target_url", "target_id"])]
-        target: Option<String>,
-        /// Explicit target URL to replay cases to
-        #[arg(long, conflicts_with_all = ["target", "target_id"])]
-        target_url: Option<String>,
-        /// Explicit saved replay target ID
-        #[arg(long, conflicts_with_all = ["target", "target_url"])]
-        target_id: Option<String>,
-        /// Optional display name for the target
-        #[arg(long)]
-        target_name: Option<String>,
-        /// Wait for the run to complete before returning
-        #[arg(long)]
-        wait: bool,
-        /// Timeout for --wait, such as 60, 60s, 2m, or 1h
-        #[arg(long, conflicts_with = "timeout_ms")]
-        timeout: Option<String>,
-        /// Timeout for --wait in milliseconds
-        #[arg(long, conflicts_with = "timeout")]
-        timeout_ms: Option<u64>,
-        /// Poll interval for --wait in milliseconds
-        #[arg(long)]
-        interval_ms: Option<u64>,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
-        org: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
 enum StaticTunnelAction {
     /// List reserved static tunnel slugs
     List {
@@ -850,6 +816,7 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
     }
 
     let mut params = api::CaseRunParams {
+        case_suite_id: None,
         target_url: None,
         target_id: None,
         target: None,
@@ -882,7 +849,15 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
 }
 
 fn case_run_failed(result: &api::CaseRunResult) -> bool {
-    matches!(result.result_status.as_str(), "failed" | "timeout")
+    !matches!(
+        result.result_status.as_str(),
+        "pending" | "completed" | "passed"
+    ) || result.timed_out == Some(true)
+        || result.failed_count > 0
+        || result.queue_failed_count > 0
+        || result.delivery_failed_count > 0
+        || result.assertion_failed_count > 0
+        || result.assertion_error_count > 0
 }
 
 fn case_run_target_label(target: &api::CaseRunTarget) -> String {
@@ -2664,47 +2639,11 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Commands::Cases { action } => match action {
-            CasesAction::Run {
-                endpoint_id,
-                target,
-                target_url,
-                target_id,
-                target_name,
-                wait,
-                timeout,
-                timeout_ms,
-                interval_ms,
-                org,
-            } => {
-                let mut config = config::Config::load()?;
-                let organization_id = require_organization(org, &config)?;
-                let token = ensure_valid_token(&mut config).await?;
-                let params = build_case_run_params(CaseRunInput {
-                    target,
-                    target_url,
-                    target_id,
-                    target_name,
-                    wait,
-                    timeout,
-                    timeout_ms,
-                    interval_ms,
-                })?;
-                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let result = client.run_endpoint_cases(&endpoint_id, &params).await?;
-
-                if json {
-                    print_json(&result)?;
-                } else {
-                    print_context("Organization:", &organization_id);
-                    print_case_run_result(&result);
-                }
-
-                if case_run_failed(&result) {
-                    std::process::exit(1);
-                }
+        Commands::Cases { action } => {
+            if cases::execute(action, json).await? {
+                std::process::exit(1);
             }
-        },
+        }
         Commands::StaticTunnel { action } => match action {
             StaticTunnelAction::List { org } => {
                 let mut config = config::Config::load()?;
@@ -4943,6 +4882,8 @@ fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
 fn print_case_run_result(result: &api::CaseRunResult) {
     let status = if case_run_failed(result) {
         OutputStatus::Err
+    } else if result.not_configured_count > 0 {
+        OutputStatus::Warn
     } else if matches!(result.result_status.as_str(), "pending" | "completed") {
         OutputStatus::Info
     } else {
@@ -4956,6 +4897,9 @@ fn print_case_run_result(result: &api::CaseRunResult) {
             "RUN ID",
             sanitize_terminal(run_id, TerminalTextLayout::Inline),
         );
+    }
+    if let Some(suite_id) = result.case_suite_id.as_deref() {
+        print_field("SUITE ID", sanitize_terminal_display(suite_id));
     }
     if let Some(report_url) = result.case_suite_run_url.as_deref() {
         print_field(
@@ -5007,9 +4951,14 @@ fn print_case_run_result(result: &api::CaseRunResult) {
         print_field(
             "RESULTS",
             format!(
-                "completed={} waiting={} passed={} assertions_failed={} assertions_error={} not_configured={}",
-                result.completed_count,
-                result.waiting_count,
+                "completed={} waiting={}",
+                result.completed_count, result.waiting_count
+            ),
+        );
+        print_field(
+            "ASSERTIONS",
+            format!(
+                "passed={} failed={} error={} unconfigured={}",
                 result.passed_count,
                 result.assertion_failed_count,
                 result.assertion_error_count,
