@@ -154,13 +154,113 @@ hooklistener endpoint forward-request \
   <endpoint-id> <request-id> http://localhost:3000/webhooks
 ```
 
-Run every saved case for an endpoint and wait for the result:
+Save a captured request with response assertions, then run it against an active local listener:
 
 ```bash
-hooklistener cases run <endpoint-id> \
-  --target http://localhost:3000/webhooks \
-  --wait --timeout 60s
+# Keep this running in another terminal; use the endpoint's slug here.
+hooklistener listen <endpoint-slug> --target http://localhost:3000/webhooks
+
+hooklistener cases save <endpoint-id> <request-id> \
+  --name "Payment accepted" --expect-status 200 --expect-json '{"accepted":true}'
+hooklistener cases run <endpoint-id> --target cli --wait --timeout 60s
 ```
+
+`--target cli` delivers through active CLI listeners for that endpoint. A URL passed
+with `--target` or `--target-url` is delivered **by the service**, not by this CLI
+process. Use `--target cli` for localhost. Multiple active listeners may receive
+replays; stop other listeners if you need a single local delivery.
+
+### Manage saved cases and inspect results
+
+```bash
+hooklistener cases list <endpoint-id>
+hooklistener cases show <case-id> --json
+hooklistener cases update <case-id> --expect-status 202
+hooklistener cases replay <case-id> --target cli --method POST --body '{"test":true}'
+
+hooklistener cases suites list <endpoint-id>
+hooklistener cases suites show <suite-id>
+hooklistener cases run <endpoint-id> --suite <suite-id> --target cli --wait
+
+hooklistener cases runs list <endpoint-id> --suite <suite-id> --page 1 --page-size 20
+hooklistener cases runs show <run-id> --json
+hooklistener cases runs wait <run-id> --timeout 60s --json
+```
+
+Save and update accept `--name`, `--notes`, `--default-target-url`, `--method`,
+`--headers` (a JSON object of string values), `--body`, `--expect-status`, and
+`--expect-json` (a nonempty JSON object). Updates preserve omitted fields and
+merge supplied assertions with the current configuration; `--clear-assertions`
+explicitly removes all assertions. Assertion updates use read-then-write, not an
+atomic server merge: avoid simultaneous edits to the same case.
+
+Replay requires an explicit target. Its `--method`, `--headers`, and `--body`
+options affect only that delivery, not the saved case. `--body ''` sends an empty
+body, and whitespace-only overrides are preserved exactly. Omitting `--body`
+inherits the saved/default request body. Replay returns a forward ID; inspect it with `hooklistener endpoint forward <forward-id>`. Named suite
+creation and membership management remain available through the service/MCP.
+All case commands support `--json` and an `--org` override on the leaf command.
+Case metadata can contain sensitive request overrides; review it before sharing
+output, and avoid putting real secrets in shell arguments or history.
+
+### Preview and wait safely
+
+```bash
+hooklistener cases run <endpoint-id> --target cli --dry-run --json
+hooklistener cases replay <case-id> --target cli --dry-run --json
+```
+
+These call dedicated **server preview** routes. The server resolves case/suite
+scope and saved targets, applies public-URL policy, and reports the current CLI
+listener count. Previews create no run, forward, job, or idempotency receipt.
+JSON uses `status: "preview"` and `$schema: "hooklistener.cases.preview/1"`.
+A preview is a snapshot, not a reservation or delivery test: DNS, listener
+availability, saved configuration, and delivery outcomes can change afterward.
+
+Run and replay use server-enforced idempotency. Supply a stable key when an agent
+or job may need to recover a submission:
+
+```bash
+hooklistener cases run <endpoint-id> --target cli --idempotency-key build-482-smoke --wait --json
+hooklistener cases replay <case-id> --target cli --idempotency-key incident-732-replay --json
+```
+
+Without `--idempotency-key`, the CLI generates a UUID. It prints the key to
+**stderr before submission**, including in JSON mode, and includes the receipt's
+`idempotency` metadata in successful/failed-run output. Stdout remains one JSON
+document. Keys must be 8–200 printable ASCII bytes without spaces; do not use
+secrets as keys. Preview mode does not accept a key.
+
+The CLI never automatically retries delivery POSTs. If a response is lost,
+repeat the command with the **same key, organization, resource, and delivery
+inputs** to recover its original receipt without queueing it again. Wait options
+are client-side and may change. Different delivery inputs with an existing key
+return HTTP 409; use a new key only for an intentional new delivery. Keys are
+scoped by organization and operation, separately from MCP and legacy HTTP calls.
+Idempotency protects submission, not exactly-once delivery or worker retries.
+Even an all-queue-failed suite run retains its receipt; repeating that key returns
+the failed run, not a new attempt. Inspect current outcomes with `cases runs show`
+or `cases runs wait`, since a recovered submission receipt is not live run state.
+
+These commands require backend **case actions v1** (`.../run/preview`,
+`.../run/execute`, `.../replay/preview`, `.../replay/execute`). Deploy the backend
+first. An older server fails closed: the CLI never falls back to legacy delivery
+routes or a weaker client preview. Released CLIs can still use the legacy routes.
+
+`cases run --wait` queues once, then polls the run ID. `cases runs wait` only
+observes an existing run. Waits default to 30 seconds, accept up to 1 hour, and
+support `--interval-ms` from 100 to 30000 (default 250). The wait budget starts
+after the submission receipt; the submission has its own HTTP timeout. A zero
+wait performs no further polling (waiting on an existing ID still performs one
+bounded GET). Timeout or interruption stops observation, **not delivery**; resume
+with `cases runs wait <run-id>` rather than starting another run.
+
+Run output keeps delivery and assertion outcomes separate. `pending` means
+accepted, not passed; `completed` may have no assertions; `not_configured_count`
+counts unasserted deliveries. Failed assertions, execution failures, unknown
+result statuses, and wait timeouts exit with status 1. Completed unasserted runs
+exit 0 but are not labeled as passing tests. Run JSON is emitted even for failed
+results; command/transport errors use the standard CLI error envelope.
 
 Use `hooklistener <command> --help` for every option and subcommand.
 

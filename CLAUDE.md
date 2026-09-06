@@ -22,7 +22,8 @@ visual direction.
 ## Build and Development Commands
 
 ```bash
-make check                  # tests + fmt --check + clippy -D warnings (what CI runs)
+make check                  # workflow/gate tests + Rust tests, fmt, clippy
+make check-cases            # release-profile saved-case + lifecycle conformance
 cargo build                 # debug build
 cargo build --release
 cargo run -- <args>         # e.g. cargo run -- listen
@@ -72,6 +73,11 @@ Single binary crate; all modules are declared in `src/main.rs`.
 - `fixtures/tunnel_v3_release_test_inventory.txt` lists tunnel v3 tests that
   must exist. `scripts/verify_tunnel_v3_release_tests.py` checks it; update
   the inventory when adding or renaming those tests.
+- Saved-case subprocess tests are in `tests/support/cases.rs`, included by the
+  same integration target. `fixtures/cases_release_test_inventory.txt` locks
+  their release-profile inventory; missing or ignored tests fail CI on all
+  three platforms. Update it with test changes and run `make check-cases`.
+  See `docs/cases-conformance.md` for receipt generation and local checks.
 
 ## Conventions
 
