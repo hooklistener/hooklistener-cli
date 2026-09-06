@@ -125,20 +125,30 @@ Prepare each version in a normal pull request. `Cargo.toml`, the root
 The repository's `release.toml` can prepare the local Cargo version commit, but
 it intentionally cannot tag, push, or publish.
 
+The owner-approved setup uses **repository-level Actions secrets** for
+publishing and supports solo-maintainer releases. The second-person approval
+requirements were removed in [PR #41](https://github.com/hooklistener/hooklistener-cli/pull/41);
+repository-scoped publishing credentials are intentional, not a temporary
+release exception.
+
 Before merging the version pull request or creating its tag, repository
 administrators must verify these controls:
 
-- Protect the `release` environment with required reviewers and restrict it to
-  one custom deployment pattern, `v*.*.*`. Prevent self-approval and disable
-  administrator bypass of environment protection rules. The workflow separately
-  enforces exact semantic versions.
-- Store `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, and `HOMEBREW_TAP_TOKEN` only as
-  `release` environment secrets; delete the repository-scoped copies after
-  rotating them. Rotate them periodically and immediately after suspected
-  exposure.
+- Keep the `release` environment restricted to one custom deployment pattern,
+  `v*.*.*`, of type **tag**. The workflow separately enforces exact semantic
+  versions. A second-person environment approval is not required by the
+  solo-maintainer policy; any additional protections actually configured must
+  still be satisfied, not bypassed.
+- Keep `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, and `HOMEBREW_TAP_TOKEN` as
+  repository-level Actions secrets. Jobs using the `release` environment inherit
+  them; environment-scoped copies are not required. Avoid same-name environment
+  secrets that would unexpectedly override the repository values. Use
+  least-privilege tokens and rotate them periodically and immediately after
+  suspected exposure.
 - Apply effective `main` rules—not merely an active ruleset with no matching
-  ref—that prevent deletion and force pushes, require at least one pull-request
-  approval, require branches to be current, and require all of these checks:
+  ref—that prevent deletion and force pushes, require a normal pull request
+  (zero required approvals is permitted), require branches to be current, and
+  require all of these checks:
   `Rustfmt`, `Clippy`, `Tests (stable)`, `Cargo Audit`, `Analyze`, the four
   `Build (...)` targets, and
   `Authenticated lifecycle (linux|macos|windows)`. Pin every context to the
@@ -150,7 +160,14 @@ administrators must verify these controls:
   also bypass immutability. Leave both rulesets' exclusion lists empty, and
   review all ruleset and environment bypass actors manually.
 
-Inspect the effective state rather than trusting settings-page names:
+Repository-scoped secrets can be referenced by other eligible workflows; the
+`release` environment's deployment restrictions do **not** limit every use of
+those secrets. Review workflow changes carefully and keep publishing credentials
+confined to the release jobs that declare `environment: release` and wait for
+release qualification.
+
+Inspect the effective state rather than trusting settings-page names. The secret
+listing commands below show metadata, not token values:
 
 ```sh
 gh api --paginate --slurp \
@@ -160,16 +177,22 @@ gh api --paginate --slurp \
 gh api repos/hooklistener/hooklistener-cli/environments/release
 gh api --paginate --slurp \
   'repos/hooklistener/hooklistener-cli/environments/release/deployment-branch-policies?per_page=100'
+gh secret list --repo hooklistener/hooklistener-cli
+gh secret list --repo hooklistener/hooklistener-cli --env release
 ```
 
-An empty effective-rules response, a missing `release` environment, empty
-reviewer protection, or a null/unmatched deployment policy blocks release.
-The release workflow checks the readable metadata and effective credential
-presence, but an administrator must verify secret scope and bypass actors.
-The sole `v*.*.*` environment deployment pattern must be of type **tag**; the
-read-only policy-list response does not expose that type. Confirm that CodeQL
-is active rather than `disabled_inactivity` before requiring its `Analyze`
-check.
+An empty effective-rules response, a missing `release` environment, a
+null/unmatched deployment policy, or unavailable effective publishing credentials
+blocks release. An empty environment-secret list or the absence of a
+second-person approval gate alone does **not** block release under this policy.
+
+The release workflow checks readable governance metadata and nonempty effective
+publisher credentials; it does not prove their storage scope or token permissions.
+An administrator must verify that the repository secrets match the approved
+setup and review bypass actors manually. Check that the sole `v*.*.*` deployment
+policy has type **tag** in the API response or environment settings; a branch
+policy with the same name is not equivalent. Confirm that CodeQL is active
+rather than `disabled_inactivity` before requiring its `Analyze` check.
 
 After the version pull request and all required checks pass, create one
 annotated tag at that exact merged commit and push only that tag:
