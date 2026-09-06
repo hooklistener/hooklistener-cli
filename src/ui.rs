@@ -3351,7 +3351,7 @@ mod tests {
     #[test]
     fn tunneling_update_warning_80x24_snapshot() {
         let mut app = app_with_tunnel_rows();
-        app.available_update = Some("1.9.0".to_string());
+        app.available_update = Some("9.9.9".to_string());
 
         let snapshot = render_app_to_text(&app, 80, 24);
 
@@ -3711,7 +3711,7 @@ mod tests {
         app.listening_connected = true;
         app.listening_endpoint = "orders-prod-v7zd".to_string();
         app.listening_target = "http://localhost:8080/webhook".to_string();
-        app.available_update = Some("1.9.0".to_string());
+        app.available_update = Some("9.9.9".to_string());
 
         let snapshot = render_app_to_text(&app, 80, 24);
 
@@ -3721,13 +3721,13 @@ mod tests {
     #[test]
     fn monochrome_update_warning_keeps_warning_text() {
         let mut app = base_tunnel_app();
-        app.available_update = Some("1.9.0".to_string());
+        app.available_update = Some("9.9.9".to_string());
         app.monochrome = true;
 
         let rendered = render_app_to_text(&app, 80, 24);
 
         assert!(rendered.contains(&format!(
-            "[WARN] UPDATE AVAILABLE   {} → 1.9.0   Run `hooklistener update`",
+            "[WARN] UPDATE AVAILABLE   {} → 9.9.9   Run `hooklistener update`",
             env!("CARGO_PKG_VERSION")
         )));
     }
@@ -3735,7 +3735,7 @@ mod tests {
     #[test]
     fn update_warning_preserves_status_bar_when_only_one_footer_row_fits() {
         let mut app = base_tunnel_app();
-        app.available_update = Some("1.9.0".to_string());
+        app.available_update = Some("9.9.9".to_string());
 
         let rendered = render_app_to_text(&app, 80, 3);
 
