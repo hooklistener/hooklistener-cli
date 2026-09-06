@@ -99,3 +99,11 @@ Releases are driven by `.github/workflows/release.yml` and `release.toml`
 (cargo-dist). Packaging for npm and Homebrew lives in `npm/` and
 `homebrew-tap/`. `scripts/release_workflow_contract_test.py` validates the
 workflow contracts and runs in CI.
+
+Publishing credentials (`CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, and
+`HOMEBREW_TAP_TOKEN`) are intentionally repository-level Actions secrets. The
+owner-approved policy permits solo-maintainer releases; an empty `release`
+environment-secret list alone is not a release blocker. Follow the current
+controls in `CONTRIBUTING.md`, including required CI checks, tag-only release
+deployments, and immutable release tags. Do not change credentials or protections
+to reconcile stale documentation.
