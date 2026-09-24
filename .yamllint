@@ -1,0 +1,12 @@
+extends: default
+
+rules:
+  # Keep pinned action SHAs and GitHub expressions readable on one line.
+  line-length:
+    max: 120
+  comments:
+    min-spaces-from-content: 1
+  # GitHub Actions uses the YAML 1.2 `on` mapping key, not a YAML 1.1 boolean.
+  truthy:
+    check-keys: false
+  document-start: disable

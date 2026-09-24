@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 
 import base64
-import copy
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import tempfile
 import textwrap
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GOVERNANCE_SCRIPT = ROOT / ".github/scripts/verify-release-governance.sh"
@@ -23,6 +21,8 @@ CONFORMANCE_WORKFLOW = ROOT / ".github/workflows/tunnel-phase1-conformance.yml"
 HOMEBREW_RENDERER = ROOT / ".github/scripts/render-homebrew-formula.py"
 V3_TEST_INVENTORY = ROOT / "fixtures/tunnel_v3_release_test_inventory.txt"
 V3_TEST_GATE = ROOT / "scripts/verify_tunnel_v3_release_tests.py"
+CASES_TEST_INVENTORY = ROOT / "fixtures/cases_release_test_inventory.txt"
+CASES_TEST_GATE = ROOT / "scripts/verify_cases_release_tests.py"
 NPM_PUBLISH_SCRIPT = ROOT / "npm/scripts/publish-npm.sh"
 NPM_VERIFY_SCRIPT = ROOT / "npm/scripts/verify-package.js"
 
@@ -59,8 +59,7 @@ def job_body(workflow: str, job_name: str) -> str:
 
 def policy_fixture() -> dict:
     checks = [
-        {"context": context, "integration_id": 15368}
-        for context in EXPECTED_CHECKS
+        {"context": context, "integration_id": 15368} for context in EXPECTED_CHECKS
     ]
     return {
         "main_rules": [
@@ -304,9 +303,9 @@ class GovernancePolicyTest(unittest.TestCase):
     def test_tag_ruleset_exclusion_fails_closed(self) -> None:
         for index in (0, 1):
             fixture = policy_fixture()
-            fixture["tag_rulesets"][index]["conditions"]["ref_name"][
-                "exclude"
-            ] = ["refs/tags/v1.*.*"]
+            fixture["tag_rulesets"][index]["conditions"]["ref_name"]["exclude"] = [
+                "refs/tags/v1.*.*"
+            ]
             with self.subTest(ruleset=index):
                 self.assert_policy_fails(fixture)
 
@@ -357,8 +356,7 @@ class MonotonicReleaseOrderTest(unittest.TestCase):
                         "versions": [
                             {
                                 "num": version,
-                                "yanked": version
-                                in (yanked_crates or set()),
+                                "yanked": version in (yanked_crates or set()),
                             }
                             for version in crates_versions
                         ]
@@ -694,13 +692,11 @@ class AnnotatedReleaseTagTest(unittest.TestCase):
         source_sha = "a" * 40
         tag_object_sha = "b" * 40
         annotated = (
-            f"{tag_object_sha}\trefs/tags/v1.8.0\n"
-            f"{source_sha}\trefs/tags/v1.8.0^{{}}\n"
+            f"{tag_object_sha}\trefs/tags/v1.8.0\n{source_sha}\trefs/tags/v1.8.0^{{}}\n"
         )
         lightweight = f"{source_sha}\trefs/tags/v1.8.0\n"
         wrong_peeled = (
-            f"{tag_object_sha}\trefs/tags/v1.8.0\n"
-            f"{'c' * 40}\trefs/tags/v1.8.0^{{}}\n"
+            f"{tag_object_sha}\trefs/tags/v1.8.0\n{'c' * 40}\trefs/tags/v1.8.0^{{}}\n"
         )
 
         self.assertEqual(
@@ -723,7 +719,10 @@ class NpmPublishArtifactTest(unittest.TestCase):
     ) -> None:
         package_json = ROOT / "npm/packages/hooklistener/package.json"
         package_before = package_json.read_bytes()
-        version = json.loads(package_before)["version"]
+        try:
+            version = json.loads(package_before)["version"]
+        except (json.JSONDecodeError, KeyError) as error:
+            self.fail(f"Invalid npm package version fixture: {error}")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -784,8 +783,12 @@ class NpmPublishArtifactTest(unittest.TestCase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertEqual(package_json.read_bytes(), package_before)
+            try:
+                invoked_args = json.loads(invocation.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                self.fail(f"Invalid fake npm invocation evidence: {error}")
             self.assertEqual(
-                json.loads(invocation.read_text(encoding="utf-8")),
+                invoked_args,
                 [
                     "publish",
                     str(tarball),
@@ -843,6 +846,51 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("platform: windows", self.conformance)
         self.assertIn("ref: ${{ inputs.source_sha || github.sha }}", self.conformance)
         self.assertIn("pattern: dist-*", release)
+
+    def test_saved_case_contracts_gate_the_existing_release_matrix(self) -> None:
+        body = job_body(self.conformance, "platform-conformance")
+        command = "python3 scripts/verify_cases_release_tests.py"
+        self.assertIn(command, body)
+        self.assertLess(body.index("Build release binary"), body.index(command))
+        self.assertIn("HOOKLISTENER_CONFORMANCE_BINARY:", body)
+        self.assertIn("HOOKLISTENER_CASES_CONFORMANCE_OUTPUT:", body)
+        self.assertIn("name: Authenticated lifecycle (${{ matrix.platform }})", body)
+        artifact = body.split("- name: Upload saved-case contract receipt", 1)[1]
+        self.assertIn(
+            "name: cases-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            artifact,
+        )
+        self.assertIn(
+            "path: ${{ runner.temp }}/cases-${{ matrix.platform }}.json", artifact
+        )
+        self.assertIn("if-no-files-found: error", artifact)
+        self.assertNotIn("secrets.", body)
+
+    def test_saved_case_gate_self_tests_run_in_ci_and_release_conformance(self) -> None:
+        command = "python3 scripts/verify_cases_release_tests_test.py"
+        self.assertIn(command, job_body(self.ci, "test"))
+        self.assertIn(command, job_body(self.conformance, "platform-conformance"))
+        self.assertIn(command, source(ROOT / "Makefile"))
+
+    def test_saved_case_inventory_keeps_safety_regressions(self) -> None:
+        inventory = source(CASES_TEST_INVENTORY).splitlines()
+        self.assertEqual(inventory, sorted(set(inventory)))
+        self.assertGreaterEqual(len(inventory), 21)
+        required = {
+            "cases::all_queue_failures_keep_the_durable_run_receipt_from_http_422",
+            "cases::dry_run_uses_only_authoritative_preview_routes",
+            "cases::explicit_keys_are_reused_and_conflicts_are_not_retried",
+            "cases::incompatible_preview_and_mismatched_receipts_are_not_accepted",
+            "cases::older_servers_fail_closed_for_both_preview_and_execution",
+            "cases::replay_preserves_empty_and_whitespace_body_overrides",
+            "cases::suite_discovery_and_selection_queue_once_then_poll_existing_run",
+        }
+        self.assertTrue(required.issubset(inventory))
+        gate = source(CASES_TEST_GATE)
+        self.assertIn("fixtures/cases_release_test_inventory.txt", gate)
+        self.assertIn('list_case_tests("--ignored")', gate)
+        self.assertIn('"--release"', gate)
+        self.assertIn('"--locked"', gate)
 
     def test_source_verification_supports_macos_bash_3(self) -> None:
         for workflow in (self.conformance, self.release):
@@ -925,9 +973,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         }
         for job_name, mutation in first_mutation.items():
             body = job_body(self.release, job_name)
-            governance = body.find(
-                "bash .github/scripts/verify-release-governance.sh"
-            )
+            governance = body.find("bash .github/scripts/verify-release-governance.sh")
             with self.subTest(job=job_name):
                 self.assertIn("actions: read", body)
                 self.assertGreaterEqual(governance, 0)
@@ -977,9 +1023,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             },
             "promote-release": {"gh release edit": "promote"},
         }
-        order_script = (
-            "bash .github/scripts/verify-monotonic-release-order.sh"
-        )
+        order_script = "bash .github/scripts/verify-monotonic-release-order.sh"
         remote_script = "bash .github/scripts/verify-remote-release-tag.sh"
 
         for job_name, mutations in expected_mutations.items():
@@ -1051,7 +1095,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_npm_publishes_the_integrity_checked_tarball(self) -> None:
         body = job_body(self.release, "publish-npm")
         self.assertIn(
-            "--pack-destination \"${package_directory}\"",
+            '--pack-destination "${package_directory}"',
             body,
         )
         self.assertIn(
@@ -1120,7 +1164,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
         self.assertIn("cmp --silent", body)
         self.assertIn("ruby -c homebrew-tap/Formula/hooklistener.rb", body)
-        self.assertIn('git diff --cached --name-only -z', body)
+        self.assertIn("git diff --cached --name-only -z", body)
         self.assertIn("git diff --cached --check", body)
         self.assertIn("git push origin HEAD:refs/heads/main", body)
 

@@ -12,7 +12,7 @@ Commands:
   endpoint       Manage debug endpoints and their captured requests
   static-tunnel  Reserve and manage static tunnel slugs
   anon           Create temporary endpoints and tunnels (no login required)
-  cases          Run saved replay cases against a target
+  cases          Save captured requests as cases, then replay or run them against a target
   share          Create, inspect, and revoke public links to captured requests
   monitor        Create and inspect uptime monitors
   login          Sign in with the device flow

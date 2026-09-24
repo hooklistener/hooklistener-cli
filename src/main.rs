@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod auth;
+mod cases;
 mod config;
 mod errors;
 mod logger;
@@ -43,6 +44,7 @@ use tracing::{error, warn};
 
 use api::ApiClient;
 use app::{App, AppState, FeedbackKind};
+use cases::CasesAction;
 use logger::{LogConfig, Logger};
 use output::{ColorMode, Stylize};
 use tunnel::TunnelEvent;
@@ -182,7 +184,7 @@ enum Commands {
         #[command(subcommand)]
         action: AnonAction,
     },
-    /// Run saved replay cases against a target
+    /// Save captured requests as cases, then replay or run them against a target
     Cases {
         #[command(subcommand)]
         action: CasesAction,
@@ -587,41 +589,6 @@ enum EndpointAction {
     ShowForward {
         /// Forward ID
         forward_id: String,
-        /// Organization ID (overrides the configured default)
-        #[arg(short = 'o', long, value_name = "ORG_ID")]
-        org: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum CasesAction {
-    /// Run saved cases for an endpoint
-    Run {
-        /// Debug endpoint ID
-        endpoint_id: String,
-        /// Target: a URL, a saved target ID, or cli for the running listen session
-        #[arg(long, value_name = "TARGET", conflicts_with_all = ["target_url", "target_id"])]
-        target: Option<String>,
-        #[arg(long, hide = true, value_name = "URL", conflicts_with_all = ["target", "target_id"])]
-        target_url: Option<String>,
-        #[arg(long, hide = true, value_name = "TARGET_ID", conflicts_with_all = ["target", "target_url"])]
-        target_id: Option<String>,
-        /// Display name recorded for the target
-        #[arg(long, value_name = "NAME")]
-        target_name: Option<String>,
-        /// Wait for the run to complete before returning
-        #[arg(long)]
-        wait: bool,
-        /// Timeout for --wait, such as 60, 2m, or 1h
-        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
-        timeout: Option<Duration>,
-        #[arg(long, hide = true, value_name = "MS", conflicts_with = "timeout")]
-        timeout_ms: Option<u64>,
-        /// Poll interval for --wait, such as 500ms, 2s, or 10s
-        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
-        interval: Option<Duration>,
-        #[arg(long, hide = true, value_name = "MS", conflicts_with = "interval")]
-        interval_ms: Option<u64>,
         /// Organization ID (overrides the configured default)
         #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
@@ -1151,6 +1118,7 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
     }
 
     let mut params = api::CaseRunParams {
+        case_suite_id: None,
         target_url: None,
         target_id: None,
         target: None,
@@ -1201,7 +1169,15 @@ fn monitor_enabled_update(enable: bool, disable: bool, enabled: Option<bool>) ->
 }
 
 fn case_run_failed(result: &api::CaseRunResult) -> bool {
-    matches!(result.result_status.as_str(), "failed" | "timeout")
+    !matches!(
+        result.result_status.as_str(),
+        "pending" | "completed" | "passed"
+    ) || result.timed_out == Some(true)
+        || result.failed_count > 0
+        || result.queue_failed_count > 0
+        || result.delivery_failed_count > 0
+        || result.assertion_failed_count > 0
+        || result.assertion_error_count > 0
 }
 
 fn case_run_target_label(target: &api::CaseRunTarget) -> String {
@@ -2980,52 +2956,11 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Commands::Cases { action } => match action {
-            CasesAction::Run {
-                endpoint_id,
-                target,
-                target_url,
-                target_id,
-                target_name,
-                wait,
-                timeout,
-                timeout_ms,
-                interval,
-                interval_ms,
-                org,
-            } => {
-                let timeout_ms = resolve_millis_flag(timeout, timeout_ms, "timeout-ms", "timeout");
-                let interval_ms =
-                    resolve_millis_flag(interval, interval_ms, "interval-ms", "interval");
-                let mut config = config::Config::load()?;
-                let organization_id = require_organization(org, &config)?;
-                let token = ensure_valid_token(&mut config).await?;
-                let params = build_case_run_params(CaseRunInput {
-                    target,
-                    target_url,
-                    target_id,
-                    target_name,
-                    wait,
-                    timeout: None,
-                    timeout_ms,
-                    interval: None,
-                    interval_ms,
-                })?;
-                let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let result = client.run_endpoint_cases(&endpoint_id, &params).await?;
-
-                if json {
-                    print_json(&result)?;
-                } else {
-                    print_context("Organization:", &organization_id);
-                    print_case_run_result(&result);
-                }
-
-                if case_run_failed(&result) {
-                    std::process::exit(1);
-                }
+        Commands::Cases { action } => {
+            if cases::execute(action, json).await? {
+                std::process::exit(1);
             }
-        },
+        }
         Commands::StaticTunnel { action } => match action {
             StaticTunnelAction::List { org } => {
                 let mut config = config::Config::load()?;
@@ -5269,6 +5204,8 @@ fn print_forward_detail(forward: &api::DebugRequestForwardDetail) {
 fn print_case_run_result(result: &api::CaseRunResult) {
     let status = if case_run_failed(result) {
         OutputStatus::Err
+    } else if result.not_configured_count > 0 {
+        OutputStatus::Warn
     } else if matches!(result.result_status.as_str(), "pending" | "completed") {
         OutputStatus::Info
     } else {
@@ -5282,6 +5219,9 @@ fn print_case_run_result(result: &api::CaseRunResult) {
             "RUN ID",
             sanitize_terminal(run_id, TerminalTextLayout::Inline),
         );
+    }
+    if let Some(suite_id) = result.case_suite_id.as_deref() {
+        print_field("SUITE ID", sanitize_terminal_display(suite_id));
     }
     if let Some(report_url) = result.case_suite_run_url.as_deref() {
         print_field(
@@ -5333,9 +5273,14 @@ fn print_case_run_result(result: &api::CaseRunResult) {
         print_field(
             "RESULTS",
             format!(
-                "completed={} waiting={} passed={} assertions_failed={} assertions_error={} not_configured={}",
-                result.completed_count,
-                result.waiting_count,
+                "completed={} waiting={}",
+                result.completed_count, result.waiting_count
+            ),
+        );
+        print_field(
+            "ASSERTIONS",
+            format!(
+                "passed={} failed={} error={} unconfigured={}",
                 result.passed_count,
                 result.assertion_failed_count,
                 result.assertion_error_count,
@@ -7309,6 +7254,27 @@ mod tests {
     }
 
     #[test]
+    fn help_snapshot_cases() {
+        insta::assert_snapshot!("help_cases", render_help_snapshot(&["cases"]));
+    }
+
+    #[test]
+    fn help_snapshot_cases_replay() {
+        insta::assert_snapshot!(
+            "help_cases_replay",
+            render_help_snapshot(&["cases", "replay"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_cases_runs_wait() {
+        insta::assert_snapshot!(
+            "help_cases_runs_wait",
+            render_help_snapshot(&["cases", "runs", "wait"])
+        );
+    }
+
+    #[test]
     fn help_snapshot_share_create() {
         insta::assert_snapshot!(
             "help_share_create",
@@ -8362,9 +8328,12 @@ mod tests {
             Some(Commands::Cases {
                 action:
                     CasesAction::Run {
-                        target,
-                        target_url,
-                        target_id,
+                        destination:
+                            cases::DestinationArgs {
+                                target,
+                                target_url,
+                                target_id,
+                            },
                         ..
                     },
             }) => {
@@ -8388,9 +8357,12 @@ mod tests {
             Some(Commands::Cases {
                 action:
                     CasesAction::Run {
-                        target,
-                        target_url,
-                        target_id,
+                        destination:
+                            cases::DestinationArgs {
+                                target,
+                                target_url,
+                                target_id,
+                            },
                         ..
                     },
             }) => {
@@ -8678,10 +8650,13 @@ mod tests {
             Some(Commands::Cases {
                 action:
                     CasesAction::Run {
-                        timeout,
-                        timeout_ms,
-                        interval,
-                        interval_ms,
+                        wait_options:
+                            cases::WaitArgs {
+                                timeout,
+                                timeout_ms,
+                                interval,
+                                interval_ms,
+                            },
                         ..
                     },
             }) => (timeout, timeout_ms, interval, interval_ms),
@@ -8768,7 +8743,7 @@ mod tests {
                 "--interval",
                 "1s",
                 "--interval-ms",
-                "5",
+                "500",
             ]),
             clap::error::ErrorKind::ArgumentConflict
         );
@@ -9094,16 +9069,16 @@ mod tests {
                 action:
                     CasesAction::Run {
                         endpoint_id,
-                        target,
+                        destination,
                         wait,
-                        timeout,
+                        wait_options,
                         ..
                     },
             } => {
                 assert_eq!(endpoint_id, "ep_123");
-                assert_eq!(target.as_deref(), Some("cli"));
+                assert_eq!(destination.target.as_deref(), Some("cli"));
                 assert!(wait);
-                assert_eq!(timeout, Some(Duration::from_secs(60)));
+                assert_eq!(wait_options.timeout, Some(Duration::from_secs(60)));
             }
             _ => panic!("expected cases run command"),
         }

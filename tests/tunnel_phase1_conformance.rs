@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
+#[path = "support/cases.rs"]
+mod cases;
+
 const ACCESS_TOKEN: &str = "phase1-conformance-access-token";
 const ORGANIZATION_ID: &str = "phase1-conformance-organization";
 

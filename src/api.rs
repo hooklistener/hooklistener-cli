@@ -1,3 +1,5 @@
+pub mod cases;
+
 use crate::{
     errors::TunnelLifecycleError,
     models::{ForwardResponse, WebhookRequest},
@@ -198,7 +200,10 @@ fn bounded_control_neutral_text(value: &str) -> String {
 
 fn structured_server_error_detail(body: &str) -> Option<String> {
     let payload = serde_json::from_str::<Value>(body).ok()?;
-    let error = payload.get("error").unwrap_or(&payload);
+    let error = payload
+        .get("error")
+        .or_else(|| payload.get("errors"))
+        .unwrap_or(&payload);
     let code = error
         .get("code")
         .and_then(Value::as_str)
@@ -206,6 +211,7 @@ fn structured_server_error_detail(body: &str) -> Option<String> {
     let message = error
         .get("message")
         .and_then(Value::as_str)
+        .or_else(|| error.get("detail").and_then(Value::as_str))
         .or_else(|| error.as_str())
         .or_else(|| payload.get("message").and_then(Value::as_str));
 
@@ -417,6 +423,8 @@ pub struct EndpointRequestForwardResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseRunParams {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub case_suite_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
@@ -481,6 +489,12 @@ pub struct CaseRunForward {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseRunResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<cases::IdempotencyReceipt>,
+    #[serde(default)]
+    pub case_suite_id: Option<String>,
+    #[serde(default)]
+    pub case_suite_name: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -1384,12 +1398,18 @@ impl ApiClient {
         &self,
         endpoint_id: &str,
         params: &CaseRunParams,
+        key: &str,
     ) -> Result<CaseRunResult> {
-        let path = format!("/api/v1/endpoints/{}/cases/run", endpoint_id);
-        let body = serde_json::to_value(params)?;
-        let response: DataResponse<CaseRunResult> =
-            self.post_json(&path, &body, "run endpoint cases").await?;
-        Ok(response.data)
+        cases::validate_id(endpoint_id)?;
+        if let Some(id) = params.case_suite_id.as_deref() {
+            cases::validate_id(id)?;
+        }
+        self.case_action_request(
+            &format!("/api/v1/endpoints/{endpoint_id}/cases/run/execute"),
+            &serde_json::to_value(params)?,
+            Some(key),
+        )
+        .await
     }
 
     pub async fn list_endpoint_request_forwards(
@@ -2419,21 +2439,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn case_error_details_preserve_codes_without_dumping_other_fields() {
+        let detail = structured_server_error_detail(r#"{"errors":{"code":"idempotency_key_conflict","detail":"Key used with different inputs","request_body":"SECRET-PAYLOAD"}}"#).unwrap();
+        assert_eq!(
+            detail,
+            "code=idempotency_key_conflict; message=Key used with different inputs"
+        );
+        assert!(!detail.contains("SECRET-PAYLOAD"));
+    }
+
     #[tokio::test]
     async fn test_run_endpoint_cases_posts_params_and_returns_data() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
-            .mock("POST", "/api/v1/endpoints/ep_123/cases/run")
+            .mock("POST", "/api/v1/endpoints/ep_123/cases/run/execute")
             .match_header("authorization", "Bearer test-token")
+            .match_header("idempotency-key", "test-case-key")
             .match_body(mockito::Matcher::Json(serde_json::json!({
-                "target_url": "http://localhost:3000/webhooks",
-                "wait": true,
-                "timeout_ms": 60000
+                "target_url": "http://localhost:3000/webhooks"
             })))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{"data":{"id":"run_123","case_suite_run_id":"run_123","case_suite_run_url":"/api/v1/case-runs/run_123","status":"completed","result_status":"passed","async":false,"waited":true,"endpoint_id":"ep_123","target":{"type":"custom","url":"http://localhost:3000/webhooks"},"total_count":1,"queued_count":0,"failed_count":0,"completed_count":1,"passed_count":1,"forwards":[],"failures":[]}}"#,
+                r#"{"data":{"$schema":"hooklistener.cases.action/1","schema_version":1,"idempotency":{"key":"test-case-key","tool_name":"http.case.run/1","disposition":"executed"},"id":"run_123","case_suite_run_id":"run_123","case_suite_run_url":"/api/v1/case-runs/run_123","status":"completed","result_status":"passed","async":false,"waited":true,"endpoint_id":"ep_123","target":{"type":"custom","url":"http://localhost:3000/webhooks"},"total_count":1,"queued_count":0,"failed_count":0,"completed_count":1,"passed_count":1,"forwards":[],"failures":[]}}"#,
             )
             .create_async()
             .await;
@@ -2444,14 +2473,16 @@ mod tests {
             .run_endpoint_cases(
                 "ep_123",
                 &CaseRunParams {
+                    case_suite_id: None,
                     target_url: Some("http://localhost:3000/webhooks".to_string()),
                     target_id: None,
                     target: None,
                     target_name: None,
-                    wait: Some(true),
-                    timeout_ms: Some(60_000),
+                    wait: None,
+                    timeout_ms: None,
                     interval_ms: None,
                 },
+                "test-case-key",
             )
             .await
             .unwrap();

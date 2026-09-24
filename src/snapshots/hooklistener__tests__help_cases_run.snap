@@ -10,13 +10,20 @@ Arguments:
   <ENDPOINT_ID>  Debug endpoint ID
 
 Options:
-      --target <TARGET>      Target: a URL, a saved target ID, or cli for the running listen session
-      --target-name <NAME>   Display name recorded for the target
-      --wait                 Wait for the run to complete before returning
-      --timeout <DURATION>   Timeout for --wait, such as 60, 2m, or 1h
-      --interval <DURATION>  Poll interval for --wait, such as 500ms, 2s, or 10s
-  -o, --org <ORG_ID>         Organization ID (overrides the configured default)
-  -h, --help                 Print help
+      --target <TARGET>           Target: a service-side URL, a saved target ID, or cli for an
+                                  active listen session
+      --target-name <NAME>        Display name recorded for the target
+      --case-suite-id <SUITE_ID>  Run only this named suite (see cases suites list)
+      --wait                      Wait for completion using read-only polling; timeout does not
+                                  cancel delivery
+      --timeout <DURATION>        Maximum wait, such as 60, 2m, or 1h (up to 1h) [default: 30s]
+      --interval <DURATION>       Read-only polling interval, such as 500ms or 2s (100ms to 30s)
+                                  [default: 250ms]
+      --idempotency-key <KEY>     Delivery key; reuse with identical inputs to recover a lost
+                                  receipt [default: new UUID]
+      --dry-run                   Server preview of scope and target policy; queues no delivery
+  -o, --org <ORG_ID>              Organization ID (overrides the configured default)
+  -h, --help                      Print help
 
 Global options:
       --json               Output supported command responses or event streams as JSON
