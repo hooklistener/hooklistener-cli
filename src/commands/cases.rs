@@ -1,19 +1,23 @@
 //! Saved endpoint case commands. Local fixtures and tunnel investigation cases are separate workflows.
 
-use std::time::Duration;
-
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde_json::{Map, Value, json};
+use std::time::Duration;
 use tokio::time::{Instant, sleep, timeout_at};
 
+use crate::api;
 use crate::api::{
     ApiClient, CaseRunParams, CaseRunResult,
     cases::{CaseSuite, SavedCase, validate_action_key, validate_id},
 };
-use crate::{
-    CaseRunInput, HttpMethod, build_case_run_params, config, ensure_valid_token,
-    require_organization, resolve_millis_flag,
+use crate::cli::{HttpMethod, duration_millis, resolve_millis_flag};
+use crate::config;
+use crate::credentials::{ensure_valid_token, require_organization};
+use crate::output::Stylize;
+use crate::render::{
+    OutputStatus, TerminalTextLayout, new_table, print_field, print_section, print_status,
+    sanitize_terminal, sanitize_terminal_display, value_or_dash, yes_no,
 };
 
 #[derive(Subcommand)]
@@ -192,12 +196,12 @@ pub struct DestinationArgs {
 #[derive(Args)]
 pub struct WaitArgs {
     /// Maximum wait, such as 60, 2m, or 1h (up to 1h) [default: 30s]
-    #[arg(long, value_name = "DURATION", value_parser = crate::parse_duration)]
+    #[arg(long, value_name = "DURATION", value_parser = crate::cli::parse_duration)]
     pub(crate) timeout: Option<Duration>,
     #[arg(long, hide = true, value_name = "MS", conflicts_with = "timeout")]
     pub(crate) timeout_ms: Option<u64>,
     /// Read-only polling interval, such as 500ms or 2s (100ms to 30s) [default: 250ms]
-    #[arg(long, value_name = "DURATION", value_parser = crate::parse_duration_within(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL))]
+    #[arg(long, value_name = "DURATION", value_parser = crate::cli::parse_duration_within(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL))]
     pub(crate) interval: Option<Duration>,
     #[arg(long, hide = true, value_name = "MS", conflicts_with = "interval", value_parser = clap::value_parser!(u64).range(100..=30_000))]
     pub(crate) interval_ms: Option<u64>,
@@ -548,7 +552,10 @@ async fn execute_with_client(
                     &json!({"organization_id":org,"replay":replay}),
                     json_output,
                     || {
-                        crate::print_status(crate::OutputStatus::Info, "CASE REPLAY");
+                        crate::render::print_status(
+                            crate::render::OutputStatus::Info,
+                            "CASE REPLAY",
+                        );
                         field("FORWARD ID", &replay.forward_id);
                         field("IDEMPOTENCY KEY", &replay.idempotency.key);
                         field("DISPOSITION", &replay.idempotency.disposition);
@@ -633,7 +640,7 @@ async fn execute_with_client(
                         field("SUITE ID", &suite.id);
                         field("NAME", &suite.name);
                         field("ENDPOINT", &suite.endpoint_id);
-                        let mut table = crate::new_table(&["Position", "Case ID", "Name"]);
+                        let mut table = crate::render::new_table(&["Position", "Case ID", "Name"]);
                         for member in &suite.cases {
                             table.add_row([
                                 member.position.to_string(),
@@ -666,7 +673,7 @@ async fn execute_with_client(
                             return;
                         }
                         let mut table =
-                            crate::new_table(&["Run ID", "Result", "Passed", "Unasserted"]);
+                            crate::render::new_table(&["Run ID", "Result", "Passed", "Unasserted"]);
                         for run in &history.data {
                             table.add_row([
                                 safe(
@@ -681,7 +688,7 @@ async fn execute_with_client(
                             ]);
                         }
                         println!("{table}");
-                        crate::print_pagination(&history.pagination);
+                        crate::render::print_pagination(&history.pagination);
                     },
                 )?;
             }
@@ -726,7 +733,7 @@ fn delivery_key(key: Option<String>) -> Result<String> {
 
 fn print_preview(preview: &Value, json_output: bool) -> Result<()> {
     emit(preview, json_output, || {
-        crate::print_status(crate::OutputStatus::Info, "CASE PREVIEW");
+        crate::render::print_status(crate::render::OutputStatus::Info, "CASE PREVIEW");
         field("OPERATION", preview["operation"].as_str().unwrap_or("-"));
         field(
             "CASES",
@@ -750,19 +757,19 @@ fn print_preview(preview: &Value, json_output: bool) -> Result<()> {
 fn emit_run(result: &CaseRunResult, org: &str, json_output: bool) -> Result<bool> {
     // Preserve the original cases run JSON shape.
     emit(result, json_output, || {
-        crate::print_context("Organization:", org);
-        crate::print_case_run_result(result);
+        crate::render::print_context("Organization:", org);
+        print_case_run_result(result);
         if let Some(receipt) = &result.idempotency {
             field("IDEMPOTENCY KEY", &receipt.key);
             field("DISPOSITION", &receipt.disposition);
         }
     })?;
-    Ok(crate::case_run_failed(result))
+    Ok(case_run_failed(result))
 }
 
 fn emit<T: serde::Serialize>(value: &T, json_output: bool, human: impl FnOnce()) -> Result<()> {
     if json_output {
-        crate::print_json(value)?;
+        crate::render::print_json(value)?;
     } else {
         human();
     }
@@ -770,10 +777,10 @@ fn emit<T: serde::Serialize>(value: &T, json_output: bool, human: impl FnOnce())
 }
 
 fn safe(value: &str) -> String {
-    crate::sanitize_terminal_display(value)
+    crate::render::sanitize_terminal_display(value)
 }
 fn field(label: &str, value: &str) {
-    crate::print_field(label, safe(value));
+    crate::render::print_field(label, safe(value));
 }
 
 fn print_case(case: &SavedCase) {
@@ -801,7 +808,7 @@ fn print_cases(cases: &[SavedCase]) {
         println!("No saved cases. Use hooklistener cases save <endpoint-id> <request-id>.");
         return;
     }
-    let mut table = crate::new_table(&["Case ID", "Name", "Method", "Path"]);
+    let mut table = crate::render::new_table(&["Case ID", "Name", "Method", "Path"]);
     for case in cases {
         table.add_row([
             safe(&case.id),
@@ -813,6 +820,296 @@ fn print_cases(cases: &[SavedCase]) {
     println!("{table}");
 }
 
+pub struct CaseRunInput {
+    pub target: Option<String>,
+    pub target_url: Option<String>,
+    pub target_id: Option<String>,
+    pub target_name: Option<String>,
+    pub wait: bool,
+    pub timeout: Option<Duration>,
+    pub timeout_ms: Option<u64>,
+    pub interval: Option<Duration>,
+    pub interval_ms: Option<u64>,
+}
+
+pub fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
+    let CaseRunInput {
+        target,
+        target_url,
+        target_id,
+        target_name,
+        wait,
+        timeout,
+        timeout_ms,
+        interval,
+        interval_ms,
+    } = input;
+
+    let explicit_targets = target_url.iter().count() + target_id.iter().count();
+    if target.is_some() && explicit_targets > 0 {
+        return Err(anyhow!(
+            "Use --target by itself, or use one of --target-url/--target-id."
+        ));
+    }
+    if explicit_targets > 1 {
+        return Err(anyhow!("Use only one of --target-url or --target-id."));
+    }
+
+    let mut params = api::CaseRunParams {
+        case_suite_id: None,
+        target_url: None,
+        target_id: None,
+        target: None,
+        target_name,
+        wait: wait.then_some(true),
+        timeout_ms: timeout.map(duration_millis).or(timeout_ms),
+        interval_ms: interval.map(duration_millis).or(interval_ms),
+    };
+
+    if let Some(target_url) = target_url {
+        params.target_url = Some(target_url);
+    } else if let Some(target_id) = target_id {
+        params.target_id = Some(target_id);
+    } else if let Some(target) = target {
+        let normalized = target.trim();
+        if normalized.eq_ignore_ascii_case("cli") {
+            params.target = Some("cli".to_string());
+        } else if normalized.starts_with("http://") || normalized.starts_with("https://") {
+            params.target_url = Some(target);
+        } else {
+            params.target_id = Some(target);
+        }
+    } else {
+        return Err(anyhow!(
+            "Target is required. Use --target <URL|TARGET_ID|cli>."
+        ));
+    }
+
+    Ok(params)
+}
+
+pub fn case_run_failed(result: &api::CaseRunResult) -> bool {
+    !matches!(
+        result.result_status.as_str(),
+        "pending" | "completed" | "passed"
+    ) || result.timed_out == Some(true)
+        || result.failed_count > 0
+        || result.queue_failed_count > 0
+        || result.delivery_failed_count > 0
+        || result.assertion_failed_count > 0
+        || result.assertion_error_count > 0
+}
+
+pub fn case_run_target_label(target: &api::CaseRunTarget) -> String {
+    if target.r#type.as_deref() == Some("cli") {
+        return "CLI listener".to_string();
+    }
+
+    target
+        .name
+        .as_deref()
+        .or(target.url.as_deref())
+        .or(target.id.as_deref())
+        .unwrap_or("-")
+        .to_string()
+}
+
+pub fn case_run_forward_target(forward: &api::CaseRunForward) -> String {
+    forward.target_url.as_deref().unwrap_or("CLI").to_string()
+}
+
+pub fn has_case_run_error(error: Option<&serde_json::Value>) -> bool {
+    match error {
+        Some(serde_json::Value::Null) | None => false,
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(serde_json::Value::Object(value)) => !value.is_empty(),
+        Some(_) => true,
+    }
+}
+
+pub fn case_run_value_message(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(message) => message.clone(),
+        serde_json::Value::Object(object) => {
+            if let Some(detail) = object.get("detail").and_then(|value| value.as_str()) {
+                detail.to_string()
+            } else if let Some(error_type) = object.get("type").and_then(|value| value.as_str()) {
+                error_type.replace('_', " ")
+            } else {
+                value.to_string()
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
+pub fn case_run_failure_reason(failure: &api::CaseRunFailure) -> String {
+    case_run_value_message(&failure.reason)
+}
+
+pub fn print_case_run_result(result: &api::CaseRunResult) {
+    let status = if case_run_failed(result) {
+        OutputStatus::Err
+    } else if result.not_configured_count > 0 {
+        OutputStatus::Warn
+    } else if matches!(result.result_status.as_str(), "pending" | "completed") {
+        OutputStatus::Info
+    } else {
+        OutputStatus::Ok
+    };
+
+    print_status(status, "CASE RUN");
+    println!();
+    if let Some(run_id) = result.case_suite_run_id.as_deref().or(result.id.as_deref()) {
+        print_field(
+            "RUN ID",
+            sanitize_terminal(run_id, TerminalTextLayout::Inline),
+        );
+    }
+    if let Some(suite_id) = result.case_suite_id.as_deref() {
+        print_field("SUITE ID", sanitize_terminal_display(suite_id));
+    }
+    if let Some(report_url) = result.case_suite_run_url.as_deref() {
+        print_field(
+            "REPORT",
+            sanitize_terminal(report_url, TerminalTextLayout::Inline),
+        );
+    }
+    print_field(
+        "RESULT",
+        sanitize_terminal(&result.result_status, TerminalTextLayout::Inline).bold(),
+    );
+    print_field(
+        "STATUS",
+        sanitize_terminal(&result.status, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "ENDPOINT",
+        sanitize_terminal(&result.endpoint_id, TerminalTextLayout::Inline),
+    );
+    print_field(
+        "TARGET",
+        sanitize_terminal(
+            &case_run_target_label(&result.target),
+            TerminalTextLayout::Inline,
+        ),
+    );
+    if let Some(source) = result.source.as_deref() {
+        print_field(
+            "SOURCE",
+            sanitize_terminal(&source.to_uppercase(), TerminalTextLayout::Inline),
+        );
+    }
+    print_field("ASYNC", yes_no(result.async_run));
+    if let Some(waited) = result.waited {
+        print_field("WAITED", yes_no(waited));
+    }
+    if result.timed_out == Some(true) {
+        print_field("TIMED OUT", "yes".red());
+    }
+    print_field(
+        "COUNTS",
+        format!(
+            "total={} queued={} failed={}",
+            result.total_count, result.queued_count, result.failed_count
+        ),
+    );
+
+    if result.waited == Some(true) || result.completed_count > 0 {
+        print_field(
+            "RESULTS",
+            format!(
+                "completed={} waiting={}",
+                result.completed_count, result.waiting_count
+            ),
+        );
+        print_field(
+            "ASSERTIONS",
+            format!(
+                "passed={} failed={} error={} unconfigured={}",
+                result.passed_count,
+                result.assertion_failed_count,
+                result.assertion_error_count,
+                result.not_configured_count
+            ),
+        );
+        print_field(
+            "FAILURES",
+            format!(
+                "queue={} delivery={}",
+                result.queue_failed_count, result.delivery_failed_count
+            ),
+        );
+    }
+
+    let problem_forwards = result
+        .forwards
+        .iter()
+        .filter(|forward| {
+            has_case_run_error(forward.error_message.as_ref())
+                || forward.status_code.is_some_and(|code| code >= 400)
+                || matches!(
+                    forward.assertion_status.as_deref(),
+                    Some("failed" | "error" | "timeout")
+                )
+        })
+        .collect::<Vec<_>>();
+
+    if !problem_forwards.is_empty() {
+        println!();
+        print_section("Failed Forwards");
+        let mut table = new_table(&[
+            "ID",
+            "Request",
+            "Case",
+            "Target",
+            "HTTP",
+            "Assertion",
+            "Error",
+        ]);
+        for forward in problem_forwards {
+            let status = forward
+                .status_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let assertion = forward
+                .assertion_status
+                .as_deref()
+                .unwrap_or("-")
+                .to_string();
+            let error = forward
+                .error_message
+                .as_ref()
+                .map(case_run_value_message)
+                .or_else(|| forward.poll_url.clone())
+                .unwrap_or_else(|| "-".to_string());
+            table.add_row(vec![
+                sanitize_terminal_display(&forward.id),
+                sanitize_terminal_display(&forward.debug_request_id),
+                sanitize_terminal_display(value_or_dash(forward.debug_request_case_id.as_deref())),
+                sanitize_terminal_display(case_run_forward_target(forward)),
+                status,
+                sanitize_terminal_display(assertion),
+                sanitize_terminal_display(error),
+            ]);
+        }
+        println!("{table}");
+    }
+
+    if !result.failures.is_empty() {
+        println!();
+        print_section("Queue Failures");
+        let mut table = new_table(&["Case", "Reason"]);
+        for failure in &result.failures {
+            table.add_row(vec![
+                sanitize_terminal_display(&failure.case_id),
+                sanitize_terminal_display(case_run_failure_reason(failure)),
+            ]);
+        }
+        println!("{table}");
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -821,7 +1118,7 @@ fn print_suites(suites: &[CaseSuite]) {
         println!("No named suites. Create a suite in Hooklistener or through MCP.");
         return;
     }
-    let mut table = crate::new_table(&["Suite ID", "Name", "Cases"]);
+    let mut table = crate::render::new_table(&["Suite ID", "Name", "Cases"]);
     for suite in suites {
         table.add_row([
             safe(&suite.id),

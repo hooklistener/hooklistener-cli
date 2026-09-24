@@ -39,17 +39,27 @@ dependency reported by `cargo machete`. Keep the tree warning-free.
 
 ## Project Structure
 
-Single binary crate; all modules are declared in `src/main.rs`.
+Single binary crate; top-level modules are declared in `src/main.rs`.
 
-- `src/main.rs` - clap CLI definition, command dispatch, non-TUI command
-  output, error-to-exit-code mapping (`error_hint`, `error_code`).
+- `src/main.rs` - `main()` and `run()`, which dispatches each subcommand.
+- `src/cli.rs` - clap `Cli` and `Commands`, shared value enums, and duration
+  parsing.
+- `src/commands/<name>.rs` - one module per subcommand (`endpoint`, `monitor`,
+  `tunnel`, `cases`, ...): its clap action enum, an `execute` function, and
+  its human-readable output. `src/commands.rs` holds helpers they share.
+- `src/receipts.rs` - `--json` receipts and resource URIs.
+- `src/render.rs` - non-TUI terminal output (status blocks, fields, tables).
+- `src/credentials.rs` - access-token checks and refresh, organization choice.
+- `src/tui.rs` - TUI event loop and terminal setup/restore.
 - `src/api.rs` - HTTP client for the Hooklistener API and its response types.
 - `src/auth.rs` - device-code login flow and token refresh.
 - `src/config.rs` - `~/.config/hooklistener/config.json` persistence.
 - `src/app.rs` - TUI application state and key handling.
 - `src/ui.rs` - Ratatui rendering for every TUI screen.
-- `src/tunnel.rs` - WebSocket tunnel forwarder (Phoenix channel protocol,
-  request/response framing, reconnect).
+- `src/tunnel.rs` and `src/tunnel/` - WebSocket tunnel transport: `client.rs`
+  (`listen`), `forwarder.rs` plus `forwarder/v2.rs` and `forwarder/v3.rs`
+  (`tunnel`), and `framing`, `http`, `limits`, `preview`, `relay`,
+  `v3_relay`, `writer` for the pieces they share.
 - `src/tunnel_v3.rs` - protocol v3 streaming transport and bounded body
   primitives; selected automatically from the relay ticket.
 - `src/target_policy.rs` - validation of local forwarding targets.
@@ -58,12 +68,15 @@ Single binary crate; all modules are declared in `src/main.rs`.
 - `src/output.rs`, `src/syntax.rs`, `src/theme.rs`, `src/logo.rs` - terminal
   styling, JSON highlighting, status colors, startup animation.
 - `src/errors.rs` - typed errors that carry user hints (`TunnelLifecycleError`,
-  `UpdateError`).
+  `UpdateError`) and error-to-exit-code mapping (`error_hint`, `error_code`).
 - `src/models.rs` - shared request/response models.
 
 ## Tests
 
-- Unit tests live inline in each module under `#[cfg(test)]`.
+- Unit tests live under `#[cfg(test)]` in each module. The large suites for
+  `main` and `tunnel` are in `src/tests.rs` and `src/tunnel/tests.rs` (plus
+  `audit_findings.rs` next to each) so their module paths, snapshot names, and
+  inventory entries stay stable.
 - `insta` snapshot tests render TUI screens and command output; snapshots are
   in `src/snapshots/`. Review new `.snap.new` files with `cargo insta review`
   or by inspecting the diff before committing.

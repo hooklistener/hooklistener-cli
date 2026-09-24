@@ -22,7 +22,7 @@ fn idempotency_keys_are_bounded_and_terminal_safe() {
 fn preview_rejects_execution_keys() {
     for operation in ["run", "replay"] {
         assert!(
-            crate::Cli::try_parse_from([
+            crate::cli::Cli::try_parse_from([
                 "hooklistener",
                 "cases",
                 operation,
@@ -213,13 +213,15 @@ fn parser_rejects_conflicting_or_invalid_case_flags() {
             "1000",
         ],
     ] {
-        assert!(crate::Cli::try_parse_from(std::iter::once("hooklistener").chain(args)).is_err());
+        assert!(
+            crate::cli::Cli::try_parse_from(std::iter::once("hooklistener").chain(args)).is_err()
+        );
     }
 }
 
 #[test]
 fn suite_alias_and_org_override_parse() {
-    let cli = crate::Cli::try_parse_from([
+    let cli = crate::cli::Cli::try_parse_from([
         "hooklistener",
         "cases",
         "run",
@@ -233,7 +235,7 @@ fn suite_alias_and_org_override_parse() {
         "--json",
     ])
     .unwrap();
-    let Some(crate::Commands::Cases {
+    let Some(crate::cli::Commands::Cases {
         action: CasesAction::Run {
             case_suite_id, org, ..
         },
@@ -248,5 +250,5 @@ fn suite_alias_and_org_override_parse() {
 #[test]
 fn run_failures_are_not_hidden_by_a_success_label() {
     let result: CaseRunResult = serde_json::from_value(json!({"status":"completed","result_status":"passed","async":false,"endpoint_id":"ep-1","target":{},"assertion_error_count":1})).unwrap();
-    assert!(crate::case_run_failed(&result));
+    assert!(crate::commands::cases::case_run_failed(&result));
 }

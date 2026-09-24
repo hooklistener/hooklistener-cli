@@ -347,12 +347,13 @@ fn render_update_notification(
     new_version: &str,
     method: &InstallMethod,
 ) -> String {
-    let status = crate::format_status_line(crate::OutputStatus::Info, "UPDATE AVAILABLE")
-        .yellow()
-        .bold();
-    let current = crate::format_field_line("CURRENT", current_version.dim());
-    let latest = crate::format_field_line("LATEST", new_version.green().bold());
-    let action = crate::format_field_line(
+    let status =
+        crate::render::format_status_line(crate::render::OutputStatus::Info, "UPDATE AVAILABLE")
+            .yellow()
+            .bold();
+    let current = crate::render::format_field_line("CURRENT", current_version.dim());
+    let latest = crate::render::format_field_line("LATEST", new_version.green().bold());
+    let action = crate::render::format_field_line(
         "ACTION",
         format!("Run {} to update.", method.upgrade_command().bold()),
     );
@@ -368,7 +369,7 @@ pub async fn run_self_update(json: bool) -> Result<()> {
         InstallMethod::Homebrew | InstallMethod::Npm | InstallMethod::Cargo => {
             let cmd = method.upgrade_command();
             if json {
-                crate::print_json(&serde_json::json!({
+                crate::render::print_json(&serde_json::json!({
                     "status": "manual_update_required",
                     "install_method": method.to_string(),
                     "command": cmd,
@@ -377,18 +378,21 @@ pub async fn run_self_update(json: bool) -> Result<()> {
             } else {
                 println!(
                     "{}",
-                    crate::format_status_line(crate::OutputStatus::Info, "MANUAL UPDATE REQUIRED")
-                        .yellow()
-                        .bold()
+                    crate::render::format_status_line(
+                        crate::render::OutputStatus::Info,
+                        "MANUAL UPDATE REQUIRED"
+                    )
+                    .yellow()
+                    .bold()
                 );
                 println!();
                 println!(
                     "{}",
-                    crate::format_field_line("METHOD", method.to_string().bold())
+                    crate::render::format_field_line("METHOD", method.to_string().bold())
                 );
                 println!(
                     "{}",
-                    crate::format_field_line("COMMAND", cmd.green().bold())
+                    crate::render::format_field_line("COMMAND", cmd.green().bold())
                 );
             }
             Ok(())
@@ -401,7 +405,11 @@ async fn run_binary_self_update(json: bool) -> Result<()> {
     if !json {
         println!(
             "{}",
-            crate::format_status_line(crate::OutputStatus::Info, "CHECKING FOR UPDATES").bold()
+            crate::render::format_status_line(
+                crate::render::OutputStatus::Info,
+                "CHECKING FOR UPDATES"
+            )
+            .bold()
         );
     }
 
@@ -448,7 +456,7 @@ async fn run_binary_self_update(json: bool) -> Result<()> {
     persist_check_result(None);
 
     if json {
-        crate::print_json(&serde_json::json!({
+        crate::render::print_json(&serde_json::json!({
             "status": if status.is_updated() { "updated" } else { "up_to_date" },
             "current_version": CURRENT_VERSION,
             "latest_version": new_version,
@@ -456,24 +464,27 @@ async fn run_binary_self_update(json: bool) -> Result<()> {
     } else if status.is_updated() {
         println!(
             "\n{}",
-            crate::format_status_line(crate::OutputStatus::Ok, "UPDATED")
+            crate::render::format_status_line(crate::render::OutputStatus::Ok, "UPDATED")
                 .green()
                 .bold(),
         );
         println!();
         println!(
             "{}",
-            crate::format_field_line("VERSION", new_version.bold())
+            crate::render::format_field_line("VERSION", new_version.bold())
         );
     } else {
         println!(
             "\n{}",
-            crate::format_status_line(crate::OutputStatus::Ok, "UP TO DATE")
+            crate::render::format_status_line(crate::render::OutputStatus::Ok, "UP TO DATE")
                 .green()
                 .bold(),
         );
         println!();
-        println!("{}", crate::format_field_line("VERSION", CURRENT_VERSION));
+        println!(
+            "{}",
+            crate::render::format_field_line("VERSION", CURRENT_VERSION)
+        );
     }
 
     Ok(())
