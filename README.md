@@ -87,10 +87,10 @@ hooklistener anon claim <route-id> --token <claim-token> --org <organization-id>
 To create a capture-only temporary endpoint instead:
 
 ```bash
-hooklistener anon create --ttl 3600
+hooklistener anon create --ttl 1h
 ```
 
-The result includes the endpoint URL, endpoint ID, and viewer token needed to inspect captured events.
+Duration flags accept a bare number of seconds (`--ttl 3600`) or a unit suffix (`500ms`, `30s`, `10m`, `1h`, `7d`). The result includes the endpoint URL, endpoint ID, and viewer token needed to inspect captured events.
 
 ## Choose the right workflow
 
@@ -131,7 +131,7 @@ hooklistener tunnel detach <session-id> --reason "switching machines"
 hooklistener tunnel stop <session-id> --reason "deployment complete"
 ```
 
-`hooklistener tunnel --port 3000` remains an alias for `tunnel start`. Every lifecycle command negotiates the authenticated tunnel contract first; an incompatible schema major fails before relay activation.
+`hooklistener tunnel --port 3000` remains an alias for `tunnel start`. Target flags given before a subcommand set defaults; the same flag on the subcommand overrides them. Every lifecycle command negotiates the authenticated tunnel contract first; an incompatible schema major fails before relay activation.
 
 `tunnel` and `listen` are authenticated beta relay modes and require an organization enabled by Hooklistener. Every connection exchanges the account credential for a short-lived, single-use ticket scoped to its mode, route, organization, and pinned target. `anon tunnel` uses a separate public bootstrap with a 1 MiB body limit, per-route request limits, short expiry, and no authenticated capture access. See [the authenticated beta guide](docs/tunnel-authenticated-beta.md) and [the anonymous route guide](docs/tunnel-anonymous-routes.md).
 
@@ -148,8 +148,8 @@ Create an endpoint, inspect its traffic, and replay a request:
 
 ```bash
 hooklistener endpoint create "Billing Webhooks" --slug billing-webhooks
-hooklistener endpoint requests <endpoint-id>
-hooklistener endpoint request <endpoint-id> <request-id>
+hooklistener endpoint list-requests <endpoint-id>
+hooklistener endpoint show-request <endpoint-id> <request-id>
 hooklistener endpoint forward-request \
   <endpoint-id> <request-id> http://localhost:3000/webhooks
 ```
@@ -166,7 +166,7 @@ hooklistener cases run <endpoint-id> --target cli --wait --timeout 60s
 ```
 
 `--target cli` delivers through active CLI listeners for that endpoint. A URL passed
-with `--target` or `--target-url` is delivered **by the service**, not by this CLI
+with `--target` is delivered **by the service**, not by this CLI
 process. Use `--target cli` for localhost. Multiple active listeners may receive
 replays; stop other listeners if you need a single local delivery.
 
@@ -197,7 +197,7 @@ atomic server merge: avoid simultaneous edits to the same case.
 Replay requires an explicit target. Its `--method`, `--headers`, and `--body`
 options affect only that delivery, not the saved case. `--body ''` sends an empty
 body, and whitespace-only overrides are preserved exactly. Omitting `--body`
-inherits the saved/default request body. Replay returns a forward ID; inspect it with `hooklistener endpoint forward <forward-id>`. Named suite
+inherits the saved/default request body. Replay returns a forward ID; inspect it with `hooklistener endpoint show-forward <forward-id>`. Named suite
 creation and membership management remain available through the service/MCP.
 All case commands support `--json` and an `--org` override on the leaf command.
 Case metadata can contain sensitive request overrides; review it before sharing
@@ -249,7 +249,8 @@ routes or a weaker client preview. Released CLIs can still use the legacy routes
 
 `cases run --wait` queues once, then polls the run ID. `cases runs wait` only
 observes an existing run. Waits default to 30 seconds, accept up to 1 hour, and
-support `--interval-ms` from 100 to 30000 (default 250). The wait budget starts
+support `--interval` from 100ms to 30s (default 250ms). Both `--timeout` and
+`--interval` take a duration such as `1500ms`, `60`, `2m`, or `1h`. The wait budget starts
 after the submission receipt; the submission has its own HTTP timeout. A zero
 wait performs no further polling (waiting on an existing ID still performs one
 bounded GET). Timeout or interruption stops observation, **not delivery**; resume
@@ -268,16 +269,16 @@ Use `hooklistener <command> --help` for every option and subcommand.
 
 | Command | Purpose |
 | --- | --- |
-| `login`, `logout` | Manage the authenticated session |
-| `org`, `config` | Select an organization and inspect local configuration |
-| `listen` | Stream an existing endpoint and forward events to a local URL |
-| `tunnel`, `static-tunnel` | Expose localhost and manage reserved tunnel slugs |
-| `endpoint`, `cases` | Manage captures, requests, forwards, and saved replay cases |
-| `anon` | Create and inspect temporary anonymous endpoints |
-| `share` | Create, inspect, and revoke public request links |
-| `monitor` | Manage uptime monitors and their checks |
-| `diagnostics`, `clean-logs` | Collect support information and remove old logs |
-| `completions`, `update` | Generate shell completions and update direct binary installs |
+| `listen` | Forward events from a debug endpoint to a local URL |
+| `tunnel`, `static-tunnel` | Expose a local HTTP server on a public URL and reserve static tunnel slugs |
+| `endpoint`, `cases` | Manage debug endpoints and captured requests, and run saved replay cases |
+| `anon` | Create temporary endpoints and tunnels without signing in |
+| `share` | Create, inspect, and revoke public links to captured requests |
+| `monitor` | Create and inspect uptime monitors |
+| `login`, `logout` | Sign in with the device flow and sign out |
+| `org`, `config` | Set the default organization and show or set CLI configuration |
+| `diagnostics`, `clean-logs` | Write a diagnostic bundle for support and delete old log files |
+| `completions`, `update` | Print a shell completion script and update the binary |
 
 Run `hooklistener --help` for the complete command list.
 
@@ -287,7 +288,7 @@ Most non-interactive commands support `--json` for scripts, agents, and CI:
 
 ```bash
 hooklistener --json org list
-hooklistener --json endpoint request <endpoint-id> <request-id>
+hooklistener --json endpoint show-request <endpoint-id> <request-id>
 hooklistener --json endpoint forward-request \
   <endpoint-id> <request-id> http://localhost:3000/webhooks --dry-run
 ```
@@ -315,6 +316,31 @@ Runtime errors use a consistent envelope:
 
 Exit status `0` means success, `1` means a runtime failure, `2` means command-line parsing failed, `3` means the tunnel schema major is incompatible, and `4` means an event cursor expired. Destructive commands in scripts require `--yes`. `login` and `completions` do not support JSON output.
 
+`--json`, `--color`, `--yes`, `--log-level`, `--log-dir`, and `--log-stdout` are global flags and are accepted before or after any subcommand, so `hooklistener tunnel --log-level debug prepare` and `hooklistener --log-level debug tunnel prepare` are equivalent.
+
+### Migration
+
+The following spellings still parse and behave as before. The `endpoint` and `anon` list/show names remain listed as aliases in `--help`; every other entry is hidden from `--help`. Scripts should move to the replacement; the `-ms` and `-hours` flags print a one-line deprecation warning on stderr and leave stdout untouched.
+
+| Hidden spelling | Replacement |
+| --- | --- |
+| `endpoint requests` | `endpoint list-requests` |
+| `endpoint request` | `endpoint show-request` |
+| `endpoint forwards` | `endpoint list-forwards` |
+| `endpoint forward` | `endpoint show-forward` |
+| `anon events` | `anon list-events` |
+| `anon event` | `anon show-event` |
+| `tunnel activate` | `tunnel start` |
+| `completions power-shell` | `completions powershell` |
+| `cases run` or `cases replay --target-url <url>` | `--target <url>` |
+| `cases run` or `cases replay --target-id <target-id>` | `--target <target-id>` |
+| `cases run` or `cases runs wait --timeout-ms <ms>` | `--timeout <duration>`, for example `--timeout 1500ms` |
+| `cases run` or `cases runs wait --interval-ms <ms>` | `--interval <duration>`, for example `--interval 500ms` |
+| `tunnel events --interval-ms <ms>` | `tunnel events --interval <duration>`, for example `--interval 250ms` |
+| `share create --expires-in-hours <hours>` | `share create --expires-in <duration>`, for example `--expires-in 24h` |
+| `monitor create --email <true\|false>` | `monitor create --no-email` to disable notifications; omit the flag to keep them enabled |
+| `monitor update --enabled <true\|false>` | `monitor update --enable` or `monitor update --disable` |
+
 ## Terminal behavior
 
 Human output adapts to the terminal. Styling is disabled when output is redirected, when `NO_COLOR` is set, or when you pass `--color never`.
@@ -324,7 +350,7 @@ hooklistener --color never endpoint list
 NO_COLOR=1 hooklistener monitor list
 ```
 
-Live views are keyboard operated and show the available shortcuts in their status bar. Generate completions with `hooklistener completions <shell>`; accepted shell names are `bash`, `zsh`, `fish`, `power-shell`, and `elvish`.
+Live views are keyboard operated and show the available shortcuts in their status bar. Generate completions with `hooklistener completions <shell>`; accepted shell names are `bash`, `zsh`, `fish`, `powershell`, and `elvish`.
 
 ## Configuration
 

@@ -103,17 +103,34 @@ fn resource_ids_cannot_change_paths_or_queries() {
 
 #[test]
 fn wait_settings_are_bounded_and_zero_is_explicit() {
+    let wait = |timeout, timeout_ms, interval, interval_ms| WaitArgs {
+        timeout,
+        timeout_ms,
+        interval,
+        interval_ms,
+    };
     assert_eq!(
-        wait_settings(None, None, None).unwrap(),
+        wait_settings(wait(None, None, None, None)).unwrap(),
         (Duration::from_secs(30), Duration::from_millis(250))
     );
     assert_eq!(
-        wait_settings(Some("0".into()), None, None).unwrap().0,
+        wait_settings(wait(Some(Duration::ZERO), None, None, None))
+            .unwrap()
+            .0,
         Duration::ZERO
     );
-    assert!(wait_settings(Some("2h".into()), None, None).is_err());
-    assert!(wait_settings(None, None, Some(0)).is_err());
-    assert!(wait_settings(None, None, Some(30_001)).is_err());
+    assert!(wait_settings(wait(Some(Duration::from_secs(7_200)), None, None, None)).is_err());
+    assert!(wait_settings(wait(None, Some(3_600_001), None, None)).is_err());
+    assert_eq!(
+        wait_settings(wait(None, Some(1_500), None, Some(100))).unwrap(),
+        (Duration::from_millis(1_500), Duration::from_millis(100))
+    );
+    assert_eq!(
+        wait_settings(wait(None, None, Some(Duration::from_secs(2)), None))
+            .unwrap()
+            .1,
+        Duration::from_secs(2)
+    );
 }
 
 #[test]
@@ -162,6 +179,29 @@ fn parser_rejects_conflicting_or_invalid_case_flags() {
         ],
         vec!["cases", "runs", "list", "ep-1", "--page-size", "101"],
         vec!["cases", "runs", "wait", "run-1", "--interval-ms", "0"],
+        vec!["cases", "runs", "wait", "run-1", "--interval", "50ms"],
+        vec!["cases", "runs", "wait", "run-1", "--interval", "31s"],
+        vec![
+            "cases",
+            "runs",
+            "wait",
+            "run-1",
+            "--timeout",
+            "5 fortnights",
+        ],
+        vec![
+            "cases",
+            "runs",
+            "wait",
+            "run-1",
+            "--interval",
+            "1s",
+            "--interval-ms",
+            "1000",
+        ],
+        vec![
+            "cases", "replay", "case-1", "--target", "cli", "--method", "TRACE",
+        ],
         vec![
             "cases",
             "runs",

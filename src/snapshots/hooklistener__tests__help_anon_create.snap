@@ -1,0 +1,21 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"anon\", \"create\"])"
+---
+Create a temporary anonymous endpoint
+
+Usage: hooklistener anon create [OPTIONS]
+
+Options:
+      --ttl <DURATION>  Endpoint lifetime, such as 3600, 1h, or 24h [default: 24h]
+  -h, --help            Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout

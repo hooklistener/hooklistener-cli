@@ -12,7 +12,8 @@ use crate::api::{
     cases::{CaseSuite, SavedCase, validate_action_key, validate_id},
 };
 use crate::{
-    CaseRunInput, build_case_run_params, config, ensure_valid_token, require_organization,
+    CaseRunInput, HttpMethod, build_case_run_params, config, ensure_valid_token,
+    require_organization, resolve_millis_flag,
 };
 
 #[derive(Subcommand)]
@@ -21,81 +22,78 @@ pub enum CasesAction {
     List(EndpointArgs),
     /// Save a captured request as a case
     Save {
+        /// Debug endpoint ID
         endpoint_id: String,
+        /// Captured request ID
         request_id: String,
         #[command(flatten)]
         options: Box<CaseOptions>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Show a saved case and its assertions
-    Show(ResourceArgs),
+    Show(CaseArgs),
     /// Update a saved case (omitted fields remain unchanged)
     Update {
+        /// Saved case ID
         case_id: String,
         #[command(flatten)]
         options: Box<CaseOptions>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Queue one saved case for delivery by the service or an active CLI listener
     Replay {
+        /// Saved case ID
         case_id: String,
         #[command(flatten)]
         destination: DestinationArgs,
         /// Override the HTTP method for this delivery only
-        #[arg(long)]
-        method: Option<String>,
+        #[arg(long, value_name = "METHOD", ignore_case = true)]
+        method: Option<HttpMethod>,
         /// JSON object of request header overrides for this delivery only
-        #[arg(long)]
+        #[arg(long, value_name = "JSON")]
         headers: Option<String>,
         /// Request body override for this delivery only
-        #[arg(long)]
+        #[arg(long, value_name = "BODY")]
         body: Option<String>,
-        /// Delivery key; reuse with identical inputs to recover a lost receipt (default: UUID)
-        #[arg(long, conflicts_with = "dry_run")]
+        /// Delivery key; reuse with identical inputs to recover a lost receipt [default: new UUID]
+        #[arg(long, value_name = "KEY", conflicts_with = "dry_run")]
         idempotency_key: Option<String>,
         /// Server preview of scope and target policy; queues no delivery
         #[arg(long)]
         dry_run: bool,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Run saved cases for an endpoint
     Run {
+        /// Debug endpoint ID
         endpoint_id: String,
-        /// Target URL (service-side), saved target ID, or "cli" (local listener)
-        #[arg(long, conflicts_with_all = ["target_url", "target_id"])]
-        target: Option<String>,
-        /// Explicit service-side destination URL; use --target cli for local delivery
-        #[arg(long, conflicts_with_all = ["target", "target_id"])]
-        target_url: Option<String>,
-        #[arg(long, conflicts_with_all = ["target", "target_url"])]
-        target_id: Option<String>,
-        /// Optional display name to save for the target
-        #[arg(long)]
+        #[command(flatten)]
+        destination: DestinationArgs,
+        /// Display name recorded for the target
+        #[arg(long, value_name = "NAME")]
         target_name: Option<String>,
-        /// Run only this named suite ID (see cases suites list)
-        #[arg(long, alias = "suite")]
+        /// Run only this named suite (see cases suites list)
+        #[arg(long, alias = "suite", value_name = "SUITE_ID")]
         case_suite_id: Option<String>,
         /// Wait for completion using read-only polling; timeout does not cancel delivery
         #[arg(long, conflicts_with = "dry_run")]
         wait: bool,
-        /// Maximum wait, such as 60s or 2m (default 30s, maximum 1h)
-        #[arg(long, conflicts_with = "timeout_ms")]
-        timeout: Option<String>,
-        #[arg(long, conflicts_with = "timeout")]
-        timeout_ms: Option<u64>,
-        /// Read-only polling interval (100 to 30000 milliseconds)
-        #[arg(long, value_parser = clap::value_parser!(u64).range(100..=30_000))]
-        interval_ms: Option<u64>,
-        /// Delivery key; reuse with identical inputs to recover a lost receipt (default: UUID)
-        #[arg(long, conflicts_with = "dry_run")]
+        #[command(flatten)]
+        wait_options: WaitArgs,
+        /// Delivery key; reuse with identical inputs to recover a lost receipt [default: new UUID]
+        #[arg(long, value_name = "KEY", conflicts_with = "dry_run")]
         idempotency_key: Option<String>,
         /// Server preview of scope and target policy; queues no delivery
         #[arg(long)]
         dry_run: bool,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Discover named suites and their members
@@ -112,40 +110,68 @@ pub enum CasesAction {
 
 #[derive(Args)]
 pub struct EndpointArgs {
+    /// Debug endpoint ID
     pub endpoint_id: String,
-    #[arg(long)]
+    /// Organization ID (overrides the configured default)
+    #[arg(short = 'o', long, value_name = "ORG_ID")]
     pub org: Option<String>,
 }
 
 #[derive(Args)]
-pub struct ResourceArgs {
+pub struct CaseArgs {
+    /// Saved case ID
+    #[arg(value_name = "CASE_ID")]
     pub id: String,
-    #[arg(long)]
+    /// Organization ID (overrides the configured default)
+    #[arg(short = 'o', long, value_name = "ORG_ID")]
+    pub org: Option<String>,
+}
+
+#[derive(Args)]
+pub struct SuiteArgs {
+    /// Case suite ID
+    #[arg(value_name = "SUITE_ID")]
+    pub id: String,
+    /// Organization ID (overrides the configured default)
+    #[arg(short = 'o', long, value_name = "ORG_ID")]
+    pub org: Option<String>,
+}
+
+#[derive(Args)]
+pub struct RunArgs {
+    /// Case run ID
+    #[arg(value_name = "RUN_ID")]
+    pub id: String,
+    /// Organization ID (overrides the configured default)
+    #[arg(short = 'o', long, value_name = "ORG_ID")]
     pub org: Option<String>,
 }
 
 #[derive(Args, Default)]
 pub struct CaseOptions {
-    #[arg(long)]
+    /// Case display name
+    #[arg(long, value_name = "NAME")]
     name: Option<String>,
-    #[arg(long)]
+    /// Free-form notes stored with the case
+    #[arg(long, value_name = "TEXT")]
     notes: Option<String>,
     /// Default service-side replay destination (not a local forwarding URL)
-    #[arg(long)]
+    #[arg(long, value_name = "URL")]
     default_target_url: Option<String>,
-    #[arg(long)]
-    method: Option<String>,
+    /// Default HTTP method for replays
+    #[arg(long, value_name = "METHOD", ignore_case = true)]
+    method: Option<HttpMethod>,
     /// JSON object of default request header overrides
-    #[arg(long)]
+    #[arg(long, value_name = "JSON")]
     headers: Option<String>,
     /// Default request body override
-    #[arg(long)]
+    #[arg(long, value_name = "BODY")]
     body: Option<String>,
-    /// Expected response status, 100 to 599
-    #[arg(long, value_parser = clap::value_parser!(u16).range(100..=599), conflicts_with = "clear_assertions")]
+    /// Expected response status code
+    #[arg(long, value_name = "CODE", value_parser = clap::value_parser!(u16).range(100..=599), conflicts_with = "clear_assertions")]
     expect_status: Option<u16>,
     /// Nonempty JSON object expected as a subset of the response body
-    #[arg(long, conflicts_with = "clear_assertions")]
+    #[arg(long, value_name = "JSON", conflicts_with = "clear_assertions")]
     expect_json: Option<String>,
     /// Remove all assertions; delivery completion will no longer prove a test passed
     #[arg(long)]
@@ -154,45 +180,79 @@ pub struct CaseOptions {
 
 #[derive(Args)]
 pub struct DestinationArgs {
-    /// Service-side URL, saved target ID, or "cli" for an active local listener
-    #[arg(long, conflicts_with_all = ["target_url", "target_id"])]
-    target: Option<String>,
-    #[arg(long, conflicts_with_all = ["target", "target_id"])]
-    target_url: Option<String>,
-    #[arg(long, conflicts_with_all = ["target", "target_url"])]
-    target_id: Option<String>,
+    /// Target: a service-side URL, a saved target ID, or cli for an active listen session
+    #[arg(long, value_name = "TARGET", conflicts_with_all = ["target_url", "target_id"])]
+    pub(crate) target: Option<String>,
+    #[arg(long, hide = true, value_name = "URL", conflicts_with_all = ["target", "target_id"])]
+    pub(crate) target_url: Option<String>,
+    #[arg(long, hide = true, value_name = "TARGET_ID", conflicts_with_all = ["target", "target_url"])]
+    pub(crate) target_id: Option<String>,
 }
+
+#[derive(Args)]
+pub struct WaitArgs {
+    /// Maximum wait, such as 60, 2m, or 1h (up to 1h) [default: 30s]
+    #[arg(long, value_name = "DURATION", value_parser = crate::parse_duration)]
+    pub(crate) timeout: Option<Duration>,
+    #[arg(long, hide = true, value_name = "MS", conflicts_with = "timeout")]
+    pub(crate) timeout_ms: Option<u64>,
+    /// Read-only polling interval, such as 500ms or 2s (100ms to 30s) [default: 250ms]
+    #[arg(long, value_name = "DURATION", value_parser = crate::parse_duration_within(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL))]
+    pub(crate) interval: Option<Duration>,
+    #[arg(long, hide = true, value_name = "MS", conflicts_with = "interval", value_parser = clap::value_parser!(u64).range(100..=30_000))]
+    pub(crate) interval_ms: Option<u64>,
+}
+
+impl WaitArgs {
+    fn is_set(&self) -> bool {
+        self.timeout.is_some()
+            || self.timeout_ms.is_some()
+            || self.interval.is_some()
+            || self.interval_ms.is_some()
+    }
+}
+
+const MIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Subcommand)]
 pub enum SuiteAction {
+    /// List named suites for an endpoint
     List(EndpointArgs),
-    Show(ResourceArgs),
+    /// Show a suite and its member cases
+    Show(SuiteArgs),
 }
 
 #[derive(Subcommand)]
 pub enum RunAction {
+    /// List case runs for an endpoint
     List {
+        /// Debug endpoint ID
         endpoint_id: String,
-        #[arg(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
+        /// Page number
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        #[arg(long, default_value = "20", value_parser = clap::value_parser!(u32).range(1..=100))]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100))]
         page_size: u32,
-        #[arg(long, alias = "suite")]
+        /// Only runs of this named suite
+        #[arg(long, alias = "suite", value_name = "SUITE_ID")]
         case_suite_id: Option<String>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    Show(ResourceArgs),
+    /// Show a case run and its results
+    Show(RunArgs),
     /// Wait for an existing run; never queues another delivery
     Wait {
+        /// Case run ID
+        #[arg(value_name = "RUN_ID")]
         id: String,
-        #[arg(long, conflicts_with = "timeout_ms")]
-        timeout: Option<String>,
-        #[arg(long, conflicts_with = "timeout")]
-        timeout_ms: Option<u64>,
-        #[arg(long, value_parser = clap::value_parser!(u64).range(100..=30_000))]
-        interval_ms: Option<u64>,
-        #[arg(long)]
+        #[command(flatten)]
+        wait_options: WaitArgs,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -204,11 +264,11 @@ impl CasesAction {
             | Self::Suites {
                 action: SuiteAction::List(args),
             } => args.org.clone(),
-            Self::Show(args)
-            | Self::Suites {
+            Self::Show(args) => args.org.clone(),
+            Self::Suites {
                 action: SuiteAction::Show(args),
-            }
-            | Self::Runs {
+            } => args.org.clone(),
+            Self::Runs {
                 action: RunAction::Show(args),
             } => args.org.clone(),
             Self::Save { org, .. }
@@ -241,8 +301,8 @@ impl CaseOptions {
         if let Some(url) = &self.default_target_url {
             validate_destination_url(url)?;
         }
-        if let Some(method) = crate::normalize_http_method(self.method.clone())? {
-            attrs.insert("default_method".into(), json!(method));
+        if let Some(method) = self.method {
+            attrs.insert("default_method".into(), json!(method.as_uppercase()));
         }
         if let Some(headers) = &self.headers {
             attrs.insert("default_request_headers".into(), header_object(headers)?);
@@ -314,19 +374,19 @@ fn validate_target(params: &CaseRunParams) -> Result<()> {
     Ok(())
 }
 
-fn wait_settings(
-    timeout: Option<String>,
-    timeout_ms: Option<u64>,
-    interval_ms: Option<u64>,
-) -> Result<(Duration, Duration)> {
-    let ms = crate::parse_timeout_ms(timeout, timeout_ms)?.unwrap_or(30_000);
+fn wait_settings(options: WaitArgs) -> Result<(Duration, Duration)> {
+    let ms = resolve_millis_flag(options.timeout, options.timeout_ms, "timeout-ms", "timeout")
+        .unwrap_or(30_000);
     if ms > 3_600_000 {
         bail!("Maximum case wait is 1h. Resume with cases runs wait <run-id>.");
     }
-    let interval = interval_ms.unwrap_or(250);
-    if !(100..=30_000).contains(&interval) {
-        bail!("Polling interval must be 100 to 30000 milliseconds.");
-    }
+    let interval = resolve_millis_flag(
+        options.interval,
+        options.interval_ms,
+        "interval-ms",
+        "interval",
+    )
+    .unwrap_or(250);
     Ok((Duration::from_millis(ms), Duration::from_millis(interval)))
 }
 
@@ -464,12 +524,13 @@ async fn execute_with_client(
                 wait: false,
                 timeout: None,
                 timeout_ms: None,
+                interval: None,
                 interval_ms: None,
             })?;
             validate_target(&params)?;
             let mut body_params = serde_json::to_value(&params)?;
-            if let Some(method) = crate::normalize_http_method(method)? {
-                body_params["method"] = json!(method);
+            if let Some(method) = method {
+                body_params["method"] = json!(method.as_uppercase());
             }
             if let Some(headers) = headers {
                 body_params["request_headers"] = header_object(&headers)?;
@@ -501,7 +562,7 @@ async fn execute_with_client(
                         );
                         field(
                             "INSPECT",
-                            &format!("hooklistener endpoint forward {}", replay.forward_id),
+                            &format!("hooklistener endpoint show-forward {}", replay.forward_id),
                         );
                     },
                 )?;
@@ -511,31 +572,28 @@ async fn execute_with_client(
         }
         CasesAction::Run {
             endpoint_id,
-            target,
-            target_url,
-            target_id,
+            destination,
             target_name,
             case_suite_id,
             wait,
-            timeout,
-            timeout_ms,
-            interval_ms,
+            wait_options,
             idempotency_key,
             dry_run,
             ..
         } => {
-            let settings = wait_settings(timeout.clone(), timeout_ms, interval_ms)?;
-            if !wait && (timeout.is_some() || timeout_ms.is_some() || interval_ms.is_some()) {
+            if !wait && wait_options.is_set() {
                 bail!("Wait options require --wait.");
             }
+            let settings = wait_settings(wait_options)?;
             let mut params = build_case_run_params(CaseRunInput {
-                target,
-                target_url,
-                target_id,
+                target: destination.target,
+                target_url: destination.target_url,
+                target_id: destination.target_id,
                 target_name,
                 wait: false,
                 timeout: None,
                 timeout_ms: None,
+                interval: None,
                 interval_ms: None,
             })?;
             params.case_suite_id = case_suite_id;
@@ -631,13 +689,9 @@ async fn execute_with_client(
                 return emit_run(&client.get_case_run(&args.id).await?, org, json_output);
             }
             RunAction::Wait {
-                id,
-                timeout,
-                timeout_ms,
-                interval_ms,
-                ..
+                id, wait_options, ..
             } => {
-                let (duration, interval) = wait_settings(timeout, timeout_ms, interval_ms)?;
+                let (duration, interval) = wait_settings(wait_options)?;
                 let started = Instant::now();
                 // Initial GET also consumes the wait budget; an API timeout is not a test result.
                 let fetch_budget = if duration.is_zero() {

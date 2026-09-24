@@ -137,8 +137,8 @@ async fn wait_resumes_observing_a_server_timed_out_run_with_pending_deliveries()
             "run-1",
             "--timeout",
             "3s",
-            "--interval-ms",
-            "100",
+            "--interval",
+            "100ms",
             "--json",
         ],
     );
@@ -332,8 +332,8 @@ async fn suite_discovery_and_selection_queue_once_then_poll_existing_run() {
             "--wait",
             "--timeout",
             "3s",
-            "--interval-ms",
-            "100",
+            "--interval",
+            "100ms",
             "--json",
         ],
     );

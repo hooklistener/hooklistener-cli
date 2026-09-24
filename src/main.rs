@@ -51,63 +51,103 @@ use tunnel::TunnelEvent;
 
 #[derive(Parser)]
 #[command(name = "hooklistener")]
-#[command(about = "A CLI tool for debugging webhooks")]
+#[command(about = "Inspect webhooks, replay failures, and expose localhost from your terminal")]
 #[command(version)]
 #[command(
-    after_help = "COMMAND GROUPS:\n  Capture and delivery: listen, tunnel, endpoint, static-tunnel, anon\n  Review and automation: cases, share, monitor\n  Account and settings: login, logout, org, config\n  Maintenance: diagnostics, clean-logs, completions, update\n\nCOMMON WORKFLOWS:\n  Inspect an existing debug endpoint:\n    hooklistener listen <endpoint> --target http://localhost:3000\n\n  Expose a local HTTP server:\n    hooklistener tunnel --port 3000\n\n  Create and inspect hosted captures:\n    hooklistener endpoint create <name>\n    hooklistener endpoint requests <endpoint-id>"
+    after_help = "COMMAND GROUPS:\n  Capture and delivery: listen, tunnel, endpoint, static-tunnel, anon\n  Review and automation: cases, share, monitor\n  Account and settings: login, logout, org, config\n  Maintenance: diagnostics, clean-logs, completions, update\n\nCOMMON WORKFLOWS:\n  Sign in:\n    hooklistener login\n\n  Forward an existing debug endpoint:\n    hooklistener listen <endpoint-slug> --target http://localhost:3000\n\n  Expose a local HTTP server:\n    hooklistener tunnel --port 3000\n\n  Create and inspect hosted captures:\n    hooklistener endpoint create <name>\n    hooklistener endpoint list-requests <endpoint-id>"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
     /// Output supported command responses or event streams as JSON
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     json: bool,
 
     /// Styling policy for human output
-    #[arg(long, global = true, value_enum, default_value_t)]
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t,
+        help_heading = "Global options"
+    )]
     color: ColorMode,
 
     /// Confirm destructive commands without an interactive prompt
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     yes: bool,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info", value_parser = validate_log_level)]
-    log_level: String,
+    /// Log level
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        ignore_case = true,
+        default_value_t = LogLevel::Info,
+        value_name = "LEVEL",
+        help_heading = "Global options"
+    )]
+    log_level: LogLevel,
 
-    /// Custom directory for log files
-    #[arg(long)]
+    /// Directory for log files
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        help_heading = "Global options"
+    )]
     log_dir: Option<PathBuf>,
 
-    /// Output logs to stdout in addition to files (for debugging)
-    #[arg(long)]
+    /// Also write logs to stdout
+    #[arg(long, global = true, help_heading = "Global options")]
     log_stdout: bool,
 
     /// Allow a non-loopback cleartext Hooklistener server (development only)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     allow_insecure_dev_server: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authenticate with Hooklistener via the device flow
-    Login {
-        /// Start a new authentication even if a valid token already exists
-        #[arg(long)]
-        force: bool,
-    },
-    /// Connect an existing debug endpoint and forward its WebSocket events
+    /// Forward events from a debug endpoint to a local URL
     Listen {
-        /// Debug endpoint slug to listen to
-        endpoint: String,
+        /// Debug endpoint slug (from `endpoint list`)
+        endpoint_slug: String,
 
         /// Local URL to forward requests to
-        #[arg(short, long, default_value = "http://localhost:3000")]
+        #[arg(
+            short,
+            long,
+            value_name = "URL",
+            default_value = "http://localhost:3000"
+        )]
         target: String,
 
         /// WebSocket server URL; requires wss except for approved development use
-        #[arg(long, value_name = "WSS_URL")]
+        #[arg(long, value_name = "URL")]
         ws_url: Option<String>,
 
         /// Allow forwarding to a target that resolves outside loopback
@@ -118,69 +158,10 @@ enum Commands {
         #[arg(long)]
         insecure_tls: bool,
     },
-    /// Generate a diagnostic bundle for support
-    Diagnostics {
-        /// Output directory for the diagnostic bundle
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
-    },
-    /// Clean up old log files
-    CleanLogs {
-        /// Maximum number of log files to keep
-        #[arg(short, long, default_value = "10")]
-        keep: usize,
-    },
-    /// Manage CLI configuration
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
-    /// Sign out and clear locally stored token
-    Logout,
-    /// Organization helpers
-    Org {
-        #[command(subcommand)]
-        action: OrgAction,
-    },
-    /// Debug endpoint helpers
-    Endpoint {
-        #[command(subcommand)]
-        action: EndpointAction,
-    },
-    /// Saved endpoint case helpers
-    Cases {
-        #[command(subcommand)]
-        action: CasesAction,
-    },
-    /// Static tunnel slug management
-    StaticTunnel {
-        #[command(subcommand)]
-        action: StaticTunnelAction,
-    },
-    /// Anonymous temporary debug endpoints (no login required)
-    Anon {
-        #[command(subcommand)]
-        action: AnonAction,
-    },
-    /// Share captured requests via public links
-    Share {
-        #[command(subcommand)]
-        action: ShareAction,
-    },
-    /// Uptime monitoring for your endpoints
-    Monitor {
-        #[command(subcommand)]
-        action: MonitorAction,
-    },
-    /// Generate shell completion scripts
-    Completions {
-        /// Target shell
-        #[arg(value_enum)]
-        shell: CompletionShell,
-    },
-    /// Update hooklistener to the latest version
-    Update,
     /// Expose a local HTTP server on a public Hooklistener URL
+    #[command(
+        after_help = "TARGET FLAGS:\n  Flags given before a subcommand set defaults; the same flag on the subcommand overrides them.\n  hooklistener tunnel --port 3000          same as: hooklistener tunnel start --port 3000"
+    )]
     Tunnel {
         #[command(subcommand)]
         action: Option<TunnelAction>,
@@ -188,31 +169,102 @@ enum Commands {
         #[command(flatten)]
         target: TunnelTargetArgs,
     },
+    /// Manage debug endpoints and their captured requests
+    Endpoint {
+        #[command(subcommand)]
+        action: EndpointAction,
+    },
+    /// Reserve and manage static tunnel slugs
+    StaticTunnel {
+        #[command(subcommand)]
+        action: StaticTunnelAction,
+    },
+    /// Create temporary endpoints and tunnels (no login required)
+    Anon {
+        #[command(subcommand)]
+        action: AnonAction,
+    },
+    /// Save captured requests as cases, then replay or run them against a target
+    Cases {
+        #[command(subcommand)]
+        action: CasesAction,
+    },
+    /// Create, inspect, and revoke public links to captured requests
+    Share {
+        #[command(subcommand)]
+        action: ShareAction,
+    },
+    /// Create and inspect uptime monitors
+    Monitor {
+        #[command(subcommand)]
+        action: MonitorAction,
+    },
+    /// Sign in with the device flow
+    Login {
+        /// Start a new sign-in even if a valid token exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sign out and delete the stored token
+    Logout,
+    /// List organizations and set the default one
+    Org {
+        #[command(subcommand)]
+        action: OrgAction,
+    },
+    /// Show and set CLI configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Write a diagnostic bundle for support
+    Diagnostics {
+        /// Directory for the diagnostic bundle
+        #[arg(short, long, value_name = "DIR", default_value = ".")]
+        output: PathBuf,
+    },
+    /// Delete old log files
+    CleanLogs {
+        /// Number of log files to keep
+        #[arg(short, long, value_name = "N", default_value = "10")]
+        keep: usize,
+    },
+    /// Print a shell completion script
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum, ignore_case = true, value_name = "SHELL")]
+        shell: CompletionShell,
+    },
+    /// Update hooklistener to the latest release
+    Update,
 }
 
 #[derive(Args, Clone, Default)]
 struct TunnelTargetArgs {
-    /// Local port to forward requests to (default: 3000)
+    // `port` and `host` stay `Option` so `merge()` can distinguish "not given"
+    // from "given the default"; the default is written into the doc comment
+    // in clap's own `[default: ...]` rendering style.
+    /// Local port to forward requests to [default: 3000]
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Local host to forward to (default: localhost)
+    /// Local host to forward to [default: localhost]
     #[arg(long)]
     host: Option<String>,
 
-    /// Organization ID override (falls back to configured default)
-    #[arg(short, long)]
+    /// Organization ID (overrides the configured default)
+    #[arg(short = 'o', long, value_name = "ORG_ID")]
     org: Option<String>,
 
-    /// Static tunnel slug (paid plans only, creates persistent subdomain)
+    /// Static tunnel slug to attach (from `static-tunnel create`)
     #[arg(short, long)]
     slug: Option<String>,
 
-    /// Allow forwarding to a host that resolves outside loopback
+    /// Allow a host that resolves outside loopback
     #[arg(long)]
     allow_non_loopback: bool,
 
-    /// Do not automatically replay requests buffered while the tunnel was offline
+    /// Do not replay requests buffered while the tunnel was offline
     #[arg(long)]
     no_replay_buffered: bool,
 }
@@ -253,70 +305,98 @@ struct TunnelTarget {
 
 #[derive(Subcommand)]
 enum TunnelAction {
-    /// Validate authentication, schema compatibility, and the activation plan
+    /// Validate authentication, schema compatibility, and the activation plan without connecting
     Prepare(TunnelTargetArgs),
-    /// Activate a relay and keep it attached to the local target
-    Activate(TunnelTargetArgs),
-    /// Prepare and activate a relay (the default tunnel behavior)
+    /// Prepare and activate a relay (the default when no subcommand is given)
+    #[command(alias = "activate")]
     Start(TunnelTargetArgs),
-    /// List cloud-authoritative tunnel sessions
+    /// List tunnel sessions
     List {
-        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
+        /// Maximum number of sessions to return
+        #[arg(long, value_name = "N", default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
-        #[arg(long)]
+        /// Only sessions in this status, such as active or stopped
+        #[arg(long, value_name = "STATUS")]
         status: Option<String>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Read a tunnel session by canonical ID
+    /// Show a tunnel session
     Status {
+        /// Tunnel session ID (from `tunnel list`)
+        #[arg(value_name = "SESSION_ID")]
         session_id: String,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Read ordered lifecycle events, optionally following from a cursor
+    /// List lifecycle events, optionally following new ones
     Events {
-        #[arg(long)]
+        /// Resume after this cursor from an earlier events receipt
+        #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
-        #[arg(long, default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
+        /// Maximum number of events per page
+        #[arg(long, value_name = "N", default_value = "50", value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
-        #[arg(long)]
+        /// Only events for this capture
+        #[arg(long, value_name = "CAPTURE_ID")]
         capture_id: Option<String>,
-        #[arg(long)]
+        /// Only events for this delivery attempt
+        #[arg(long, value_name = "ATTEMPT_ID")]
         attempt_id: Option<String>,
+        /// Keep polling for new events until interrupted
         #[arg(long)]
         follow: bool,
-        #[arg(long, default_value = "1000")]
-        interval_ms: u64,
-        #[arg(long)]
+        /// Poll interval for --follow, such as 500ms, 1s, or 5s
+        #[arg(long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration)]
+        interval: Duration,
+        #[arg(long, hide = true, value_name = "MS", conflicts_with = "interval")]
+        interval_ms: Option<u64>,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Read a redacted capture projection by canonical ID
+    /// Show a redacted capture
     Capture {
+        /// Capture ID (from `tunnel events`)
+        #[arg(value_name = "CAPTURE_ID")]
         capture_id: String,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Read a delivery attempt by canonical ID
+    /// Show a delivery attempt
     Attempt {
+        /// Delivery attempt ID (from `tunnel events`)
+        #[arg(value_name = "ATTEMPT_ID")]
         attempt_id: String,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Stop a tunnel session even when its original CLI process is gone
+    /// Stop a tunnel session, even if its CLI process is gone
     Stop {
+        /// Tunnel session ID (from `tunnel list`)
+        #[arg(value_name = "SESSION_ID")]
         session_id: String,
-        #[arg(long)]
+        /// Reason recorded in the session's lifecycle events
+        #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Detach the current owner while preserving the route for recovery
+    /// Detach the current owner and keep the route for recovery
     Detach {
+        /// Tunnel session ID (from `tunnel list`)
+        #[arg(value_name = "SESSION_ID")]
         session_id: String,
-        #[arg(long)]
+        /// Reason recorded in the session's lifecycle events
+        #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -326,31 +406,72 @@ enum CompletionShell {
     Bash,
     Zsh,
     Fish,
+    #[value(name = "powershell", alias = "power-shell")]
     PowerShell,
     Elvish,
 }
 
+/// Generate the completion script for `shell` into `out`.
+///
+/// The script is rendered into memory first so that a single `write_all`
+/// carries it to `out`; a closed pipe then surfaces as one `io::Error`
+/// instead of a panic inside `clap_complete`.
+fn write_completions(shell: CompletionShell, out: &mut dyn io::Write) -> io::Result<()> {
+    use clap_complete::generate;
+    use clap_complete::shells::{Bash, Elvish, Fish, PowerShell, Zsh};
+
+    let mut command = Cli::command();
+    let bin_name = command.get_name().to_string();
+    let mut buf: Vec<u8> = Vec::new();
+
+    match shell {
+        CompletionShell::Bash => generate(Bash, &mut command, bin_name, &mut buf),
+        CompletionShell::Zsh => generate(Zsh, &mut command, bin_name, &mut buf),
+        CompletionShell::Fish => generate(Fish, &mut command, bin_name, &mut buf),
+        CompletionShell::PowerShell => generate(PowerShell, &mut command, bin_name, &mut buf),
+        CompletionShell::Elvish => generate(Elvish, &mut command, bin_name, &mut buf),
+    }
+
+    out.write_all(&buf).and_then(|_| out.flush())
+}
+
+/// Write the completion script for `shell` to `out`, treating a closed pipe
+/// (for example `completions bash | head -1`) as success.
+fn print_completions(shell: CompletionShell, out: &mut dyn io::Write) -> io::Result<()> {
+    match write_completions(shell, out) {
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Display current configuration
+    /// Show the current configuration
     Show,
     /// Set a configuration value
     Set {
-        /// Configuration key (selected_organization_id)
-        key: String,
+        /// Configuration key
+        #[arg(value_enum)]
+        key: ConfigKey,
         /// New value
         value: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConfigKey {
+    #[value(name = "selected_organization_id")]
+    SelectedOrganizationId,
 }
 
 #[derive(Subcommand)]
 enum OrgAction {
     /// List organizations available to your account
     List,
-    /// Set the default organization used by CLI commands
+    /// Set the default organization
     Use {
-        /// Organization ID
-        id: String,
+        /// Organization ID (from `org list`)
+        org_id: String,
     },
     /// Clear the default organization
     Clear,
@@ -362,109 +483,114 @@ enum EndpointAction {
     Create {
         /// Endpoint display name
         name: String,
-        /// Optional custom slug
+        /// Custom slug
         #[arg(long)]
         slug: Option<String>,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// List debug endpoints for an organization
     List {
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Show a single debug endpoint by ID
     Show {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Delete a debug endpoint by ID
     Delete {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// List captured requests for an endpoint
-    Requests {
+    #[command(name = "list-requests", visible_alias = "requests")]
+    ListRequests {
         /// Debug endpoint ID
         endpoint_id: String,
         /// Page number
-        #[arg(long, default_value = "1")]
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        /// Page size
-        #[arg(long, default_value = "50")]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Show a single captured request
-    Request {
+    /// Show a captured request
+    #[command(name = "show-request", visible_alias = "request")]
+    ShowRequest {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Debug request ID
+        /// Captured request ID
         request_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Delete a captured request
     DeleteRequest {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Debug request ID
+        /// Captured request ID
         request_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Replay a captured request to a target URL
     ForwardRequest {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Debug request ID
+        /// Captured request ID
         request_id: String,
-        /// Target URL to replay to
+        /// URL to replay the request to
+        #[arg(value_name = "URL")]
         target_url: String,
-        /// Optional HTTP method override (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)
-        #[arg(long)]
-        method: Option<String>,
+        /// HTTP method override
+        #[arg(long, value_enum, ignore_case = true)]
+        method: Option<HttpMethod>,
         /// Validate scope and print the forward plan without queueing delivery
         #[arg(long)]
         dry_run: bool,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// List forwards created from a captured request
-    Forwards {
+    /// List forwards of a captured request
+    #[command(name = "list-forwards", visible_alias = "forwards")]
+    ListForwards {
         /// Debug endpoint ID
         endpoint_id: String,
-        /// Debug request ID
+        /// Captured request ID
         request_id: String,
         /// Page number
-        #[arg(long, default_value = "1")]
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        /// Page size
-        #[arg(long, default_value = "50")]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Show a single forward attempt by ID
-    Forward {
+    /// Show a forward by ID
+    #[command(name = "show-forward", visible_alias = "forward")]
+    ShowForward {
         /// Forward ID
         forward_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
@@ -473,66 +599,68 @@ enum EndpointAction {
 enum StaticTunnelAction {
     /// List reserved static tunnel slugs
     List {
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Create a new static tunnel slug
+    /// Reserve a static tunnel slug
     Create {
         /// Slug to reserve
         slug: String,
-        /// Optional display name
+        /// Display name
         #[arg(long)]
         name: Option<String>,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Delete a static tunnel slug by ID
+    /// Release a static tunnel slug
     Delete {
-        /// Static tunnel ID
-        slug_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Static tunnel ID (from `static-tunnel list`)
+        static_tunnel_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum AnonAction {
-    /// Create a temporary anonymous endpoint (no login required)
+    /// Create a temporary anonymous endpoint
     Create {
-        /// Time-to-live in seconds (default: 86400 = 24 hours)
-        #[arg(long)]
-        ttl: Option<u64>,
+        /// Endpoint lifetime, such as 3600, 1h, or 24h
+        #[arg(long, value_name = "DURATION", default_value = "24h", value_parser = parse_duration)]
+        ttl: Duration,
     },
-    /// Show status of an anonymous endpoint
+    /// Show an anonymous endpoint
     Show {
-        /// Anonymous endpoint ID
-        id: String,
+        /// Anonymous endpoint ID (from `anon create`)
+        endpoint_id: String,
     },
     /// List captured events for an anonymous endpoint
-    Events {
-        /// Anonymous endpoint ID
+    #[command(name = "list-events", visible_alias = "events")]
+    ListEvents {
+        /// Anonymous endpoint ID (from `anon create`)
         endpoint_id: String,
-        /// Viewer token (returned when the endpoint was created)
-        #[arg(long)]
+        /// Viewer token (from `anon create`)
+        #[arg(long, value_name = "VIEWER_TOKEN")]
         token: String,
         /// Page number
-        #[arg(long, default_value = "1")]
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        /// Page size
-        #[arg(long, default_value = "50")]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
     },
-    /// Show a single captured event
-    Event {
-        /// Anonymous endpoint ID
+    /// Show a captured event
+    #[command(name = "show-event", visible_alias = "event")]
+    ShowEvent {
+        /// Anonymous endpoint ID (from `anon create`)
         endpoint_id: String,
-        /// Event ID
+        /// Event ID (from `anon events`)
         event_id: String,
-        /// Viewer token (returned when the endpoint was created)
-        #[arg(long)]
+        /// Viewer token (from `anon create`)
+        #[arg(long, value_name = "VIEWER_TOKEN")]
         token: String,
     },
     /// Expose a local HTTP server without signing in
@@ -543,125 +671,140 @@ enum AnonAction {
         /// Local host to forward to
         #[arg(long, default_value = "localhost")]
         host: String,
-        /// Optional stable public route name
+        /// Stable public route name
         #[arg(long)]
         name: Option<String>,
-        /// Route lifetime in seconds
-        #[arg(long, default_value = "900", value_parser = clap::value_parser!(u64).range(60..=1800))]
-        ttl: u64,
+        /// Route lifetime, such as 300, 10m, or 30m
+        #[arg(
+            long,
+            value_name = "DURATION",
+            default_value = "15m",
+            value_parser = parse_duration_within(Duration::from_secs(60), Duration::from_secs(1800))
+        )]
+        ttl: Duration,
         /// Allow forwarding to a host that resolves outside loopback
         #[arg(long)]
         allow_non_loopback: bool,
     },
-    /// Claim an anonymous route into an authenticated organization
+    /// Claim an anonymous route into an organization
     Claim {
+        /// Anonymous route ID (from `anon tunnel`)
+        #[arg(value_name = "ROUTE_ID")]
         route_id: String,
-        #[arg(long)]
+        /// Claim token (from `anon tunnel`)
+        #[arg(long, value_name = "CLAIM_TOKEN")]
         token: String,
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum ShareAction {
-    /// Create a shareable link for a captured request
+    /// Create a public link for a captured request
     Create {
-        /// Debug request ID to share
-        debug_request_id: String,
-        /// Expiration in hours (e.g. 24)
-        #[arg(long)]
+        /// Captured request ID (from `endpoint list-requests`)
+        request_id: String,
+        /// Link lifetime in whole hours, such as 24h, 86400, or 7d
+        #[arg(long, value_name = "DURATION", value_parser = parse_whole_hours)]
+        expires_in: Option<Duration>,
+        #[arg(long, hide = true, value_name = "HOURS", conflicts_with = "expires_in")]
         expires_in_hours: Option<u64>,
-        /// Optional password to protect the share
+        /// Password required to open the link
         #[arg(long)]
         password: Option<String>,
         /// Include forwards in the shared view
         #[arg(long)]
         include_forwards: bool,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// List all shares for a captured request
+    /// List links for a captured request
     List {
-        /// Debug request ID
-        debug_request_id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Captured request ID (from `endpoint list-requests`)
+        request_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// View a shared request by its share token (public, no login required)
+    /// Show a shared request by token (no login required)
     Show {
-        /// Share token
-        token: String,
+        /// Share token (from `share create`)
+        share_token: String,
     },
-    /// Revoke a shared request link
+    /// Revoke a public link
     Revoke {
-        /// Share token to revoke
-        token: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Share token (from `share create`)
+        share_token: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum MonitorAction {
-    /// Create a new uptime monitor
+    /// Create an uptime monitor
     Create {
         /// Monitor display name
         name: String,
-        /// URL to monitor (must be http:// or https://)
+        /// URL to check (http:// or https://)
         url: String,
-        /// HTTP method (get, post, put, patch, delete, head)
-        #[arg(long, default_value = "get")]
-        method: String,
+        /// HTTP method
+        #[arg(long, value_enum, ignore_case = true, default_value_t = MonitorMethod::Get)]
+        method: MonitorMethod,
         /// Expected HTTP status code
-        #[arg(long, default_value = "200")]
+        #[arg(long, value_name = "CODE", default_value_t = 200, value_parser = clap::value_parser!(u16).range(100..=599))]
         expected_status: u16,
-        /// Check interval in minutes (1, 5, 10, 30, 60)
-        #[arg(long, default_value = "5")]
-        interval: u32,
-        /// String the response body must contain
-        #[arg(long)]
+        /// Check interval
+        #[arg(long, value_enum, default_value = "5m", ignore_case = true)]
+        interval: MonitorInterval,
+        /// Text the response body must contain
+        #[arg(long, value_name = "TEXT")]
         body_contains: Option<String>,
-        /// Request body to send (for POST/PUT/PATCH)
+        /// Request body to send with POST, PUT, or PATCH
         #[arg(long)]
         body: Option<String>,
-        /// Number of consecutive failures before alerting
-        #[arg(long, default_value = "2")]
+        /// Consecutive failures before alerting
+        #[arg(long, value_name = "N", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
         failure_threshold: u32,
-        /// Enable or disable email notifications (true or false)
+        /// Disable email notifications for this monitor
+        #[arg(long, conflicts_with = "email")]
+        no_email: bool,
         #[arg(
             long,
+            hide = true,
             default_value_t = true,
             action = ArgAction::Set,
             num_args = 0..=1,
-            default_missing_value = "true"
+            default_missing_value = "true",
+            conflicts_with = "no_email"
         )]
         email: bool,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// List all uptime monitors
+    /// List uptime monitors
     List {
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Show details of an uptime monitor
+    /// Show an uptime monitor
     Show {
-        /// Monitor ID
-        id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Monitor ID (from `monitor list`)
+        monitor_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Update an uptime monitor
     Update {
-        /// Monitor ID
-        id: String,
+        /// Monitor ID (from `monitor list`)
+        monitor_id: String,
         /// New name
         #[arg(long)]
         name: Option<String>,
@@ -669,92 +812,164 @@ enum MonitorAction {
         #[arg(long)]
         url: Option<String>,
         /// HTTP method
-        #[arg(long)]
-        method: Option<String>,
+        #[arg(long, value_enum, ignore_case = true)]
+        method: Option<MonitorMethod>,
         /// Expected HTTP status code
-        #[arg(long)]
+        #[arg(long, value_name = "CODE", value_parser = clap::value_parser!(u16).range(100..=599))]
         expected_status: Option<u16>,
-        /// Check interval in minutes (1, 5, 10, 30, 60)
-        #[arg(long)]
-        interval: Option<u32>,
-        /// Enable or disable the monitor
-        #[arg(long)]
+        /// Check interval
+        #[arg(long, value_enum, ignore_case = true)]
+        interval: Option<MonitorInterval>,
+        /// Resume checks for this monitor
+        #[arg(long, conflicts_with_all = ["disable", "enabled"])]
+        enable: bool,
+        /// Pause checks for this monitor
+        #[arg(long, conflicts_with_all = ["enable", "enabled"])]
+        disable: bool,
+        #[arg(long, hide = true, value_name = "BOOL")]
         enabled: Option<bool>,
-        /// Number of consecutive failures before alerting
-        #[arg(long)]
+        /// Consecutive failures before alerting
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         failure_threshold: Option<u32>,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
     /// Delete an uptime monitor
     Delete {
-        /// Monitor ID
-        id: String,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Monitor ID (from `monitor list`)
+        monitor_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
-    /// Show recent check history for a monitor
+    /// List recent checks for a monitor
     Checks {
-        /// Monitor ID
-        id: String,
+        /// Monitor ID (from `monitor list`)
+        monitor_id: String,
         /// Page number
-        #[arg(long, default_value = "1")]
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         page: u32,
-        /// Page size
-        #[arg(long, default_value = "50")]
+        /// Results per page
+        #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         page_size: u32,
-        /// Organization ID override (falls back to configured default)
-        #[arg(long)]
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
     },
 }
 
-fn validate_log_level(s: &str) -> Result<String, String> {
-    match s.to_lowercase().as_str() {
-        "trace" | "debug" | "info" | "warn" | "error" => Ok(s.to_string()),
-        _ => Err(format!(
-            "Invalid log level: {}. Valid levels are: trace, debug, info, warn, error",
-            s
-        )),
+/// HTTP method for `endpoint forward-request` (sent uppercase on the wire).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum HttpMethod {
+    #[value(name = "GET")]
+    Get,
+    #[value(name = "POST")]
+    Post,
+    #[value(name = "PUT")]
+    Put,
+    #[value(name = "PATCH")]
+    Patch,
+    #[value(name = "DELETE")]
+    Delete,
+    #[value(name = "HEAD")]
+    Head,
+    #[value(name = "OPTIONS")]
+    Options,
+}
+
+impl HttpMethod {
+    fn as_uppercase(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+        }
     }
 }
 
-fn normalize_http_method(method: Option<String>) -> Result<Option<String>> {
-    let Some(method) = method else {
-        return Ok(None);
-    };
-
-    let normalized = method.trim().to_ascii_uppercase();
-    let valid = matches!(
-        normalized.as_str(),
-        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
-    );
-
-    if !valid {
-        return Err(anyhow!(
-            "Invalid HTTP method '{}'. Valid values: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS",
-            method
-        ));
-    }
-
-    Ok(Some(normalized))
+/// HTTP method for uptime monitors (sent lowercase on the wire; no OPTIONS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum MonitorMethod {
+    #[value(name = "GET")]
+    Get,
+    #[value(name = "POST")]
+    Post,
+    #[value(name = "PUT")]
+    Put,
+    #[value(name = "PATCH")]
+    Patch,
+    #[value(name = "DELETE")]
+    Delete,
+    #[value(name = "HEAD")]
+    Head,
 }
 
-fn parse_timeout_ms(timeout: Option<String>, timeout_ms: Option<u64>) -> Result<Option<u64>> {
-    match (timeout, timeout_ms) {
-        (Some(_), Some(_)) => Err(anyhow!("Use either --timeout or --timeout-ms, not both.")),
-        (None, None) => Ok(None),
-        (None, Some(ms)) => Ok(Some(ms)),
-        (Some(raw), None) => parse_duration_to_ms(&raw).map(Some),
+impl MonitorMethod {
+    fn as_lowercase(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Post => "post",
+            Self::Put => "put",
+            Self::Patch => "patch",
+            Self::Delete => "delete",
+            Self::Head => "head",
+        }
     }
 }
 
-fn parse_duration_to_ms(raw: &str) -> Result<u64> {
+// Required by `default_value_t`; renders the help default as `[default: GET]`.
+impl std::fmt::Display for MonitorMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.to_possible_value().unwrap().get_name())
+    }
+}
+
+/// Check interval accepted by the monitor API, in minutes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum MonitorInterval {
+    #[value(name = "1m", alias = "1")]
+    M1,
+    #[value(name = "5m", alias = "5")]
+    M5,
+    #[value(name = "10m", alias = "10")]
+    M10,
+    #[value(name = "30m", alias = "30")]
+    M30,
+    #[value(name = "60m", alias = "60", alias = "1h")]
+    M60,
+}
+
+impl MonitorInterval {
+    /// Wire value for `check_interval`.
+    fn minutes(self) -> u32 {
+        match self {
+            MonitorInterval::M1 => 1,
+            MonitorInterval::M5 => 5,
+            MonitorInterval::M10 => 10,
+            MonitorInterval::M30 => 30,
+            MonitorInterval::M60 => 60,
+        }
+    }
+}
+
+const MILLIS_PER_SECOND: u64 = 1_000;
+const MILLIS_PER_MINUTE: u64 = 60 * MILLIS_PER_SECOND;
+const MILLIS_PER_HOUR: u64 = 60 * MILLIS_PER_MINUTE;
+const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
+
+/// Parses a duration such as `60`, `1500ms`, `2m`, `1h`, or `7d`.
+///
+/// A bare integer is seconds. Unit names are case-insensitive and may be
+/// separated from the number by whitespace.
+fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
     let value = raw.trim();
     if value.is_empty() {
-        return Err(anyhow!("Timeout cannot be empty."));
+        return Err("Duration cannot be empty.".to_string());
     }
 
     let split_at = value
@@ -762,24 +977,109 @@ fn parse_duration_to_ms(raw: &str) -> Result<u64> {
         .unwrap_or(value.len());
     let (number, unit) = value.split_at(split_at);
     if number.is_empty() {
-        return Err(anyhow!("Timeout must start with a number."));
+        return Err("Duration must start with a number.".to_string());
     }
-    let amount: u64 = number.parse()?;
-    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| "Duration is too large.".to_string())?;
+    let millis_per_unit = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => MILLIS_PER_SECOND,
         "ms" | "millisecond" | "milliseconds" => 1,
-        "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
-        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+        "m" | "min" | "mins" | "minute" | "minutes" => MILLIS_PER_MINUTE,
+        "h" | "hr" | "hrs" | "hour" | "hours" => MILLIS_PER_HOUR,
+        "d" | "day" | "days" => MILLIS_PER_DAY,
         other => {
-            return Err(anyhow!(
-                "Invalid timeout unit '{}'. Use ms, s, m, or h.",
-                other
+            return Err(format!(
+                "Invalid duration unit '{other}'. Use ms, s, m, h, or d."
             ));
         }
     };
     amount
-        .checked_mul(multiplier)
-        .ok_or_else(|| anyhow!("Timeout is too large."))
+        .checked_mul(millis_per_unit)
+        .map(Duration::from_millis)
+        .ok_or_else(|| "Duration is too large.".to_string())
+}
+
+/// Value parser for a duration flag that must fall within `min..=max`.
+fn parse_duration_within(
+    min: Duration,
+    max: Duration,
+) -> impl clap::builder::TypedValueParser<Value = Duration> {
+    move |raw: &str| -> std::result::Result<Duration, String> {
+        let duration = parse_duration(raw)?;
+        if duration < min || duration > max {
+            return Err(format!(
+                "must be between {} and {}",
+                format_duration(min),
+                format_duration(max)
+            ));
+        }
+        Ok(duration)
+    }
+}
+
+/// Value parser for a duration flag whose API field counts whole hours.
+fn parse_whole_hours(raw: &str) -> std::result::Result<Duration, String> {
+    let duration = parse_duration(raw)?;
+    let millis = duration_millis(duration);
+    if millis == 0 || !millis.is_multiple_of(MILLIS_PER_HOUR) {
+        return Err("must be a whole number of hours, such as 24h, 86400, or 7d".to_string());
+    }
+    Ok(duration)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duration_hours(duration: Duration) -> u64 {
+    duration.as_secs() / (MILLIS_PER_HOUR / MILLIS_PER_SECOND)
+}
+
+/// Renders a duration in the largest unit that expresses it exactly.
+fn format_duration(duration: Duration) -> String {
+    let millis = duration_millis(duration);
+    if millis == 0 {
+        return "0s".to_string();
+    }
+    for (unit, per_unit) in [
+        ("d", MILLIS_PER_DAY),
+        ("h", MILLIS_PER_HOUR),
+        ("m", MILLIS_PER_MINUTE),
+        ("s", MILLIS_PER_SECOND),
+    ] {
+        if millis.is_multiple_of(per_unit) {
+            return format!("{}{unit}", millis / per_unit);
+        }
+    }
+    format!("{millis}ms")
+}
+
+/// Prints the single stderr notice for a hidden compatibility flag.
+fn warn_deprecated_flag(old: &str, new: &str, example: &str) {
+    eprintln!("warning: --{old} is deprecated; use --{new} {example}");
+}
+
+/// Resolves a canonical duration flag against its hidden `--<flag>-ms` twin.
+///
+/// The hidden flag wins when given (clap already rejects supplying both
+/// explicitly; a defaulted canonical flag must not mask it) and prints a
+/// deprecation notice.
+fn resolve_millis_flag(
+    duration: Option<Duration>,
+    legacy_ms: Option<u64>,
+    old_flag: &str,
+    new_flag: &str,
+) -> Option<u64> {
+    if let Some(ms) = legacy_ms {
+        warn_deprecated_flag(
+            old_flag,
+            new_flag,
+            &format_duration(Duration::from_millis(ms)),
+        );
+        return Some(ms);
+    }
+    duration.map(duration_millis)
 }
 
 struct CaseRunInput {
@@ -788,8 +1088,9 @@ struct CaseRunInput {
     target_id: Option<String>,
     target_name: Option<String>,
     wait: bool,
-    timeout: Option<String>,
+    timeout: Option<Duration>,
     timeout_ms: Option<u64>,
+    interval: Option<Duration>,
     interval_ms: Option<u64>,
 }
 
@@ -802,6 +1103,7 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
         wait,
         timeout,
         timeout_ms,
+        interval,
         interval_ms,
     } = input;
 
@@ -822,8 +1124,8 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
         target: None,
         target_name,
         wait: wait.then_some(true),
-        timeout_ms: parse_timeout_ms(timeout, timeout_ms)?,
-        interval_ms,
+        timeout_ms: timeout.map(duration_millis).or(timeout_ms),
+        interval_ms: interval.map(duration_millis).or(interval_ms),
     };
 
     if let Some(target_url) = target_url {
@@ -841,11 +1143,29 @@ fn build_case_run_params(input: CaseRunInput) -> Result<api::CaseRunParams> {
         }
     } else {
         return Err(anyhow!(
-            "Target is required. Use --target, --target-url, or --target-id."
+            "Target is required. Use --target <URL|TARGET_ID|cli>."
         ));
     }
 
     Ok(params)
+}
+
+/// Effective email setting for `monitor create`: `--no-email` wins over the
+/// hidden `--email <BOOL>` shape (clap already rejects supplying both).
+fn monitor_email_enabled(email: bool, no_email: bool) -> bool {
+    email && !no_email
+}
+
+/// Effective `enabled` update for `monitor update`: `--enable` / `--disable`
+/// take precedence over the hidden `--enabled <BOOL>` shape.
+fn monitor_enabled_update(enable: bool, disable: bool, enabled: Option<bool>) -> Option<bool> {
+    if enable {
+        Some(true)
+    } else if disable {
+        Some(false)
+    } else {
+        enabled
+    }
 }
 
 fn case_run_failed(result: &api::CaseRunResult) -> bool {
@@ -961,7 +1281,7 @@ fn forward_poll_path(forward_id: &str) -> String {
 }
 
 fn forward_poll_command(forward_id: &str) -> String {
-    format!("hooklistener endpoint forward {forward_id}")
+    format!("hooklistener endpoint show-forward {forward_id}")
 }
 
 fn emitted_at() -> String {
@@ -1141,7 +1461,7 @@ fn listen_started_receipt(
         endpoint_receipt_parts(endpoint_slug, endpoint);
     let session_resource_uri = listen_session_resource_uri(endpoint_slug);
     let inspect_command = endpoint
-        .map(|endpoint| format!("hooklistener endpoint requests {}", endpoint.id))
+        .map(|endpoint| format!("hooklistener endpoint list-requests {}", endpoint.id))
         .unwrap_or_else(|| "hooklistener endpoint list --json".to_string());
 
     serde_json::json!({
@@ -1209,7 +1529,7 @@ fn listen_event_receipt(
                 "resource_uri": request_resource_uri
             });
             receipt["next_actions"] = serde_json::json!([format!(
-                "hooklistener endpoint request <endpoint-id> {}",
+                "hooklistener endpoint show-request <endpoint-id> {}",
                 request.id
             )]);
             receipt
@@ -1570,7 +1890,8 @@ fn forward_request_receipt(
     let request_forwards_resource_uri = request_forwards_resource_uri(request_id);
     let poll_url = forward_poll_path(&response.forward_id);
     let poll_command = forward_poll_command(&response.forward_id);
-    let forwards_command = format!("hooklistener endpoint forwards {endpoint_id} {request_id}");
+    let forwards_command =
+        format!("hooklistener endpoint list-forwards {endpoint_id} {request_id}");
 
     serde_json::json!({
         "status": &response.status,
@@ -1694,7 +2015,7 @@ async fn run_endpoint_forward_request(
     endpoint_id: String,
     request_id: String,
     target_url: String,
-    method: Option<String>,
+    method: Option<HttpMethod>,
     dry_run: bool,
     org: Option<String>,
     json: bool,
@@ -1702,7 +2023,7 @@ async fn run_endpoint_forward_request(
     let mut config = config::Config::load()?;
     let organization_id = require_organization(org, &config)?;
     let token = ensure_valid_token(&mut config).await?;
-    let normalized_method = normalize_http_method(method)?;
+    let method = method.map(HttpMethod::as_uppercase);
     validate_forward_target_url(&target_url)?;
     let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
 
@@ -1717,7 +2038,7 @@ async fn run_endpoint_forward_request(
                 &endpoint_id,
                 &request_id,
                 &target_url,
-                normalized_method.as_deref(),
+                method,
                 &request,
             ))?;
         } else {
@@ -1726,7 +2047,7 @@ async fn run_endpoint_forward_request(
                 &endpoint_id,
                 &request_id,
                 &target_url,
-                normalized_method.as_deref(),
+                method,
                 &request,
             );
         }
@@ -1735,12 +2056,7 @@ async fn run_endpoint_forward_request(
     }
 
     let response = client
-        .forward_endpoint_request(
-            &endpoint_id,
-            &request_id,
-            &target_url,
-            normalized_method.as_deref(),
-        )
+        .forward_endpoint_request(&endpoint_id, &request_id, &target_url, method)
         .await?;
 
     if json {
@@ -2066,7 +2382,7 @@ async fn run(cli: Cli) -> Result<()> {
     match command {
         Commands::Login { force } => {
             let log_config = LogConfig {
-                level: log_level.clone(),
+                level: log_level.as_str().to_string(),
                 output_to_stdout: log_stdout,
                 directory: log_dir
                     .clone()
@@ -2077,7 +2393,7 @@ async fn run(cli: Cli) -> Result<()> {
             run_login_flow(force).await?;
         }
         Commands::Listen {
-            endpoint,
+            endpoint_slug,
             target,
             ws_url,
             allow_non_loopback,
@@ -2086,7 +2402,7 @@ async fn run(cli: Cli) -> Result<()> {
             let ws_url = effective_listen_ws_url(ws_url.as_deref())?;
             // Initialize logging for tunnel
             let log_config = LogConfig {
-                level: log_level.clone(),
+                level: log_level.as_str().to_string(),
                 output_to_stdout: false, // Disable stdout logging for TUI
                 directory: log_dir
                     .clone()
@@ -2103,7 +2419,7 @@ async fn run(cli: Cli) -> Result<()> {
             if json {
                 run_listen_json(
                     access_token_rx,
-                    endpoint,
+                    endpoint_slug,
                     target,
                     ws_url,
                     selected_organization_id,
@@ -2124,7 +2440,7 @@ async fn run(cli: Cli) -> Result<()> {
 
                 // Set app state to listening
                 app.state = AppState::Listening;
-                app.listening_endpoint = endpoint.clone();
+                app.listening_endpoint = endpoint_slug.clone();
                 app.listening_target = target.clone();
 
                 // Create channel for tunnel events
@@ -2133,7 +2449,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // Create and spawn tunnel client
                 let tunnel_client = tunnel::TunnelClient::new(
                     access_token_rx,
-                    endpoint.clone(),
+                    endpoint_slug.clone(),
                     target_policy,
                     Some(ws_url),
                     event_tx,
@@ -2171,9 +2487,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Diagnostics { output } => {
             // Initialize minimal logging for diagnostics
             let log_config = LogConfig {
-                level: "info".to_string(),
+                level: log_level.as_str().to_string(),
                 // Keep machine-readable output clean when --json is enabled.
                 output_to_stdout: !json,
+                directory: log_dir
+                    .clone()
+                    .unwrap_or_else(|| LogConfig::default().directory),
                 ..Default::default()
             };
             let logger = Logger::new(log_config)?;
@@ -2255,8 +2574,8 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            ConfigAction::Set { key, value } => match key.as_str() {
-                "selected_organization_id" => {
+            ConfigAction::Set { key, value } => match key {
+                ConfigKey::SelectedOrganizationId => {
                     let mut config = config::Config::load()?;
                     if value == "none" {
                         config.selected_organization_id = None;
@@ -2305,11 +2624,6 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                     }
                 }
-                _ => {
-                    return Err(anyhow!(
-                        "Unknown config key `{key}`. Available key: selected_organization_id."
-                    ));
-                }
             },
         },
         Commands::Logout => {
@@ -2353,25 +2667,28 @@ async fn run(cli: Cli) -> Result<()> {
                     print_organizations(&organizations, config.selected_organization_id.as_deref());
                 }
             }
-            OrgAction::Use { id } => {
+            OrgAction::Use { org_id } => {
                 let mut config = config::Config::load()?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, None)?;
                 let organizations = client.list_organizations().await?;
                 let organization_name = organizations
                     .iter()
-                    .find(|org| org.id == id)
+                    .find(|org| org.id == org_id)
                     .map(|org| org.name.clone())
                     .ok_or_else(|| {
-                        anyhow!("Organization not found or not accessible with id: {}", id)
+                        anyhow!(
+                            "Organization not found or not accessible with id: {}",
+                            org_id
+                        )
                     })?;
 
-                config.selected_organization_id = Some(id.clone());
+                config.selected_organization_id = Some(org_id.clone());
                 config.save()?;
                 if json {
                     print_json(&serde_json::json!({
                         "status": "ok",
-                        "selected_organization_id": id,
+                        "selected_organization_id": org_id,
                         "organization_name": organization_name
                     }))?;
                 } else {
@@ -2380,7 +2697,7 @@ async fn run(cli: Cli) -> Result<()> {
                         "ORGANIZATION SELECTED",
                         &[
                             output_field("NAME", organization_name.bold()),
-                            output_field("ORGANIZATION", id.dim()),
+                            output_field("ORGANIZATION", org_id.dim()),
                         ],
                     );
                 }
@@ -2486,7 +2803,7 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            EndpointAction::Requests {
+            EndpointAction::ListRequests {
                 endpoint_id,
                 page,
                 page_size,
@@ -2511,7 +2828,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_endpoint_requests(&requests);
                 }
             }
-            EndpointAction::Request {
+            EndpointAction::ShowRequest {
                 endpoint_id,
                 request_id,
                 org,
@@ -2594,7 +2911,7 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
             }
-            EndpointAction::Forwards {
+            EndpointAction::ListForwards {
                 endpoint_id,
                 request_id,
                 page,
@@ -2622,7 +2939,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_endpoint_request_forwards(&forwards);
                 }
             }
-            EndpointAction::Forward { forward_id, org } => {
+            EndpointAction::ShowForward { forward_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
@@ -2688,12 +3005,15 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            StaticTunnelAction::Delete { slug_id, org } => {
+            StaticTunnelAction::Delete {
+                static_tunnel_id,
+                org,
+            } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 if !confirm_destructive_action(
                     "DELETE STATIC TUNNEL?",
-                    &format!("static tunnel {slug_id}"),
+                    &format!("static tunnel {static_tunnel_id}"),
                     &organization_id,
                     yes,
                     json,
@@ -2703,19 +3023,19 @@ async fn run(cli: Cli) -> Result<()> {
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let response = client
-                    .delete_static_tunnel(&organization_id, &slug_id)
+                    .delete_static_tunnel(&organization_id, &static_tunnel_id)
                     .await?;
                 if json {
                     print_json(&serde_json::json!({
                         "organization_id": organization_id,
-                        "slug_id": slug_id,
+                        "slug_id": static_tunnel_id,
                         "status": "deleted",
                         "message": response.message
                     }))?;
                 } else {
                     print_status(OutputStatus::Ok, "STATIC TUNNEL DELETED");
                     println!();
-                    print_field("SLUG/ID", slug_id);
+                    print_field("SLUG/ID", static_tunnel_id);
                     print_field("ORGANIZATION", organization_id.dim());
                     if let Some(message) = response.message {
                         print_field("MESSAGE", message.dim());
@@ -2726,7 +3046,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Anon { action } => match action {
             AnonAction::Create { ttl } => {
                 let client = ApiClient::unauthenticated()?;
-                let endpoint = client.create_anon_endpoint(ttl).await?;
+                let endpoint = client.create_anon_endpoint(Some(ttl.as_secs())).await?;
                 if json {
                     print_json(&endpoint)?;
                 } else {
@@ -2743,9 +3063,9 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
-            AnonAction::Show { id } => {
+            AnonAction::Show { endpoint_id } => {
                 let client = ApiClient::unauthenticated()?;
-                let status = client.get_anon_endpoint(&id).await?;
+                let status = client.get_anon_endpoint(&endpoint_id).await?;
                 if json {
                     print_json(&status)?;
                 } else {
@@ -2769,7 +3089,7 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            AnonAction::Events {
+            AnonAction::ListEvents {
                 endpoint_id,
                 token,
                 page,
@@ -2789,7 +3109,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_anon_events(&response);
                 }
             }
-            AnonAction::Event {
+            AnonAction::ShowEvent {
                 endpoint_id,
                 event_id,
                 token,
@@ -2817,7 +3137,7 @@ async fn run(cli: Cli) -> Result<()> {
                     host,
                     port,
                     name,
-                    ttl,
+                    ttl.as_secs(),
                     allow_non_loopback,
                     json,
                     &mut update_handle,
@@ -2864,19 +3184,24 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Commands::Share { action } => match action {
             ShareAction::Create {
-                debug_request_id,
+                request_id,
+                expires_in,
                 expires_in_hours,
                 password,
                 include_forwards,
                 org,
             } => {
+                if let Some(hours) = expires_in_hours {
+                    warn_deprecated_flag("expires-in-hours", "expires-in", &format!("{hours}h"));
+                }
+                let expires_in_hours = expires_in_hours.or(expires_in.map(duration_hours));
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
                 let shared = client
                     .create_shared_request(
-                        &debug_request_id,
+                        &request_id,
                         expires_in_hours,
                         password.as_deref(),
                         include_forwards,
@@ -2905,30 +3230,27 @@ async fn run(cli: Cli) -> Result<()> {
                     print_field("INCLUDE FWDS", shared.include_forwards);
                 }
             }
-            ShareAction::List {
-                debug_request_id,
-                org,
-            } => {
+            ShareAction::List { request_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let shares = client.list_shared_requests(&debug_request_id).await?;
+                let shares = client.list_shared_requests(&request_id).await?;
                 if json {
                     print_json(&serde_json::json!({
                         "organization_id": organization_id,
-                        "debug_request_id": debug_request_id,
+                        "debug_request_id": request_id,
                         "shares": shares
                     }))?;
                 } else {
                     print_context("Organization:", &organization_id);
-                    print_context("Request:", &debug_request_id);
+                    print_context("Request:", &request_id);
                     print_shared_requests(&shares);
                 }
             }
-            ShareAction::Show { token } => {
+            ShareAction::Show { share_token } => {
                 let client = ApiClient::unauthenticated()?;
-                let data = client.get_shared_request(&token).await?;
+                let data = client.get_shared_request(&share_token).await?;
                 if json {
                     print_json(&data)?;
                 } else {
@@ -2948,12 +3270,12 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            ShareAction::Revoke { token, org } => {
+            ShareAction::Revoke { share_token, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 if !confirm_destructive_action(
                     "REVOKE SHARED LINK?",
-                    &format!("share {token}"),
+                    &format!("share {share_token}"),
                     &organization_id,
                     yes,
                     json,
@@ -2963,19 +3285,19 @@ async fn run(cli: Cli) -> Result<()> {
                 let access_token = ensure_valid_token(&mut config).await?;
                 let client =
                     ApiClient::with_organization(access_token, Some(organization_id.clone()))?;
-                client.revoke_shared_request(&token).await?;
+                client.revoke_shared_request(&share_token).await?;
                 if json {
                     print_json(&serde_json::json!({
                         "status": "revoked",
                         "organization_id": organization_id,
-                        "share_token": token
+                        "share_token": share_token
                     }))?;
                 } else {
                     print_status_block(
                         OutputStatus::Ok,
                         "SHARE REVOKED",
                         &[
-                            output_field("SHARE TOKEN", token.bold()),
+                            output_field("SHARE TOKEN", share_token.bold()),
                             output_field("ORGANIZATION", organization_id.dim()),
                         ],
                     );
@@ -2992,6 +3314,7 @@ async fn run(cli: Cli) -> Result<()> {
                 body_contains,
                 body,
                 failure_threshold,
+                no_email,
                 email,
                 org,
             } => {
@@ -3000,14 +3323,15 @@ async fn run(cli: Cli) -> Result<()> {
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
 
+                let email_enabled = monitor_email_enabled(email, no_email);
                 let mut params = serde_json::json!({
                     "name": name,
                     "url": url,
-                    "method": method.to_lowercase(),
+                    "method": method.as_lowercase(),
                     "expected_status_code": expected_status,
-                    "check_interval": interval,
+                    "check_interval": interval.minutes(),
                     "failure_threshold": failure_threshold,
-                    "email_enabled": email,
+                    "email_enabled": email_enabled,
                 });
                 if let Some(bc) = body_contains {
                     params["body_contains"] = serde_json::Value::String(bc);
@@ -3045,12 +3369,12 @@ async fn run(cli: Cli) -> Result<()> {
                     print_monitors(&monitors);
                 }
             }
-            MonitorAction::Show { id, org } => {
+            MonitorAction::Show { monitor_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let monitor = client.get_uptime_monitor(&id).await?;
+                let monitor = client.get_uptime_monitor(&monitor_id).await?;
                 if json {
                     print_json(&serde_json::json!({
                         "organization_id": organization_id,
@@ -3062,16 +3386,19 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             MonitorAction::Update {
-                id,
+                monitor_id,
                 name,
                 url,
                 method,
                 expected_status,
                 interval,
+                enable,
+                disable,
                 enabled,
                 failure_threshold,
                 org,
             } => {
+                let enabled = monitor_enabled_update(enable, disable, enabled);
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
@@ -3085,13 +3412,16 @@ async fn run(cli: Cli) -> Result<()> {
                     params.insert("url".into(), serde_json::Value::String(v));
                 }
                 if let Some(v) = method {
-                    params.insert("method".into(), serde_json::Value::String(v.to_lowercase()));
+                    params.insert(
+                        "method".into(),
+                        serde_json::Value::String(v.as_lowercase().to_string()),
+                    );
                 }
                 if let Some(v) = expected_status {
                     params.insert("expected_status_code".into(), v.into());
                 }
                 if let Some(v) = interval {
-                    params.insert("check_interval".into(), v.into());
+                    params.insert("check_interval".into(), v.minutes().into());
                 }
                 if let Some(v) = enabled {
                     params.insert("enabled".into(), serde_json::Value::Bool(v));
@@ -3102,12 +3432,12 @@ async fn run(cli: Cli) -> Result<()> {
 
                 if params.is_empty() {
                     return Err(anyhow!(
-                        "No fields to update. Use --name, --url, --method, --expected-status, --interval, --enabled, or --failure-threshold."
+                        "No fields to update. Use --name, --url, --method, --expected-status, --interval, --enable, --disable, or --failure-threshold."
                     ));
                 }
 
                 let monitor = client
-                    .update_uptime_monitor(&id, &serde_json::Value::Object(params))
+                    .update_uptime_monitor(&monitor_id, &serde_json::Value::Object(params))
                     .await?;
                 if json {
                     print_json(&serde_json::json!({
@@ -3121,12 +3451,12 @@ async fn run(cli: Cli) -> Result<()> {
                     print_field("ORGANIZATION", &organization_id);
                 }
             }
-            MonitorAction::Delete { id, org } => {
+            MonitorAction::Delete { monitor_id, org } => {
                 let mut config = config::Config::load()?;
                 let organization_id = require_organization(org, &config)?;
                 if !confirm_destructive_action(
                     "DELETE MONITOR?",
-                    &format!("monitor {id}"),
+                    &format!("monitor {monitor_id}"),
                     &organization_id,
                     yes,
                     json,
@@ -3135,26 +3465,26 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                client.delete_uptime_monitor(&id).await?;
+                client.delete_uptime_monitor(&monitor_id).await?;
                 if json {
                     print_json(&serde_json::json!({
                         "status": "deleted",
                         "organization_id": organization_id,
-                        "monitor_id": id
+                        "monitor_id": monitor_id
                     }))?;
                 } else {
                     print_status_block(
                         OutputStatus::Ok,
                         "MONITOR DELETED",
                         &[
-                            output_field("MONITOR", id.bold()),
+                            output_field("MONITOR", monitor_id.bold()),
                             output_field("ORGANIZATION", organization_id.dim()),
                         ],
                     );
                 }
             }
             MonitorAction::Checks {
-                id,
+                monitor_id,
                 page,
                 page_size,
                 org,
@@ -3163,37 +3493,25 @@ async fn run(cli: Cli) -> Result<()> {
                 let organization_id = require_organization(org, &config)?;
                 let token = ensure_valid_token(&mut config).await?;
                 let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
-                let response = client.list_uptime_checks(&id, page, page_size).await?;
+                let response = client
+                    .list_uptime_checks(&monitor_id, page, page_size)
+                    .await?;
                 if json {
                     print_json(&serde_json::json!({
                         "organization_id": organization_id,
-                        "monitor_id": id,
+                        "monitor_id": monitor_id,
                         "checks": response
                     }))?;
                 } else {
                     print_context("Organization:", &organization_id);
-                    print_context("Monitor:", &id);
+                    print_context("Monitor:", &monitor_id);
                     print_uptime_checks(&response);
                 }
             }
         },
         Commands::Completions { shell } => {
-            use clap_complete::generate;
-            use clap_complete::shells::{Bash, Elvish, Fish, PowerShell, Zsh};
-
-            let mut command = Cli::command();
-            let bin_name = command.get_name().to_string();
-            let mut stdout = io::stdout();
-
-            match shell {
-                CompletionShell::Bash => generate(Bash, &mut command, bin_name, &mut stdout),
-                CompletionShell::Zsh => generate(Zsh, &mut command, bin_name, &mut stdout),
-                CompletionShell::Fish => generate(Fish, &mut command, bin_name, &mut stdout),
-                CompletionShell::PowerShell => {
-                    generate(PowerShell, &mut command, bin_name, &mut stdout)
-                }
-                CompletionShell::Elvish => generate(Elvish, &mut command, bin_name, &mut stdout),
-            }
+            let mut stdout = io::stdout().lock();
+            print_completions(shell, &mut stdout)?;
         }
         Commands::Update => {
             updater::run_self_update(json).await?;
@@ -3201,7 +3519,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Tunnel { action, target } => {
             // Initialize logging for tunnel
             let log_config = LogConfig {
-                level: log_level.clone(),
+                level: log_level.as_str().to_string(),
                 output_to_stdout: false, // Disable stdout logging for TUI
                 directory: log_dir
                     .clone()
@@ -3359,7 +3677,7 @@ async fn run_tunnel_lifecycle_command(
 ) -> Result<()> {
     match action {
         None => run_tunnel_activation(default_target.resolve(), json, update_handle).await,
-        Some(TunnelAction::Start(target)) | Some(TunnelAction::Activate(target)) => {
+        Some(TunnelAction::Start(target)) => {
             run_tunnel_activation(default_target.merge(target).resolve(), json, update_handle).await
         }
         Some(TunnelAction::Prepare(target)) => {
@@ -3507,9 +3825,13 @@ async fn run_tunnel_lifecycle_command(
             capture_id,
             attempt_id,
             follow,
+            interval,
             interval_ms,
             org,
         }) => {
+            let interval_ms =
+                resolve_millis_flag(Some(interval), interval_ms, "interval-ms", "interval")
+                    .unwrap_or(MILLIS_PER_SECOND);
             let context = tunnel_lifecycle_context(org).await?;
             run_tunnel_lifecycle_events(
                 &context,
@@ -3887,7 +4209,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
             "ACTION",
             format!(
                 "Run {} to start forwarding webhooks.",
-                "hooklistener listen <endpoint>".bold()
+                "hooklistener listen <endpoint-slug>".bold()
             ),
         );
         print_field(
@@ -3957,7 +4279,7 @@ async fn run_login_flow(force_reauth: bool) -> Result<()> {
                     "ACTION",
                     format!(
                         "Run {} to forward webhooks.",
-                        "hooklistener listen <endpoint>".bold()
+                        "hooklistener listen <endpoint-slug>".bold()
                     ),
                 );
                 println!();
@@ -4713,7 +5035,7 @@ fn print_endpoint_requests(response: &api::EndpointRequestsResponse) {
     if response.data.is_empty() {
         print_empty_state(
             "NO REQUESTS FOUND",
-            "Send a webhook, then run `hooklistener endpoint requests <endpoint-id>` again.",
+            "Send a webhook, then run `hooklistener endpoint list-requests <endpoint-id>` again.",
         );
         return;
     }
@@ -4781,7 +5103,7 @@ fn print_endpoint_request_forwards(response: &api::EndpointRequestForwardsRespon
     if response.data.is_empty() {
         print_empty_state(
             "NO FORWARDS FOUND",
-            "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <target-url>`.",
+            "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <url>`.",
         );
         return;
     }
@@ -5071,7 +5393,7 @@ fn print_anon_events(response: &api::AnonEventsResponse) {
     if response.data.is_empty() {
         print_empty_state(
             "NO EVENTS CAPTURED",
-            "Send a webhook, then run `hooklistener anon events <endpoint-id> --token <token>`.",
+            "Send a webhook, then run `hooklistener anon list-events <endpoint-id> --token <viewer-token>`.",
         );
     } else {
         let mut table = new_table(&["ID", "Method", "Received At"]);
@@ -5860,8 +6182,6 @@ fn error_code(err: &anyhow::Error) -> String {
             "authentication_required".to_string()
         } else if message.contains("No organization selected") {
             "organization_required".to_string()
-        } else if message.contains("Unknown config key") {
-            "invalid_config_key".to_string()
         } else {
             "command_failed".to_string()
         }
@@ -6507,11 +6827,7 @@ mod tests {
             } => target.resolve(),
             Commands::Tunnel {
                 action:
-                    Some(
-                        TunnelAction::Start(action_target)
-                        | TunnelAction::Activate(action_target)
-                        | TunnelAction::Prepare(action_target),
-                    ),
+                    Some(TunnelAction::Start(action_target) | TunnelAction::Prepare(action_target)),
                 target,
             } => target.merge(action_target).resolve(),
             _ => panic!("expected a tunnel target command"),
@@ -6607,7 +6923,7 @@ mod tests {
         assert!(before_start.allow_non_loopback);
         assert!(before_start.no_replay_buffered);
 
-        for action in ["prepare", "activate"] {
+        for action in ["prepare", "start", "activate"] {
             let before =
                 parsed_tunnel_target(&["hooklistener", "tunnel", "--port", "4001", action]);
             let after = parsed_tunnel_target(&["hooklistener", "tunnel", action, "--port", "4001"]);
@@ -6658,10 +6974,10 @@ mod tests {
                 action: AnonAction::Tunnel {
                     port: 4000,
                     name: Some(name),
-                    ttl: 1200,
+                    ttl,
                     ..
                 }
-            }) if name == "stable-demo"
+            }) if name == "stable-demo" && ttl == Duration::from_secs(1200)
         ));
 
         let claim = Cli::try_parse_from([
@@ -6847,6 +7163,1003 @@ mod tests {
     }
 
     #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    fn render_help_snapshot(path: &[&str]) -> String {
+        let mut cli = Cli::command()
+            .term_width(100)
+            .color(clap::ColorChoice::Never);
+        cli.build();
+        let mut command = &mut cli;
+        for name in path {
+            command = command
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("subcommand `{name}` exists"));
+        }
+        let help = command.render_help().to_string();
+        assert_no_emoji(&help);
+        help
+    }
+
+    #[test]
+    fn help_snapshot_top_level() {
+        insta::assert_snapshot!("help_top_level", render_help_snapshot(&[]));
+    }
+
+    #[test]
+    fn help_snapshot_endpoint() {
+        insta::assert_snapshot!("help_endpoint", render_help_snapshot(&["endpoint"]));
+    }
+
+    #[test]
+    fn help_snapshot_endpoint_list() {
+        insta::assert_snapshot!(
+            "help_endpoint_list",
+            render_help_snapshot(&["endpoint", "list"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_tunnel() {
+        insta::assert_snapshot!("help_tunnel", render_help_snapshot(&["tunnel"]));
+    }
+
+    #[test]
+    fn help_snapshot_tunnel_events() {
+        insta::assert_snapshot!(
+            "help_tunnel_events",
+            render_help_snapshot(&["tunnel", "events"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_anon() {
+        insta::assert_snapshot!("help_anon", render_help_snapshot(&["anon"]));
+    }
+
+    #[test]
+    fn help_snapshot_anon_create() {
+        insta::assert_snapshot!(
+            "help_anon_create",
+            render_help_snapshot(&["anon", "create"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_anon_tunnel() {
+        insta::assert_snapshot!(
+            "help_anon_tunnel",
+            render_help_snapshot(&["anon", "tunnel"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_monitor() {
+        insta::assert_snapshot!("help_monitor", render_help_snapshot(&["monitor"]));
+    }
+
+    #[test]
+    fn help_snapshot_monitor_create() {
+        insta::assert_snapshot!(
+            "help_monitor_create",
+            render_help_snapshot(&["monitor", "create"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_cases_run() {
+        insta::assert_snapshot!("help_cases_run", render_help_snapshot(&["cases", "run"]));
+    }
+
+    #[test]
+    fn help_snapshot_cases() {
+        insta::assert_snapshot!("help_cases", render_help_snapshot(&["cases"]));
+    }
+
+    #[test]
+    fn help_snapshot_cases_replay() {
+        insta::assert_snapshot!(
+            "help_cases_replay",
+            render_help_snapshot(&["cases", "replay"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_cases_runs_wait() {
+        insta::assert_snapshot!(
+            "help_cases_runs_wait",
+            render_help_snapshot(&["cases", "runs", "wait"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_share_create() {
+        insta::assert_snapshot!(
+            "help_share_create",
+            render_help_snapshot(&["share", "create"])
+        );
+    }
+
+    #[test]
+    fn help_snapshot_completions() {
+        let help = render_help_snapshot(&["completions"]);
+        assert!(
+            help.contains("[possible values: bash, zsh, fish, powershell, elvish]"),
+            "completions help must list the visible shell names:\n{help}"
+        );
+        assert!(
+            !help.contains("power-shell"),
+            "power-shell is a hidden alias and must not appear in help:\n{help}"
+        );
+        insta::assert_snapshot!("help_completions", help);
+    }
+
+    #[test]
+    fn org_flag_accepts_short_o_on_every_command() {
+        let cli = Cli::try_parse_from(["hooklistener", "endpoint", "list", "-o", "org_1"])
+            .expect("endpoint list -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Endpoint {
+                action: EndpointAction::List { ref org },
+            }) if org.as_deref() == Some("org_1")
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "monitor", "list", "-o", "org_1"])
+            .expect("monitor list -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Monitor {
+                action: MonitorAction::List { ref org },
+            }) if org.as_deref() == Some("org_1")
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "share", "list", "req_1", "-o", "org_1"])
+            .expect("share list -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Share {
+                action: ShareAction::List { ref request_id, ref org },
+            }) if request_id == "req_1" && org.as_deref() == Some("org_1")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "static-tunnel",
+            "delete",
+            "st_1",
+            "-o",
+            "org_1",
+        ])
+        .expect("static-tunnel delete -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::StaticTunnel {
+                action: StaticTunnelAction::Delete { ref static_tunnel_id, ref org },
+            }) if static_tunnel_id == "st_1" && org.as_deref() == Some("org_1")
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "cases", "run", "ep_1", "-o", "org_1"])
+            .expect("cases run -o parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Cases {
+                action: CasesAction::Run { ref org, .. },
+            }) if org.as_deref() == Some("org_1")
+        ));
+    }
+
+    #[test]
+    fn completions_power_shell_is_alias_of_powershell() {
+        for spelling in ["powershell", "power-shell", "PowerShell"] {
+            let cli = Cli::try_parse_from(["hooklistener", "completions", spelling])
+                .unwrap_or_else(|err| panic!("completions {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Completions {
+                        shell: CompletionShell::PowerShell,
+                    })
+                ),
+                "completions {spelling} must yield PowerShell"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_generate_for_every_shell() {
+        for shell in CompletionShell::value_variants() {
+            let mut buf: Vec<u8> = Vec::new();
+            write_completions(*shell, &mut buf)
+                .unwrap_or_else(|err| panic!("completions {shell:?} writes: {err}"));
+            assert!(!buf.is_empty(), "completions {shell:?} must not be empty");
+            let script = String::from_utf8(buf)
+                .unwrap_or_else(|err| panic!("completions {shell:?} is UTF-8: {err}"));
+            assert!(
+                script.contains("hooklistener"),
+                "completions {shell:?} must mention the binary name"
+            );
+        }
+    }
+
+    struct BrokenPipeWriter;
+
+    impl io::Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingWriter;
+
+    impl io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("disk full"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completions_broken_pipe_is_not_an_error() {
+        for shell in CompletionShell::value_variants() {
+            let mut out = BrokenPipeWriter;
+            assert!(
+                print_completions(*shell, &mut out).is_ok(),
+                "completions {shell:?} must treat a closed pipe as success"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_other_write_errors_propagate() {
+        let mut out = FailingWriter;
+        let err = print_completions(CompletionShell::Bash, &mut out)
+            .expect_err("a non-pipe write error must propagate");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "disk full");
+    }
+
+    #[test]
+    fn renamed_positionals_keep_their_positions() {
+        let cli = Cli::try_parse_from(["hooklistener", "listen", "my-endpoint"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Listen { ref endpoint_slug, .. }) if endpoint_slug == "my-endpoint"
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "org", "use", "org_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Org {
+                action: OrgAction::Use { ref org_id },
+            }) if org_id == "org_1"
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "anon", "show", "ep_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Anon {
+                action: AnonAction::Show { ref endpoint_id },
+            }) if endpoint_id == "ep_1"
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "share", "show", "tok_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Share {
+                action: ShareAction::Show { ref share_token },
+            }) if share_token == "tok_1"
+        ));
+
+        let cli = Cli::try_parse_from(["hooklistener", "monitor", "show", "mon_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Monitor {
+                action: MonitorAction::Show { ref monitor_id, .. },
+            }) if monitor_id == "mon_1"
+        ));
+    }
+
+    #[test]
+    fn endpoint_requests_is_alias_of_list_requests() {
+        for spelling in ["requests", "list-requests"] {
+            let cli = Cli::try_parse_from(["hooklistener", "endpoint", spelling, "ep_1"])
+                .unwrap_or_else(|err| panic!("endpoint {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Endpoint {
+                        action: EndpointAction::ListRequests {
+                            ref endpoint_id,
+                            page: 1,
+                            page_size: 50,
+                            org: None,
+                        },
+                    }) if endpoint_id == "ep_1"
+                ),
+                "endpoint {spelling} must yield ListRequests"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_request_is_alias_of_show_request() {
+        for spelling in ["request", "show-request"] {
+            let cli = Cli::try_parse_from(["hooklistener", "endpoint", spelling, "ep_1", "req_1"])
+                .unwrap_or_else(|err| panic!("endpoint {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Endpoint {
+                        action: EndpointAction::ShowRequest {
+                            ref endpoint_id,
+                            ref request_id,
+                            org: None,
+                        },
+                    }) if endpoint_id == "ep_1" && request_id == "req_1"
+                ),
+                "endpoint {spelling} must yield ShowRequest"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_forwards_is_alias_of_list_forwards() {
+        for spelling in ["forwards", "list-forwards"] {
+            let cli = Cli::try_parse_from([
+                "hooklistener",
+                "endpoint",
+                spelling,
+                "ep_1",
+                "req_1",
+                "--page",
+                "2",
+            ])
+            .unwrap_or_else(|err| panic!("endpoint {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Endpoint {
+                        action: EndpointAction::ListForwards {
+                            ref endpoint_id,
+                            ref request_id,
+                            page: 2,
+                            page_size: 50,
+                            org: None,
+                        },
+                    }) if endpoint_id == "ep_1" && request_id == "req_1"
+                ),
+                "endpoint {spelling} must yield ListForwards"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_forward_is_alias_of_show_forward() {
+        for spelling in ["forward", "show-forward"] {
+            let cli = Cli::try_parse_from(["hooklistener", "endpoint", spelling, "fwd_1"])
+                .unwrap_or_else(|err| panic!("endpoint {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Endpoint {
+                        action: EndpointAction::ShowForward {
+                            ref forward_id,
+                            org: None,
+                        },
+                    }) if forward_id == "fwd_1"
+                ),
+                "endpoint {spelling} must yield ShowForward"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_forward_aliases_do_not_capture_forward_request_or_delete_request() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "forward-request",
+            "ep_1",
+            "req_1",
+            "http://localhost:3000/hook",
+        ])
+        .expect("endpoint forward-request parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Endpoint {
+                action: EndpointAction::ForwardRequest { .. },
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "delete-request",
+            "ep_1",
+            "req_1",
+        ])
+        .expect("endpoint delete-request parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Endpoint {
+                action: EndpointAction::DeleteRequest { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn anon_events_is_alias_of_list_events() {
+        for spelling in ["events", "list-events"] {
+            let cli = Cli::try_parse_from([
+                "hooklistener",
+                "anon",
+                spelling,
+                "ep_1",
+                "--token",
+                "viewer_token",
+            ])
+            .unwrap_or_else(|err| panic!("anon {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Anon {
+                        action: AnonAction::ListEvents {
+                            ref endpoint_id,
+                            ref token,
+                            page: 1,
+                            page_size: 50,
+                        },
+                    }) if endpoint_id == "ep_1" && token == "viewer_token"
+                ),
+                "anon {spelling} must yield ListEvents"
+            );
+        }
+    }
+
+    #[test]
+    fn anon_event_is_alias_of_show_event() {
+        for spelling in ["event", "show-event"] {
+            let cli = Cli::try_parse_from([
+                "hooklistener",
+                "anon",
+                spelling,
+                "ep_1",
+                "evt_1",
+                "--token",
+                "viewer_token",
+            ])
+            .unwrap_or_else(|err| panic!("anon {spelling} parses: {err}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::Anon {
+                        action: AnonAction::ShowEvent {
+                            ref endpoint_id,
+                            ref event_id,
+                            ref token,
+                        },
+                    }) if endpoint_id == "ep_1" && event_id == "evt_1" && token == "viewer_token"
+                ),
+                "anon {spelling} must yield ShowEvent"
+            );
+        }
+    }
+
+    #[test]
+    fn tunnel_activate_is_alias_of_start() {
+        let cli = Cli::try_parse_from(["hooklistener", "tunnel", "activate", "--port", "5000"])
+            .expect("tunnel activate parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tunnel {
+                action: Some(TunnelAction::Start(TunnelTargetArgs {
+                    port: Some(5000),
+                    ..
+                })),
+                ..
+            })
+        ));
+
+        let alias = parsed_tunnel_target(&["hooklistener", "tunnel", "activate", "--port", "5000"]);
+        let start = parsed_tunnel_target(&["hooklistener", "tunnel", "start", "--port", "5000"]);
+        assert_eq!(alias, start);
+    }
+
+    #[test]
+    fn tunnel_list_accepts_status_limit_and_short_org() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "tunnel",
+            "list",
+            "--status",
+            "active",
+            "--limit",
+            "10",
+            "-o",
+            "org_1",
+        ])
+        .expect("tunnel list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tunnel {
+                action: Some(TunnelAction::List {
+                    limit: 10,
+                    status: Some(status),
+                    org: Some(org),
+                }),
+                ..
+            }) if status == "active" && org == "org_1"
+        ));
+    }
+
+    #[test]
+    fn tunnel_lifecycle_subcommands_accept_short_org() {
+        for args in [
+            vec!["tunnel", "status", "session-1", "-o", "org_1"],
+            vec!["tunnel", "events", "-o", "org_1"],
+            vec!["tunnel", "capture", "capture-1", "-o", "org_1"],
+            vec!["tunnel", "attempt", "attempt-1", "-o", "org_1"],
+            vec!["tunnel", "stop", "session-1", "-o", "org_1"],
+            vec!["tunnel", "detach", "session-1", "-o", "org_1"],
+            vec!["anon", "claim", "route-1", "--token", "t", "-o", "org_1"],
+        ] {
+            let mut full = vec!["hooklistener"];
+            full.extend(args.iter().copied());
+            let cli = Cli::try_parse_from(&full).unwrap_or_else(|err| panic!("{args:?}: {err}"));
+            let org = match cli.command.expect("parsed command") {
+                Commands::Tunnel {
+                    action:
+                        Some(
+                            TunnelAction::Status { org, .. }
+                            | TunnelAction::Events { org, .. }
+                            | TunnelAction::Capture { org, .. }
+                            | TunnelAction::Attempt { org, .. }
+                            | TunnelAction::Stop { org, .. }
+                            | TunnelAction::Detach { org, .. },
+                        ),
+                    ..
+                } => org,
+                Commands::Anon {
+                    action: AnonAction::Claim { org, .. },
+                } => org,
+                _ => panic!("{args:?}: unexpected command"),
+            };
+            assert_eq!(org.as_deref(), Some("org_1"), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn top_level_commands_are_listed_in_grouped_order() {
+        let command = Cli::command();
+        let names: Vec<&str> = command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                "listen",
+                "tunnel",
+                "endpoint",
+                "static-tunnel",
+                "anon",
+                "cases",
+                "share",
+                "monitor",
+                "login",
+                "logout",
+                "org",
+                "config",
+                "diagnostics",
+                "clean-logs",
+                "completions",
+                "update",
+            ]
+        );
+        assert_eq!(
+            command.get_about().map(ToString::to_string).as_deref(),
+            Some("Inspect webhooks, replay failures, and expose localhost from your terminal")
+        );
+    }
+
+    #[test]
+    fn log_level_is_global_after_tunnel_subcommand() {
+        let cli =
+            Cli::try_parse_from(["hooklistener", "tunnel", "--log-level", "debug", "prepare"])
+                .unwrap();
+
+        assert_eq!(cli.log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn log_flags_are_global_after_endpoint_list() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "list",
+            "--log-stdout",
+            "--log-dir",
+            "/tmp/x",
+        ])
+        .unwrap();
+
+        assert!(cli.log_stdout);
+        assert_eq!(cli.log_dir, Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn log_flags_are_global_after_diagnostics() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "diagnostics",
+            "--log-level",
+            "debug",
+            "--log-dir",
+            "/tmp/x",
+            "--output",
+            "/tmp/bundle",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.log_level, LogLevel::Debug);
+        assert_eq!(cli.log_dir, Some(PathBuf::from("/tmp/x")));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Diagnostics { ref output }) if output == &PathBuf::from("/tmp/bundle")
+        ));
+    }
+
+    #[test]
+    fn log_level_ignores_case() {
+        let cli = Cli::try_parse_from(["hooklistener", "--log-level", "WARN", "endpoint", "list"])
+            .unwrap();
+
+        assert_eq!(cli.log_level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn log_level_defaults_to_info() {
+        let cli = Cli::try_parse_from(["hooklistener", "endpoint", "list"]).unwrap();
+
+        assert_eq!(cli.log_level, LogLevel::Info);
+        assert_eq!(cli.log_level.as_str(), "info");
+    }
+
+    #[test]
+    fn log_level_rejects_unknown_value() {
+        let result =
+            Cli::try_parse_from(["hooklistener", "--log-level", "verbose", "endpoint", "list"]);
+
+        match result {
+            Ok(_) => panic!("expected --log-level verbose to be rejected"),
+            Err(error) => assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue),
+        }
+    }
+
+    #[test]
+    fn insecure_dev_server_flag_is_hidden_from_help() {
+        let mut command = Cli::command().term_width(100);
+        let help = command.render_help().to_string();
+
+        assert!(!help.contains("insecure"), "{help}");
+        assert_eq!(help.matches("Global options:").count(), 1, "{help}");
+        for flag in [
+            "--json",
+            "--color",
+            "--yes",
+            "--log-level",
+            "--log-dir",
+            "--log-stdout",
+        ] {
+            assert!(help.contains(flag), "missing {flag} in {help}");
+        }
+
+        let mut root = Cli::command().term_width(100);
+        root.build();
+        let help = root
+            .find_subcommand_mut("endpoint")
+            .and_then(|endpoint| endpoint.find_subcommand_mut("list"))
+            .expect("endpoint list command")
+            .render_help()
+            .to_string();
+
+        assert!(!help.contains("insecure"), "{help}");
+        assert_eq!(help.matches("Global options:").count(), 1, "{help}");
+    }
+
+    fn parse_error<I, T>(args: I) -> clap::Error
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("expected argument parsing to fail"),
+            Err(err) => err,
+        }
+    }
+
+    fn parse_error_kind<I, T>(args: I) -> clap::error::ErrorKind
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        parse_error(args).kind()
+    }
+
+    #[test]
+    fn forward_request_method_is_a_value_enum_rendered_uppercase() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "forward-request",
+            "ep_1",
+            "req_1",
+            "http://localhost:3000/hook",
+            "--method",
+            "post",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Endpoint {
+                action: EndpointAction::ForwardRequest { method, .. },
+            }) => {
+                assert_eq!(method, Some(HttpMethod::Post));
+                assert_eq!(method.unwrap().as_uppercase(), "POST");
+            }
+            _ => panic!("expected endpoint forward-request command"),
+        }
+    }
+
+    #[test]
+    fn forward_request_method_rejects_unknown_values() {
+        let kind = parse_error_kind([
+            "hooklistener",
+            "endpoint",
+            "forward-request",
+            "ep_1",
+            "req_1",
+            "http://localhost:3000/hook",
+            "--method",
+            "trace",
+        ]);
+        assert_eq!(kind, clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn monitor_create_method_defaults_to_get_and_accepts_any_case() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Monitor {
+                action:
+                    MonitorAction::Create {
+                        method,
+                        expected_status,
+                        failure_threshold,
+                        ..
+                    },
+            }) => {
+                assert_eq!(method, MonitorMethod::Get);
+                assert_eq!(method.as_lowercase(), "get");
+                assert_eq!(method.to_string(), "GET");
+                assert_eq!(expected_status, 200);
+                assert_eq!(failure_threshold, 2);
+            }
+            _ => panic!("expected monitor create command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--method",
+            "Post",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Monitor {
+                action: MonitorAction::Create { method, .. },
+            }) => {
+                assert_eq!(method, MonitorMethod::Post);
+                assert_eq!(method.as_lowercase(), "post");
+            }
+            _ => panic!("expected monitor create command"),
+        }
+    }
+
+    #[test]
+    fn monitor_method_rejects_options() {
+        for args in [
+            vec![
+                "hooklistener",
+                "monitor",
+                "create",
+                "API",
+                "https://example.com/health",
+                "--method",
+                "options",
+            ],
+            vec![
+                "hooklistener",
+                "monitor",
+                "update",
+                "mon_1",
+                "--method",
+                "OPTIONS",
+            ],
+        ] {
+            assert_eq!(parse_error_kind(args), clap::error::ErrorKind::InvalidValue);
+        }
+    }
+
+    #[test]
+    fn monitor_update_method_parses_case_insensitively() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "update",
+            "mon_1",
+            "--method",
+            "head",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Monitor {
+                action: MonitorAction::Update { method, .. },
+            }) => assert_eq!(method, Some(MonitorMethod::Head)),
+            _ => panic!("expected monitor update command"),
+        }
+    }
+
+    #[test]
+    fn monitor_expected_status_must_be_an_http_status_code() {
+        let kind = parse_error_kind([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--expected-status",
+            "42",
+        ]);
+        assert_eq!(kind, clap::error::ErrorKind::ValueValidation);
+
+        let kind = parse_error_kind([
+            "hooklistener",
+            "monitor",
+            "update",
+            "mon_1",
+            "--expected-status",
+            "600",
+        ]);
+        assert_eq!(kind, clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn monitor_failure_threshold_rejects_zero() {
+        let kind = parse_error_kind([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--failure-threshold",
+            "0",
+        ]);
+        assert_eq!(kind, clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn paginated_lists_reject_page_zero() {
+        for args in [
+            vec![
+                "hooklistener",
+                "endpoint",
+                "list-requests",
+                "ep_1",
+                "--page",
+                "0",
+            ],
+            vec![
+                "hooklistener",
+                "endpoint",
+                "list-forwards",
+                "ep_1",
+                "req_1",
+                "--page-size",
+                "0",
+            ],
+            vec![
+                "hooklistener",
+                "anon",
+                "list-events",
+                "ep_1",
+                "--token",
+                "t",
+                "--page",
+                "0",
+            ],
+            vec!["hooklistener", "monitor", "checks", "mon_1", "--page", "0"],
+        ] {
+            assert_eq!(
+                parse_error_kind(args.clone()),
+                clap::error::ErrorKind::ValueValidation,
+                "{args:?} must fail range validation"
+            );
+        }
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "checks",
+            "mon_1",
+            "--page",
+            "2",
+            "--page-size",
+            "10",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Monitor {
+                action:
+                    MonitorAction::Checks {
+                        page, page_size, ..
+                    },
+            }) => {
+                assert_eq!(page, 2);
+                assert_eq!(page_size, 10);
+            }
+            _ => panic!("expected monitor checks command"),
+        }
+    }
+
+    #[test]
+    fn config_set_key_is_a_value_enum() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "config",
+            "set",
+            "selected_organization_id",
+            "org_1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Set { key, value },
+            }) => {
+                assert_eq!(key, ConfigKey::SelectedOrganizationId);
+                assert_eq!(value, "org_1");
+            }
+            _ => panic!("expected config set command"),
+        }
+
+        assert_eq!(
+            parse_error_kind(["hooklistener", "config", "set", "other", "x"]),
+            clap::error::ErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
     fn monitor_email_accepts_explicit_false() {
         let cli = Cli::try_parse_from([
             "hooklistener",
@@ -6864,6 +8177,216 @@ mod tests {
             }) => assert!(!email),
             _ => panic!("expected monitor create command"),
         }
+    }
+
+    #[test]
+    fn monitor_no_email_disables_notifications() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+            "--no-email",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Monitor {
+                action:
+                    MonitorAction::Create {
+                        email, no_email, ..
+                    },
+            }) => {
+                assert!(email);
+                assert!(no_email);
+                assert!(!monitor_email_enabled(email, no_email));
+            }
+            _ => panic!("expected monitor create command"),
+        }
+
+        assert!(monitor_email_enabled(true, false));
+        assert!(!monitor_email_enabled(false, false));
+    }
+
+    #[test]
+    fn monitor_email_and_no_email_conflict() {
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "monitor",
+                "create",
+                "API",
+                "https://example.com/health",
+                "--email",
+                "--no-email",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn monitor_update_enable_disable_conflict() {
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "monitor",
+                "update",
+                "mon_1",
+                "--enable",
+                "--disable",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "monitor",
+                "update",
+                "mon_1",
+                "--enable",
+                "--enabled",
+                "true",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn monitor_update_enable_and_disable_set_enabled() {
+        for (flag, expected) in [("--enable", Some(true)), ("--disable", Some(false))] {
+            let cli =
+                Cli::try_parse_from(["hooklistener", "monitor", "update", "mon_1", flag]).unwrap();
+            match cli.command {
+                Some(Commands::Monitor {
+                    action:
+                        MonitorAction::Update {
+                            enable,
+                            disable,
+                            enabled,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(enable, expected == Some(true));
+                    assert_eq!(disable, expected == Some(false));
+                    assert_eq!(enabled, None);
+                    assert_eq!(monitor_enabled_update(enable, disable, enabled), expected);
+                }
+                _ => panic!("expected monitor update command"),
+            }
+        }
+
+        assert_eq!(monitor_enabled_update(false, false, None), None);
+    }
+
+    #[test]
+    fn monitor_update_enabled_hidden_flag_still_parses() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "update",
+            "mon_1",
+            "--enabled",
+            "false",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Monitor {
+                action:
+                    MonitorAction::Update {
+                        enable,
+                        disable,
+                        enabled,
+                        ..
+                    },
+            }) => {
+                assert!(!enable);
+                assert!(!disable);
+                assert_eq!(enabled, Some(false));
+                assert_eq!(
+                    monitor_enabled_update(enable, disable, enabled),
+                    Some(false)
+                );
+            }
+            _ => panic!("expected monitor update command"),
+        }
+    }
+
+    #[test]
+    fn cases_run_hidden_target_flags_still_parse() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_123",
+            "--target-url",
+            "http://localhost:3000",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cases {
+                action:
+                    CasesAction::Run {
+                        destination:
+                            cases::DestinationArgs {
+                                target,
+                                target_url,
+                                target_id,
+                            },
+                        ..
+                    },
+            }) => {
+                assert_eq!(target, None);
+                assert_eq!(target_url.as_deref(), Some("http://localhost:3000"));
+                assert_eq!(target_id, None);
+            }
+            _ => panic!("expected cases run command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_123",
+            "--target-id",
+            "t_1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cases {
+                action:
+                    CasesAction::Run {
+                        destination:
+                            cases::DestinationArgs {
+                                target,
+                                target_url,
+                                target_id,
+                            },
+                        ..
+                    },
+            }) => {
+                assert_eq!(target, None);
+                assert_eq!(target_url, None);
+                assert_eq!(target_id.as_deref(), Some("t_1"));
+            }
+            _ => panic!("expected cases run command"),
+        }
+    }
+
+    #[test]
+    fn cases_run_help_shows_only_the_target_flag() {
+        let mut cmd = Cli::command();
+        let run = cmd
+            .find_subcommand_mut("cases")
+            .unwrap()
+            .find_subcommand_mut("run")
+            .unwrap();
+        let help = run.render_help().to_string();
+        assert!(help.contains("--target <TARGET>"));
+        assert!(!help.contains("--target-url"));
+        assert!(!help.contains("--target-id"));
+        assert!(help.contains("--target-name <NAME>"));
     }
 
     #[test]
@@ -6975,8 +8498,9 @@ mod tests {
             target_id: None,
             target_name: None,
             wait: true,
-            timeout: Some("60s".to_string()),
+            timeout: Some(Duration::from_secs(60)),
             timeout_ms: None,
+            interval: None,
             interval_ms: None,
         })
         .unwrap();
@@ -6995,6 +8519,7 @@ mod tests {
             wait: false,
             timeout: None,
             timeout_ms: None,
+            interval: None,
             interval_ms: Some(500),
         })
         .unwrap();
@@ -7010,6 +8535,7 @@ mod tests {
             wait: false,
             timeout: None,
             timeout_ms: None,
+            interval: None,
             interval_ms: None,
         })
         .unwrap();
@@ -7026,6 +8552,7 @@ mod tests {
             wait: false,
             timeout: None,
             timeout_ms: None,
+            interval: None,
             interval_ms: None,
         })
         .unwrap_err();
@@ -7039,6 +8566,7 @@ mod tests {
             wait: false,
             timeout: None,
             timeout_ms: None,
+            interval: None,
             interval_ms: None,
         })
         .unwrap_err();
@@ -7046,12 +8574,477 @@ mod tests {
     }
 
     #[test]
-    fn cases_run_timeout_parser_accepts_seconds_and_units() {
-        assert_eq!(parse_duration_to_ms("60").unwrap(), 60_000);
-        assert_eq!(parse_duration_to_ms("60s").unwrap(), 60_000);
-        assert_eq!(parse_duration_to_ms("2m").unwrap(), 120_000);
-        assert_eq!(parse_duration_to_ms("1500ms").unwrap(), 1_500);
-        assert!(parse_timeout_ms(Some("1s".to_string()), Some(1_000)).is_err());
+    fn parse_duration_accepts_bare_seconds_and_units() {
+        assert_eq!(parse_duration("60").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(
+            parse_duration("1500ms").unwrap(),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3_600));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(
+            parse_duration(" 2 Hours ").unwrap(),
+            Duration::from_secs(7_200)
+        );
+    }
+
+    #[test]
+    fn parse_duration_reports_errors_in_cli_voice() {
+        assert_eq!(parse_duration("").unwrap_err(), "Duration cannot be empty.");
+        assert_eq!(
+            parse_duration("abc").unwrap_err(),
+            "Duration must start with a number."
+        );
+        assert_eq!(
+            parse_duration("5w").unwrap_err(),
+            "Invalid duration unit 'w'. Use ms, s, m, h, or d."
+        );
+        assert_eq!(
+            parse_duration("99999999999999999999").unwrap_err(),
+            "Duration is too large."
+        );
+        assert_eq!(
+            parse_duration("9999999999999999d").unwrap_err(),
+            "Duration is too large."
+        );
+    }
+
+    #[test]
+    fn format_duration_uses_the_largest_exact_unit() {
+        assert_eq!(format_duration(Duration::from_millis(1_500)), "1500ms");
+        assert_eq!(format_duration(Duration::from_secs(1)), "1s");
+        assert_eq!(format_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(format_duration(Duration::from_secs(1_800)), "30m");
+        assert_eq!(format_duration(Duration::from_secs(86_400)), "1d");
+        assert_eq!(format_duration(Duration::from_secs(90_000)), "25h");
+    }
+
+    #[test]
+    fn parse_whole_hours_rejects_partial_hours_and_zero() {
+        assert_eq!(
+            parse_whole_hours("24h").unwrap(),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            parse_whole_hours("86400").unwrap(),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            parse_whole_hours("7d").unwrap(),
+            Duration::from_secs(604_800)
+        );
+        for raw in ["90m", "0", "3601s", "500ms"] {
+            assert!(
+                parse_whole_hours(raw)
+                    .unwrap_err()
+                    .contains("whole number of hours"),
+                "{raw}"
+            );
+        }
+    }
+
+    fn cases_run_args(cli: Cli) -> (Option<Duration>, Option<u64>, Option<Duration>, Option<u64>) {
+        match cli.command {
+            Some(Commands::Cases {
+                action:
+                    CasesAction::Run {
+                        wait_options:
+                            cases::WaitArgs {
+                                timeout,
+                                timeout_ms,
+                                interval,
+                                interval_ms,
+                            },
+                        ..
+                    },
+            }) => (timeout, timeout_ms, interval, interval_ms),
+            _ => panic!("expected cases run command"),
+        }
+    }
+
+    #[test]
+    fn cases_run_duration_flags_replace_millisecond_flags() {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_1",
+            "--target",
+            "cli",
+            "--timeout",
+            "2m",
+            "--interval",
+            "500ms",
+        ])
+        .unwrap();
+        assert_eq!(
+            cases_run_args(cli),
+            (
+                Some(Duration::from_secs(120)),
+                None,
+                Some(Duration::from_millis(500)),
+                None
+            )
+        );
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_1",
+            "--target",
+            "cli",
+            "--timeout",
+            "60",
+        ])
+        .unwrap();
+        assert_eq!(cases_run_args(cli).0, Some(Duration::from_secs(60)));
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "cases",
+            "run",
+            "ep_1",
+            "--target",
+            "cli",
+            "--timeout-ms",
+            "500",
+            "--interval-ms",
+            "250",
+        ])
+        .unwrap();
+        assert_eq!(cases_run_args(cli), (None, Some(500), None, Some(250)));
+
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "cases",
+                "run",
+                "ep_1",
+                "--target",
+                "cli",
+                "--timeout",
+                "1s",
+                "--timeout-ms",
+                "5",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "cases",
+                "run",
+                "ep_1",
+                "--target",
+                "cli",
+                "--interval",
+                "1s",
+                "--interval-ms",
+                "500",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn cases_run_params_convert_durations_to_milliseconds() {
+        let params = build_case_run_params(CaseRunInput {
+            target: Some("cli".to_string()),
+            target_url: None,
+            target_id: None,
+            target_name: None,
+            wait: true,
+            timeout: Some(Duration::from_secs(120)),
+            timeout_ms: None,
+            interval: Some(Duration::from_millis(500)),
+            interval_ms: None,
+        })
+        .unwrap();
+        assert_eq!(params.timeout_ms, Some(120_000));
+        assert_eq!(params.interval_ms, Some(500));
+    }
+
+    #[test]
+    fn hidden_millisecond_flags_win_over_defaulted_duration_flags() {
+        assert_eq!(
+            resolve_millis_flag(
+                Some(Duration::from_secs(1)),
+                Some(250),
+                "interval-ms",
+                "interval"
+            ),
+            Some(250)
+        );
+        assert_eq!(
+            resolve_millis_flag(
+                Some(Duration::from_secs(2)),
+                None,
+                "interval-ms",
+                "interval"
+            ),
+            Some(2_000)
+        );
+        assert_eq!(
+            resolve_millis_flag(None, None, "timeout-ms", "timeout"),
+            None
+        );
+    }
+
+    #[test]
+    fn tunnel_events_interval_accepts_durations_and_hidden_milliseconds() {
+        fn interval_args(cli: Cli) -> (Duration, Option<u64>) {
+            match cli.command {
+                Some(Commands::Tunnel {
+                    action:
+                        Some(TunnelAction::Events {
+                            interval,
+                            interval_ms,
+                            ..
+                        }),
+                    ..
+                }) => (interval, interval_ms),
+                _ => panic!("expected tunnel events command"),
+            }
+        }
+
+        let cli = Cli::try_parse_from(["hooklistener", "tunnel", "events"]).unwrap();
+        assert_eq!(interval_args(cli), (Duration::from_secs(1), None));
+
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "tunnel",
+            "events",
+            "--follow",
+            "--interval",
+            "2s",
+        ])
+        .unwrap();
+        assert_eq!(interval_args(cli), (Duration::from_secs(2), None));
+
+        let cli = Cli::try_parse_from(["hooklistener", "tunnel", "events", "--interval-ms", "250"])
+            .unwrap();
+        let (interval, interval_ms) = interval_args(cli);
+        assert_eq!(interval_ms, Some(250));
+        assert_eq!(
+            resolve_millis_flag(Some(interval), interval_ms, "interval-ms", "interval"),
+            Some(250)
+        );
+
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "tunnel",
+                "events",
+                "--interval",
+                "2s",
+                "--interval-ms",
+                "1",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn anon_ttl_flags_accept_seconds_and_units() {
+        fn create_ttl(args: &[&str]) -> Duration {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Commands::Anon {
+                    action: AnonAction::Create { ttl },
+                }) => ttl,
+                _ => panic!("expected anon create command"),
+            }
+        }
+        fn tunnel_ttl(args: &[&str]) -> Duration {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Commands::Anon {
+                    action: AnonAction::Tunnel { ttl, .. },
+                }) => ttl,
+                _ => panic!("expected anon tunnel command"),
+            }
+        }
+
+        assert_eq!(
+            create_ttl(&["hooklistener", "anon", "create"]),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            create_ttl(&["hooklistener", "anon", "create", "--ttl", "3600"]),
+            Duration::from_secs(3_600)
+        );
+        assert_eq!(
+            create_ttl(&["hooklistener", "anon", "create", "--ttl", "7d"]),
+            Duration::from_secs(604_800)
+        );
+
+        assert_eq!(
+            tunnel_ttl(&["hooklistener", "anon", "tunnel"]),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            tunnel_ttl(&["hooklistener", "anon", "tunnel", "--ttl", "900"]),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            tunnel_ttl(&["hooklistener", "anon", "tunnel", "--ttl", "10m"]),
+            Duration::from_secs(600)
+        );
+
+        let error = parse_error(["hooklistener", "anon", "tunnel", "--ttl", "31m"]);
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(error.to_string().contains("between 1m and 30m"), "{error}");
+    }
+
+    #[test]
+    fn share_create_expires_in_accepts_whole_hours_and_hidden_hours_flag() {
+        fn expiry(args: &[&str]) -> (Option<Duration>, Option<u64>) {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Commands::Share {
+                    action:
+                        ShareAction::Create {
+                            expires_in,
+                            expires_in_hours,
+                            ..
+                        },
+                }) => (expires_in, expires_in_hours),
+                _ => panic!("expected share create command"),
+            }
+        }
+
+        assert_eq!(
+            expiry(&["hooklistener", "share", "create", "req_1"]),
+            (None, None)
+        );
+        assert_eq!(
+            expiry(&[
+                "hooklistener",
+                "share",
+                "create",
+                "req_1",
+                "--expires-in",
+                "24h"
+            ]),
+            (Some(Duration::from_secs(86_400)), None)
+        );
+        assert_eq!(
+            expiry(&[
+                "hooklistener",
+                "share",
+                "create",
+                "req_1",
+                "--expires-in-hours",
+                "24"
+            ]),
+            (None, Some(24))
+        );
+        assert_eq!(duration_hours(Duration::from_secs(604_800)), 168);
+
+        let error = parse_error([
+            "hooklistener",
+            "share",
+            "create",
+            "req_1",
+            "--expires-in",
+            "90m",
+        ]);
+        assert!(
+            error.to_string().contains("whole number of hours"),
+            "{error}"
+        );
+
+        assert_eq!(
+            parse_error_kind([
+                "hooklistener",
+                "share",
+                "create",
+                "req_1",
+                "--expires-in",
+                "24h",
+                "--expires-in-hours",
+                "24",
+            ]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn monitor_interval_is_a_closed_set_of_minutes() {
+        fn create_interval(raw: &str) -> MonitorInterval {
+            match Cli::try_parse_from([
+                "hooklistener",
+                "monitor",
+                "create",
+                "API",
+                "https://example.com/health",
+                "--interval",
+                raw,
+            ])
+            .unwrap()
+            .command
+            {
+                Some(Commands::Monitor {
+                    action: MonitorAction::Create { interval, .. },
+                }) => interval,
+                _ => panic!("expected monitor create command"),
+            }
+        }
+
+        assert_eq!(create_interval("5"), MonitorInterval::M5);
+        assert_eq!(create_interval("1h"), MonitorInterval::M60);
+        assert_eq!(create_interval("60M"), MonitorInterval::M60);
+        assert_eq!(create_interval("10m"), MonitorInterval::M10);
+        assert_eq!(MonitorInterval::M30.minutes(), 30);
+
+        match Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "create",
+            "API",
+            "https://example.com/health",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Commands::Monitor {
+                action: MonitorAction::Create { interval, .. },
+            }) => assert_eq!(interval, MonitorInterval::M5),
+            _ => panic!("expected monitor create command"),
+        }
+
+        match Cli::try_parse_from([
+            "hooklistener",
+            "monitor",
+            "update",
+            "mon_1",
+            "--interval",
+            "10m",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Commands::Monitor {
+                action: MonitorAction::Update { interval, .. },
+            }) => assert_eq!(interval, Some(MonitorInterval::M10)),
+            _ => panic!("expected monitor update command"),
+        }
+
+        for raw in ["7", "2h", "90s"] {
+            assert_eq!(
+                parse_error_kind([
+                    "hooklistener",
+                    "monitor",
+                    "create",
+                    "API",
+                    "https://example.com/health",
+                    "--interval",
+                    raw,
+                ]),
+                clap::error::ErrorKind::InvalidValue,
+                "{raw}"
+            );
+        }
     }
 
     #[test]
@@ -7076,16 +9069,16 @@ mod tests {
                 action:
                     CasesAction::Run {
                         endpoint_id,
-                        target,
+                        destination,
                         wait,
-                        timeout,
+                        wait_options,
                         ..
                     },
             } => {
                 assert_eq!(endpoint_id, "ep_123");
-                assert_eq!(target.as_deref(), Some("cli"));
+                assert_eq!(destination.target.as_deref(), Some("cli"));
                 assert!(wait);
-                assert_eq!(timeout.as_deref(), Some("60s"));
+                assert_eq!(wait_options.timeout, Some(Duration::from_secs(60)));
             }
             _ => panic!("expected cases run command"),
         }
@@ -7304,14 +9297,14 @@ mod tests {
                 "request list",
                 render_empty_status(
                     "NO REQUESTS FOUND",
-                    "Send a webhook, then run `hooklistener endpoint requests <endpoint-id>` again.",
+                    "Send a webhook, then run `hooklistener endpoint list-requests <endpoint-id>` again.",
                 ),
             ),
             (
                 "forward list",
                 render_empty_status(
                     "NO FORWARDS FOUND",
-                    "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <target-url>`.",
+                    "Run `hooklistener endpoint forward-request <endpoint-id> <request-id> <url>`.",
                 ),
             ),
             (
@@ -7346,7 +9339,7 @@ mod tests {
                 "anon events",
                 render_empty_status(
                     "NO EVENTS CAPTURED",
-                    "Send a webhook, then run `hooklistener anon events <endpoint-id> --token <token>`.",
+                    "Send a webhook, then run `hooklistener anon list-events <endpoint-id> --token <viewer-token>`.",
                 ),
             ),
         ]);
@@ -7443,7 +9436,7 @@ mod tests {
         );
         assert_eq!(
             receipt["next_actions"][0],
-            "hooklistener endpoint forward fwd_123"
+            "hooklistener endpoint show-forward fwd_123"
         );
     }
 
@@ -7730,22 +9723,6 @@ mod tests {
         let err = validate_forward_target_url("ftp://example.com/webhook").unwrap_err();
         assert!(
             err.to_string().contains("Use http or https"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn normalize_http_method_accepts_lowercase() {
-        let method = normalize_http_method(Some("post".to_string())).unwrap();
-        assert_eq!(method.as_deref(), Some("POST"));
-    }
-
-    #[test]
-    fn normalize_http_method_rejects_invalid_values() {
-        let err = normalize_http_method(Some("TRACE".to_string())).unwrap_err();
-        assert!(
-            err.to_string().contains("Invalid HTTP method"),
             "unexpected error: {}",
             err
         );

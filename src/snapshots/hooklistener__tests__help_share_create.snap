@@ -1,0 +1,27 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"share\", \"create\"])"
+---
+Create a public link for a captured request
+
+Usage: hooklistener share create [OPTIONS] <REQUEST_ID>
+
+Arguments:
+  <REQUEST_ID>  Captured request ID (from `endpoint list-requests`)
+
+Options:
+      --expires-in <DURATION>  Link lifetime in whole hours, such as 24h, 86400, or 7d
+      --password <PASSWORD>    Password required to open the link
+      --include-forwards       Include forwards in the shared view
+  -o, --org <ORG_ID>           Organization ID (overrides the configured default)
+  -h, --help                   Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout
