@@ -11,7 +11,7 @@ use tracing::error;
 use crate::api::ApiClient;
 use crate::app::{App, AppState};
 use crate::commands::{WorkerCompletion, supervise_json_worker};
-use crate::credentials::{ensure_valid_token, refreshed_access_token_rx};
+use crate::credentials::{ensure_valid_token, refreshed_access_token_rx, resolve_tunnel_org};
 use crate::receipts::{
     LISTEN_EVENT_SCHEMA, command_event_receipt, listen_event_receipt, listen_session_resource_uri,
     listen_started_receipt, reconnect_failure_reason,
@@ -32,7 +32,7 @@ pub async fn execute(
 ) -> Result<()> {
     let mut config = config::Config::load()?;
     let access_token = ensure_valid_token(&mut config).await?;
-    let selected_organization_id = config.selected_organization_id.clone();
+    let selected_organization_id = resolve_tunnel_org(None, &config);
     let access_token_rx = refreshed_access_token_rx(access_token, config);
 
     if json {
