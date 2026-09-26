@@ -74,12 +74,14 @@ Single binary crate; top-level modules are declared in `src/main.rs`.
 ## Tests
 
 - Unit tests live under `#[cfg(test)]` in each module. The large suites for
-  `main` and `tunnel` are in `src/tests.rs` and `src/tunnel/tests.rs` (plus
-  `audit_findings.rs` next to each) so their module paths, snapshot names, and
-  inventory entries stay stable.
+  `main` and `tunnel` are split by topic under `src/tests/` and
+  `src/tunnel/tests/` (plus `audit_findings.rs` next to each); shared helpers
+  sit in each directory's `mod.rs`. Moving a test between topic files changes
+  its module path, so rename its snapshot and inventory entry with it.
 - `insta` snapshot tests render TUI screens and command output; snapshots are
-  in `src/snapshots/`. Review new `.snap.new` files with `cargo insta review`
-  or by inspecting the diff before committing.
+  in a `snapshots/` directory next to the test file (`src/snapshots/`,
+  `src/tests/snapshots/`). Review new `.snap.new` files with
+  `cargo insta review` or by inspecting the diff before committing.
 - `mockito` mocks the HTTP API in `src/api.rs` and `src/updater.rs` tests.
 - `tests/tunnel_phase1_conformance.rs` is the integration suite for the tunnel
   protocol; fixtures are in `fixtures/`.

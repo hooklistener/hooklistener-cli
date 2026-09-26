@@ -1,9 +1,0 @@
----
-source: src/main.rs
-assertion_line: 3043
-expression: output
----
-[ERR] COMMAND FAILED
-
-MESSAGE        Not authenticated
-ACTION         Run `hooklistener login`
