@@ -83,10 +83,14 @@ pub fn error_hint(err: &anyhow::Error) -> Option<&str> {
 
     let message = err.to_string();
     if message.contains("Session expired") || message.contains("No access token") {
-        return Some("Run `hooklistener login` to re-authenticate.");
+        return Some(
+            "Run `hooklistener login` to re-authenticate, or set HOOKLISTENER_TOKEN for noninteractive use.",
+        );
     }
     if message.contains("No organization selected") {
-        return Some("Run `hooklistener org use <organization-id>` or pass --org to the command.");
+        return Some(
+            "Run `hooklistener org use <organization-id>`, pass --org, or set HOOKLISTENER_ORG.",
+        );
     }
     if message.contains("Confirmation required") {
         return Some("Verify the resource and organization, then re-run with --yes.");

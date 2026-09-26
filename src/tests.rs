@@ -3111,6 +3111,46 @@ async fn ensure_valid_token_returns_error_when_expired() {
     );
 }
 
+#[tokio::test]
+async fn ensure_valid_token_prefers_environment_token() {
+    let mut config = make_config(Some("org-config"));
+    let token = ensure_valid_token_with(&mut config, Some("env-token".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(token, "env-token");
+}
+
+#[tokio::test]
+async fn ensure_valid_token_without_environment_token_uses_saved_login() {
+    let mut config = make_config(Some("org-config"));
+    let err = ensure_valid_token_with(&mut config, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Session expired"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[test]
+fn resolve_org_from_prefers_cli_then_environment_then_config() {
+    let config = make_config(Some("org-config"));
+    let env = || Some("org-env".to_string());
+    assert_eq!(
+        resolve_org_from(Some("org-cli".to_string()), env(), &config).as_deref(),
+        Some("org-cli")
+    );
+    assert_eq!(
+        resolve_org_from(None, env(), &config).as_deref(),
+        Some("org-env")
+    );
+    assert_eq!(
+        resolve_org_from(None, None, &config).as_deref(),
+        Some("org-config")
+    );
+}
+
 #[test]
 fn forward_request_receipt_includes_agent_links() {
     let response = api::EndpointRequestForwardResponse {

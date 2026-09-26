@@ -9,8 +9,42 @@ use tracing::{error, warn};
 
 use crate::{api, auth, config};
 
+/// Environment variable holding an access token for noninteractive use (CI).
+/// When set, it takes precedence over the saved login and is never refreshed.
+pub const ACCESS_TOKEN_ENV: &str = "HOOKLISTENER_TOKEN";
+
+/// Environment variable naming the organization when `--org` is not passed.
+pub const ORGANIZATION_ENV: &str = "HOOKLISTENER_ORG";
+
+/// Reads a trimmed, non-empty value from the environment. CI secret stores
+/// often append a trailing newline, which would otherwise corrupt the header.
+fn env_value(name: &str) -> Option<String> {
+    non_empty_trimmed(std::env::var(name).ok())
+}
+
+fn non_empty_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub fn env_access_token() -> Option<String> {
+    env_value(ACCESS_TOKEN_ENV)
+}
+
 pub fn resolve_tunnel_org(cli_org: Option<String>, config: &config::Config) -> Option<String> {
-    cli_org.or_else(|| config.selected_organization_id.clone())
+    resolve_org_from(cli_org, env_value(ORGANIZATION_ENV), config)
+}
+
+/// Organization precedence: `--org`, then `HOOKLISTENER_ORG`, then the saved default.
+pub fn resolve_org_from(
+    cli_org: Option<String>,
+    env_org: Option<String>,
+    config: &config::Config,
+) -> Option<String> {
+    cli_org
+        .or(env_org)
+        .or_else(|| config.selected_organization_id.clone())
 }
 
 pub const ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
@@ -23,7 +57,9 @@ pub fn refreshed_access_token_rx(
 ) -> watch::Receiver<String> {
     let (token_tx, token_rx) = watch::channel(access_token);
 
-    if config.is_refresh_token_valid() {
+    // An environment token belongs to a different credential than the saved
+    // login; refreshing the saved one would silently swap identities.
+    if env_access_token().is_none() && config.is_refresh_token_valid() {
         tokio::spawn(refresh_access_token_loop(config, token_tx));
     }
 
@@ -107,6 +143,18 @@ pub fn access_token_refresh_delay(config: &config::Config) -> Duration {
 }
 
 pub async fn ensure_valid_token(config: &mut config::Config) -> Result<String> {
+    ensure_valid_token_with(config, env_access_token()).await
+}
+
+pub async fn ensure_valid_token_with(
+    config: &mut config::Config,
+    env_token: Option<String>,
+) -> Result<String> {
+    // 0. An environment token wins over the saved login and is used as-is
+    if let Some(token) = env_token {
+        return Ok(token);
+    }
+
     // 1. If access token is still valid, return it
     if config.is_token_valid() {
         return config
@@ -264,7 +312,22 @@ pub fn token_expiry_from_now(seconds: u64) -> Result<chrono::DateTime<Utc>> {
 pub fn require_organization(cli_org: Option<String>, config: &config::Config) -> Result<String> {
     resolve_tunnel_org(cli_org, config).ok_or_else(|| {
         anyhow!(
-            "No organization selected. Use `hooklistener org use <organization-id>` or pass --org."
+            "No organization selected. Use `hooklistener org use <organization-id>`, pass --org, or set HOOKLISTENER_ORG."
         )
     })
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::non_empty_trimmed;
+
+    #[test]
+    fn environment_values_are_trimmed_and_blank_values_ignored() {
+        assert_eq!(
+            non_empty_trimmed(Some(" token\n".to_string())).as_deref(),
+            Some("token")
+        );
+        assert_eq!(non_empty_trimmed(Some("  \n".to_string())), None);
+        assert_eq!(non_empty_trimmed(None), None);
+    }
 }
