@@ -1,0 +1,5 @@
+---
+source: src/tests/command_output.rs
+expression: output
+---
+PAGE 2/5  PAGE SIZE 25  TOTAL 120

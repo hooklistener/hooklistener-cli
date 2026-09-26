@@ -1,0 +1,8 @@
+---
+source: src/tests/command_output.rs
+expression: output
+---
+[ERR] COMMAND FAILED
+
+MESSAGE        Not authenticated
+ACTION         Run `hooklistener login`

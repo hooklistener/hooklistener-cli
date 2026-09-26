@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_INVENTORY = ROOT / "fixtures/tunnel_v3_release_test_inventory.txt"
+# Tunnel tests live in topic submodules (tunnel::tests::<topic>::...).
+TUNNEL_V3_CONTRACT = re.compile(
+    r"tunnel::tests::[a-z_]+::(?:protocol_v3_[a-z0-9_]+"
+    r"|tunnel_protocol_selection_prefers_v3_and_defaults_old_services_to_v2)"
+)
 CARGO_TEST = [
     "cargo",
     "test",
@@ -54,12 +60,7 @@ def main() -> int:
         name
         for name in discovered
         if name.startswith("tunnel_v3::tests::")
-        or name.startswith("tunnel::tests::protocol_v3_")
-        or name
-        == (
-            "tunnel::tests::"
-            "tunnel_protocol_selection_prefers_v3_and_defaults_old_services_to_v2"
-        )
+        or TUNNEL_V3_CONTRACT.fullmatch(name)
     }
     expected = set(expected_lines)
     if actual != expected:
