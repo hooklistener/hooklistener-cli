@@ -3,9 +3,9 @@
 use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 
-use crate::config;
 use crate::output::Stylize;
 use crate::render::{OutputStatus, output_field, print_field, print_json, print_status_block};
+use crate::{config, credentials};
 
 #[derive(Subcommand)]
 pub enum ConfigAction {
@@ -32,8 +32,12 @@ pub async fn execute(action: ConfigAction, json: bool) -> Result<()> {
         ConfigAction::Show => {
             let config = config::Config::load()?;
             let config_path = config::Config::config_path()?;
+            let env_token = credentials::env_access_token().is_some();
+            let organization_id = credentials::resolve_tunnel_org(None, &config);
             if json {
-                let token_status = if config.access_token.is_none() {
+                let token_status = if env_token {
+                    "environment"
+                } else if config.access_token.is_none() {
                     "none"
                 } else if config.is_token_valid() {
                     "valid"
@@ -44,25 +48,32 @@ pub async fn execute(action: ConfigAction, json: bool) -> Result<()> {
                 print_json(&serde_json::json!({
                     "config_path": config_path.display().to_string(),
                     "token": {
-                        "present": config.access_token.is_some(),
+                        "present": env_token || config.access_token.is_some(),
                         "status": token_status
                     },
-                    "organization_id": config.selected_organization_id
+                    "organization_id": organization_id
                 }))?;
             } else {
                 print_field("CONFIG FILE", config_path.display());
                 println!();
-                match &config.access_token {
-                    Some(_) => {
-                        if config.is_token_valid() {
-                            print_field("TOKEN", "(present, valid)".green());
-                        } else {
-                            print_field("TOKEN", "(present, expired)".red());
+                if env_token {
+                    print_field(
+                        "TOKEN",
+                        format!("(from {})", credentials::ACCESS_TOKEN_ENV).green(),
+                    );
+                } else {
+                    match &config.access_token {
+                        Some(_) => {
+                            if config.is_token_valid() {
+                                print_field("TOKEN", "(present, valid)".green());
+                            } else {
+                                print_field("TOKEN", "(present, expired)".red());
+                            }
                         }
+                        None => print_field("TOKEN", "(none)".dim()),
                     }
-                    None => print_field("TOKEN", "(none)".dim()),
                 }
-                match &config.selected_organization_id {
+                match &organization_id {
                     Some(org_id) => print_field("ORGANIZATION", org_id),
                     None => print_field("ORGANIZATION", "(none)".dim()),
                 }

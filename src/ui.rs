@@ -3037,7 +3037,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(status_paragraph, chunks[0]);
 
-    let connection_status = if app.config.access_token.is_some() && app.config.is_token_valid() {
+    let connection_status = if crate::credentials::env_access_token().is_some()
+        || (app.config.access_token.is_some() && app.config.is_token_valid())
+    {
         Span::styled(
             "API connected",
             Style::default()

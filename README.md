@@ -293,6 +293,16 @@ hooklistener --json endpoint forward-request \
   <endpoint-id> <request-id> http://localhost:3000/webhooks --dry-run
 ```
 
+In CI and other noninteractive environments, authenticate with environment variables instead of `hooklistener login`:
+
+```bash
+export HOOKLISTENER_TOKEN=<access-token>
+export HOOKLISTENER_ORG=<organization-id>
+hooklistener --json endpoint list
+```
+
+`HOOKLISTENER_TOKEN` takes precedence over the saved login, is sent as-is, and is never refreshed or written to disk. `HOOKLISTENER_ORG` is used when `--org` is not passed and takes precedence over the default set with `org use`. `config show` reports which source is active.
+
 Long-running `listen --json` and `tunnel --json` commands emit newline-delimited JSON. Each line is a receipt or event, so consumers can process connection state, captured request URIs, and forwarding outcomes as they happen.
 
 ```bash
