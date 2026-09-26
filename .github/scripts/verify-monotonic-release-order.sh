@@ -75,31 +75,49 @@ fetch_registry() {
   [[ "${status}" == "200" ]]
 }
 
-if ! fetch_registry \
-  "${crates_state}" \
-  "https://crates.io/api/v1/crates/hooklistener-cli" \
-  --header \
-  "User-Agent: hooklistener-release-workflow (${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY})"; then
-  echo "::error::Could not read the complete crates.io release history." >&2
+# crates.io and npm can serve a cached package listing for several minutes
+# after a publish, so a stage that requires the new version rereads them
+# until it appears or the attempts run out.
+visibility_attempts="${RELEASE_ORDER_VISIBILITY_ATTEMPTS:-16}"
+visibility_delay="${RELEASE_ORDER_VISIBILITY_DELAY:-30}"
+if [[ ! "${visibility_attempts}" =~ ^[1-9][0-9]*$ ]] ||
+  [[ ! "${visibility_delay}" =~ ^[0-9]+$ ]]; then
+  echo "::error::Invalid registry visibility retry settings." >&2
   exit 1
 fi
 
-if ! fetch_registry \
-  "${npm_state}" \
-  "https://registry.npmjs.org/hooklistener"; then
-  echo "::error::Could not read the complete npm release history." >&2
-  exit 1
-fi
+attempt=1
+while true; do
+  if ! fetch_registry \
+    "${crates_state}" \
+    "https://crates.io/api/v1/crates/hooklistener-cli" \
+    --header \
+    "User-Agent: hooklistener-release-workflow (${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY})"; then
+    echo "::error::Could not read the complete crates.io release history." >&2
+    exit 1
+  fi
 
-TAG_NAME="${tag_name}" \
-  RELEASE_STAGE="${stage}" \
-  GITHUB_RELEASES_JSON="${github_releases}" \
-  CRATES_JSON="${crates_state}" \
-  NPM_JSON="${npm_state}" \
-  python3 <<'PY'
+  if ! fetch_registry \
+    "${npm_state}" \
+    "https://registry.npmjs.org/hooklistener"; then
+    echo "::error::Could not read the complete npm release history." >&2
+    exit 1
+  fi
+
+  if TAG_NAME="${tag_name}" \
+    RELEASE_STAGE="${stage}" \
+    GITHUB_RELEASES_JSON="${github_releases}" \
+    CRATES_JSON="${crates_state}" \
+    NPM_JSON="${npm_state}" \
+    python3 <<'PY'
 import json
 import os
 import re
+import sys
+
+# Registries can serve a cached listing for minutes after a publish; this
+# status asks the caller to read them again.
+NOT_YET_VISIBLE = 75
 
 stable = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
@@ -248,10 +266,12 @@ elif stage == "promote":
     if target not in npm_versions:
         missing_registries.append("npm")
     if missing_registries:
-        raise SystemExit(
+        print(
             f"promote requires {target_tag} to be visible on "
-            + " and ".join(missing_registries)
+            + " and ".join(missing_registries),
+            file=sys.stderr,
         )
+        raise SystemExit(NOT_YET_VISIBLE)
     if newer and exact_state == "stable":
         print("superseded")
         raise SystemExit(0)
@@ -263,10 +283,12 @@ if stage == "homebrew-push":
     if target not in npm_versions:
         missing_registries.append("npm")
     if missing_registries:
-        raise SystemExit(
+        print(
             f"homebrew-push requires {target_tag} to be visible on "
-            + " and ".join(missing_registries)
+            + " and ".join(missing_registries),
+            file=sys.stderr,
         )
+        raise SystemExit(NOT_YET_VISIBLE)
 
 if newer:
     rendered = ", ".join(
@@ -277,3 +299,16 @@ if newer:
 
 print("promote" if stage == "promote" else "proceed")
 PY
+  then
+    exit 0
+  else
+    status=$?
+  fi
+
+  if [[ "${status}" -ne 75 ]] || [[ "${attempt}" -ge "${visibility_attempts}" ]]; then
+    exit "${status}"
+  fi
+  echo "::warning::Registry does not list ${tag_name} yet (attempt ${attempt} of ${visibility_attempts}); retrying in ${visibility_delay}s." >&2
+  sleep "${visibility_delay}"
+  attempt=$((attempt + 1))
+done
