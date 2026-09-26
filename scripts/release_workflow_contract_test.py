@@ -338,6 +338,7 @@ class MonotonicReleaseOrderTest(unittest.TestCase):
         yanked_crates: set[str] | None = None,
         stage: str = "verify",
         tag: str = "v1.8.0",
+        later_npm_versions: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -373,6 +374,18 @@ class MonotonicReleaseOrderTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            if later_npm_versions is not None:
+                (fixture_dir / "npm-later.json").write_text(
+                    json.dumps(
+                        {
+                            "dist-tags": {"latest": later_npm_versions[0]},
+                            "versions": {
+                                version: {} for version in later_npm_versions
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
 
             fake_gh = bin_dir / "gh"
             fake_gh.write_text(
@@ -423,7 +436,15 @@ class MonotonicReleaseOrderTest(unittest.TestCase):
                     if "crates.io" in url:
                         fixture = fixtures / "crates.json"
                     elif "registry.npmjs.org" in url:
+                        # Serve npm-later.json from the second read on, like a
+                        # registry cache that catches up after a publish.
+                        reads = fixtures / "npm-reads"
+                        count = int(reads.read_text()) if reads.exists() else 0
+                        reads.write_text(str(count + 1))
                         fixture = fixtures / "npm.json"
+                        later = fixtures / "npm-later.json"
+                        if count > 0 and later.exists():
+                            fixture = later
                     else:
                         raise SystemExit(f"unexpected fake curl URL: {url}")
                     output.write_bytes(fixture.read_bytes())
@@ -441,6 +462,8 @@ class MonotonicReleaseOrderTest(unittest.TestCase):
                     "GITHUB_REPOSITORY": "hooklistener/hooklistener-cli",
                     "GITHUB_SERVER_URL": "https://github.com",
                     "HOOKLISTENER_ORDER_FIXTURES": str(fixture_dir),
+                    "RELEASE_ORDER_VISIBILITY_ATTEMPTS": "3",
+                    "RELEASE_ORDER_VISIBILITY_DELAY": "0",
                     "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
                     "RUNNER_TEMP": str(temp),
                 }
@@ -630,6 +653,21 @@ class MonotonicReleaseOrderTest(unittest.TestCase):
                             **fixture,
                         )
                     )
+
+        for stage in ("homebrew-push", "promote"):
+            with self.subTest(stage=stage, missing="npm-until-reread"):
+                result = self.run_order(
+                    releases=releases,
+                    crates_versions=["1.8.0", "1.7.3"],
+                    npm_versions=["1.7.3"],
+                    later_npm_versions=["1.8.0", "1.7.3"],
+                    stage=stage,
+                )
+                self.assert_order_passes(
+                    result,
+                    "proceed" if stage == "homebrew-push" else "promote",
+                )
+                self.assertIn("attempt 1 of 3", result.stderr)
 
         for prerelease in (True, False):
             with self.subTest(stage="promote", missing="both", prerelease=prerelease):
