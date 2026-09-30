@@ -1,7 +1,7 @@
 pub mod cases;
 
 use crate::{
-    errors::TunnelLifecycleError,
+    errors::{PlanLimitError, TunnelLifecycleError},
     models::{ForwardResponse, WebhookRequest},
     target_policy::TargetPolicy,
 };
@@ -224,10 +224,54 @@ fn structured_server_error_detail(body: &str) -> Option<String> {
     Some(bounded_control_neutral_text(&detail))
 }
 
+const MAX_UPGRADE_URL_BYTES: usize = 512;
+
+/// The `upgrade` hint the server attaches to plan-limit errors
+/// (`{"error": "...", "upgrade": {"reason", "upgrade_url", "trial_available"}}`).
+fn plan_upgrade(body: &str) -> Option<(String, String, bool)> {
+    let payload = serde_json::from_str::<Value>(body).ok()?;
+    let upgrade = payload
+        .get("upgrade")
+        .or_else(|| payload.get("error").and_then(|error| error.get("upgrade")))?;
+    let upgrade_url = safe_upgrade_url(upgrade.get("upgrade_url").and_then(Value::as_str)?)?;
+    let reason = match upgrade.get("reason").and_then(Value::as_str) {
+        Some("plan_feature_unavailable") => "plan_feature_unavailable",
+        _ => "plan_limit_reached",
+    };
+    let trial_available = upgrade
+        .get("trial_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Some((reason.to_string(), upgrade_url, trial_available))
+}
+
+/// Only an https link, or plain http to a loopback dev server, is shown, and
+/// only as `Url` re-serializes it, so a response cannot smuggle another scheme
+/// or terminal control sequences into the hint.
+fn safe_upgrade_url(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    let allowed = match url.scheme() {
+        "https" => true,
+        "http" => server_url_is_loopback(&url),
+        _ => false,
+    };
+    let url = url.to_string();
+
+    (allowed && url.len() <= MAX_UPGRADE_URL_BYTES).then_some(url)
+}
+
 fn server_response_error(context: &str, status: StatusCode, body: &str) -> anyhow::Error {
-    match structured_server_error_detail(body) {
-        Some(detail) => anyhow!("{context} (HTTP {status}; {detail})"),
-        None => anyhow!("{context} (HTTP {status})"),
+    let message = match structured_server_error_detail(body) {
+        Some(detail) => format!("{context} (HTTP {status}; {detail})"),
+        None => format!("{context} (HTTP {status})"),
+    };
+
+    match plan_upgrade(body) {
+        Some((reason, upgrade_url, trial_available)) => {
+            PlanLimitError::new(message, reason, upgrade_url, trial_available).into()
+        }
+        None => anyhow!(message),
     }
 }
 
@@ -2035,6 +2079,99 @@ mod tests {
         let detail = structured_server_error_detail(&body).unwrap();
 
         assert!(detail.len() <= MAX_SERVER_ERROR_DETAIL_BYTES);
+    }
+
+    #[test]
+    fn server_response_error_keeps_the_plan_upgrade_link() {
+        let upgrade_url = "https://app.hooklistener.com/organization/settings/billing?upgrade_source=api_static_tunnels";
+        let body = serde_json::json!({
+            "error": "Static tunnel limit reached (1). Delete an existing one or upgrade your plan.",
+            "upgrade": {
+                "reason": "plan_limit_reached",
+                "resource": "static_tunnels",
+                "limit": 1,
+                "plan": "free_plan",
+                "trial_available": true,
+                "upgrade_url": upgrade_url
+            }
+        })
+        .to_string();
+
+        let error =
+            server_response_error("create static tunnel failed", StatusCode::FORBIDDEN, &body);
+
+        assert_eq!(
+            error.to_string(),
+            "create static tunnel failed (HTTP 403 Forbidden; message=Static tunnel limit reached (1). Delete an existing one or upgrade your plan.)"
+        );
+        assert_eq!(crate::errors::error_code(&error), "plan_limit_reached");
+        assert_eq!(
+            crate::errors::error_hint(&error),
+            Some(format!("Start a free Pro trial to lift this limit: {upgrade_url}").as_str())
+        );
+
+        let receipt = crate::errors::json_error_receipt(&error);
+        assert_eq!(receipt["error"]["details"]["upgrade_url"], upgrade_url);
+        assert_eq!(receipt["error"]["details"]["trial_available"], true);
+    }
+
+    #[test]
+    fn plan_feature_errors_without_a_trial_point_to_the_plans() {
+        let body = serde_json::json!({
+            "error": "Static tunnels are not available on your current plan. Please upgrade.",
+            "upgrade": {
+                "reason": "plan_feature_unavailable",
+                "trial_available": false,
+                "upgrade_url": "https://app.hooklistener.com/organization/settings/billing"
+            }
+        })
+        .to_string();
+
+        let error = server_response_error("Request failed", StatusCode::FORBIDDEN, &body)
+            .context("create static tunnel");
+
+        assert_eq!(
+            crate::errors::error_code(&error),
+            "plan_feature_unavailable"
+        );
+        assert_eq!(
+            crate::errors::error_hint(&error),
+            Some(
+                "Upgrade your plan to lift this limit: https://app.hooklistener.com/organization/settings/billing"
+            )
+        );
+    }
+
+    #[test]
+    fn plan_upgrade_links_must_be_https_or_loopback() {
+        assert_eq!(safe_upgrade_url("javascript:alert(1)"), None);
+        assert_eq!(safe_upgrade_url("http://billing.example/upgrade"), None);
+        assert_eq!(
+            safe_upgrade_url("http://localhost:4000/organization/settings/billing").as_deref(),
+            Some("http://localhost:4000/organization/settings/billing")
+        );
+
+        let escaped = safe_upgrade_url("https://app.hooklistener.com/billing?x=\u{1b}]52;c;e\u{7}")
+            .expect("https link is kept");
+        assert!(!escaped.contains('\u{1b}') && !escaped.contains('\u{7}'));
+
+        let too_long = format!("https://app.hooklistener.com/{}", "a".repeat(600));
+        assert_eq!(safe_upgrade_url(&too_long), None);
+    }
+
+    #[test]
+    fn server_response_error_ignores_an_unusable_upgrade_link() {
+        let body = serde_json::json!({
+            "error": "Nope",
+            "upgrade": {"upgrade_url": "ftp://billing.example"}
+        })
+        .to_string();
+
+        let error = server_response_error("Request failed", StatusCode::FORBIDDEN, &body);
+
+        assert!(error.downcast_ref::<PlanLimitError>().is_none());
+        assert_eq!(crate::errors::error_code(&error), "command_failed");
+        assert_eq!(crate::errors::error_hint(&error), None);
     }
 
     #[tokio::test]

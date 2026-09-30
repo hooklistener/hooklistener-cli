@@ -53,6 +53,56 @@ impl TunnelLifecycleError {
     }
 }
 
+/// A request the server refused because of the organization's plan: a limit
+/// reached, or a feature the plan does not include. It keeps the billing link
+/// the server sent with the error, so the user learns where to lift the limit
+/// instead of hitting a dead end.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct PlanLimitError {
+    message: String,
+    reason: String,
+    upgrade_url: String,
+    trial_available: bool,
+    hint: String,
+}
+
+impl PlanLimitError {
+    pub fn new(
+        message: String,
+        reason: String,
+        upgrade_url: String,
+        trial_available: bool,
+    ) -> Self {
+        let hint = if trial_available {
+            format!("Start a free Pro trial to lift this limit: {upgrade_url}")
+        } else {
+            format!("Upgrade your plan to lift this limit: {upgrade_url}")
+        };
+
+        Self {
+            message,
+            reason,
+            upgrade_url,
+            trial_available,
+            hint,
+        }
+    }
+
+    /// `plan_limit_reached` or `plan_feature_unavailable`.
+    pub fn code(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn hint(&self) -> &str {
+        &self.hint
+    }
+
+    pub fn upgrade_url(&self) -> &str {
+        &self.upgrade_url
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error("Failed to check for updates: {0}")]
@@ -77,6 +127,9 @@ pub fn error_hint(err: &anyhow::Error) -> Option<&str> {
     if let Some(e) = err.downcast_ref::<TunnelLifecycleError>() {
         return e.hint();
     }
+    if let Some(e) = err.downcast_ref::<PlanLimitError>() {
+        return Some(e.hint());
+    }
     if let Some(e) = err.downcast_ref::<UpdateError>() {
         return e.hint();
     }
@@ -100,6 +153,8 @@ pub fn error_hint(err: &anyhow::Error) -> Option<&str> {
 
 pub fn error_code(err: &anyhow::Error) -> String {
     if let Some(error) = err.downcast_ref::<TunnelLifecycleError>() {
+        error.code().to_string()
+    } else if let Some(error) = err.downcast_ref::<PlanLimitError>() {
         error.code().to_string()
     } else if err.downcast_ref::<UpdateError>().is_some() {
         "update_error".to_string()
@@ -145,7 +200,13 @@ pub fn json_error_receipt(err: &anyhow::Error) -> serde_json::Value {
         Some(TunnelLifecycleError::IncompatibleSchema { supported, actual }) => {
             serde_json::json!({"supported_major": supported, "actual_major": actual})
         }
-        _ => serde_json::Value::Null,
+        _ => match err.downcast_ref::<PlanLimitError>() {
+            Some(error) => serde_json::json!({
+                "upgrade_url": error.upgrade_url(),
+                "trial_available": error.trial_available,
+            }),
+            None => serde_json::Value::Null,
+        },
     };
 
     serde_json::json!({
