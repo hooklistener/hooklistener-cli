@@ -897,6 +897,14 @@ fn help_snapshot_endpoint() {
 }
 
 #[test]
+fn help_snapshot_endpoint_wait() {
+    insta::assert_snapshot!(
+        "help_endpoint_wait",
+        render_help_snapshot(&["endpoint", "wait"])
+    );
+}
+
+#[test]
 fn help_snapshot_endpoint_list() {
     insta::assert_snapshot!(
         "help_endpoint_list",
@@ -1192,6 +1200,130 @@ fn endpoint_requests_is_alias_of_list_requests() {
             "endpoint {spelling} must yield ListRequests"
         );
     }
+}
+
+#[test]
+fn endpoint_wait_parses_repeatable_filters() {
+    let cli = Cli::try_parse_from([
+        "hooklistener",
+        "endpoint",
+        "wait",
+        "ep_1",
+        "--event-type",
+        "invoice.paid",
+        "--header",
+        "X-GitHub-Event=push",
+        "--body",
+        "/data/id=42",
+        "--body",
+        "/type=invoice.paid",
+        "--since",
+        "1m",
+        "--timeout",
+        "2m",
+    ])
+    .unwrap_or_else(|err| panic!("endpoint wait parses: {err}"));
+
+    match cli.command {
+        Some(Commands::Endpoint {
+            action:
+                EndpointAction::Wait {
+                    endpoint_id,
+                    since,
+                    event_type,
+                    headers,
+                    body,
+                    timeout,
+                    ..
+                },
+        }) => {
+            assert_eq!(endpoint_id, "ep_1");
+            assert_eq!(since.as_deref(), Some("1m"));
+            assert_eq!(event_type.as_deref(), Some("invoice.paid"));
+            assert_eq!(headers, vec!["X-GitHub-Event=push"]);
+            assert_eq!(body, vec!["/data/id=42", "/type=invoice.paid"]);
+            assert_eq!(timeout, Some(std::time::Duration::from_secs(120)));
+        }
+        _ => panic!("endpoint wait must yield Wait"),
+    }
+
+    assert!(
+        Cli::try_parse_from([
+            "hooklistener",
+            "endpoint",
+            "wait",
+            "ep_1",
+            "--timeout",
+            "2h"
+        ])
+        .is_err(),
+        "a wait longer than an hour is refused"
+    );
+}
+
+#[test]
+fn resolve_since_reads_durations_as_time_ago_and_passes_times_and_ids_through() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    assert_eq!(
+        resolve_since(None, now).unwrap(),
+        "2026-09-30T12:00:00.000Z"
+    );
+    assert_eq!(
+        resolve_since(Some("90s"), now).unwrap(),
+        "2026-09-30T11:58:30.000Z"
+    );
+    assert_eq!(
+        resolve_since(Some("5m"), now).unwrap(),
+        "2026-09-30T11:55:00.000Z"
+    );
+    assert_eq!(
+        resolve_since(Some("2026-09-30T11:00:00+02:00"), now).unwrap(),
+        "2026-09-30T11:00:00+02:00"
+    );
+
+    let request_id = "5f0c6e2a-1b2c-4d5e-8f90-123456789abc";
+    assert_eq!(resolve_since(Some(request_id), now).unwrap(), request_id);
+}
+
+#[test]
+fn endpoint_wait_match_flags_take_name_value_pairs() {
+    assert_eq!(
+        parse_match_pairs(
+            &["X-GitHub-Event=push".to_string(), "x-sig=a=b".to_string()],
+            "--header"
+        )
+        .unwrap(),
+        vec![
+            ("X-GitHub-Event".to_string(), "push".to_string()),
+            ("x-sig".to_string(), "a=b".to_string()),
+        ]
+    );
+
+    let missing_value = parse_match_pairs(&["push".to_string()], "--header").unwrap_err();
+    assert!(
+        missing_value
+            .to_string()
+            .contains("--header takes NAME=VALUE")
+    );
+
+    let not_a_pointer = parse_body_matches(&["data.id=42".to_string()]).unwrap_err();
+    assert!(not_a_pointer.to_string().contains("JSON Pointer"));
+}
+
+#[test]
+fn endpoint_wait_timeout_has_its_own_error_code() {
+    let err: anyhow::Error = crate::errors::RequestWaitTimeout {
+        endpoint_id: "ep_1".to_string(),
+        timeout: "30s".to_string(),
+    }
+    .into();
+
+    assert_eq!(crate::errors::error_code(&err), "wait_timeout");
+    assert_eq!(crate::errors::command_exit_code(&err), 1);
+    assert!(crate::errors::error_hint(&err).is_some_and(|hint| hint.contains("--since")));
 }
 
 #[test]

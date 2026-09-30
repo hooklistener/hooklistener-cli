@@ -812,6 +812,48 @@ struct DataResponse<T> {
     data: T,
 }
 
+/// Filters for [`ApiClient::wait_for_endpoint_request`]. Headers are sent as
+/// `header[<name>]=<value>` and body matches as `body[<JSON Pointer>]=<value>`.
+#[derive(Debug, Default)]
+pub struct RequestWaitFilters {
+    pub since: Option<String>,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub event_type: Option<String>,
+    pub event_id: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<(String, String)>,
+}
+
+impl RequestWaitFilters {
+    fn query(&self, timeout_seconds: u64) -> Vec<(String, String)> {
+        let mut query = vec![("timeout".to_string(), timeout_seconds.to_string())];
+        let optional = [
+            ("since", &self.since),
+            ("method", &self.method),
+            ("path", &self.path),
+            ("event_type", &self.event_type),
+            ("event_id", &self.event_id),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                query.push((name.to_string(), value.clone()));
+            }
+        }
+        query.extend(
+            self.headers
+                .iter()
+                .map(|(name, value)| (format!("header[{name}]"), value.clone())),
+        );
+        query.extend(
+            self.body
+                .iter()
+                .map(|(pointer, value)| (format!("body[{pointer}]"), value.clone())),
+        );
+        query
+    }
+}
+
 // ── Anonymous Endpoint models ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1405,6 +1447,35 @@ impl ApiClient {
         let response: DataResponse<DebugRequestDetail> =
             self.get_json(&path, "get endpoint request").await?;
         Ok(response.data)
+    }
+
+    /// Long-polls up to `timeout_seconds` (the server allows at most 60) for
+    /// the next request matching `filters`; `None` when none arrives in time.
+    pub async fn wait_for_endpoint_request(
+        &self,
+        endpoint_id: &str,
+        filters: &RequestWaitFilters,
+        timeout_seconds: u64,
+    ) -> Result<Option<DebugRequestDetail>> {
+        let path = format!("/api/v1/endpoints/{}/requests/wait", endpoint_id);
+        let mut url = Url::parse(&self.api_url(&path)?).context("Invalid wait URL")?;
+        url.query_pairs_mut()
+            .extend_pairs(filters.query(timeout_seconds));
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("Failed to wait for endpoint request")?;
+
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+
+        let response: DataResponse<DebugRequestDetail> = self
+            .parse_json_response(response, "wait for endpoint request")
+            .await?;
+        Ok(Some(response.data))
     }
 
     pub async fn delete_endpoint_request(&self, endpoint_id: &str, request_id: &str) -> Result<()> {
@@ -2861,5 +2932,66 @@ mod audit_findings {
             !leaked.matched_async().await,
             "refresh token was forwarded to the redirect target"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_endpoint_request_sends_filters_and_returns_the_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/endpoints/ep-1/requests/wait")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("timeout".into(), "45".into()),
+                mockito::Matcher::UrlEncoded("since".into(), "2026-09-30T12:00:00.000Z".into()),
+                mockito::Matcher::UrlEncoded("method".into(), "POST".into()),
+                mockito::Matcher::UrlEncoded("event_type".into(), "invoice.paid".into()),
+                mockito::Matcher::UrlEncoded("header[X-GitHub-Event]".into(), "push".into()),
+                mockito::Matcher::UrlEncoded("body[/data/id]".into(), "42".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"id":"req-1","method":"POST","url":"https://example.com/w/x"}}"#)
+            .create_async()
+            .await;
+
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+        let filters = RequestWaitFilters {
+            since: Some("2026-09-30T12:00:00.000Z".into()),
+            method: Some("POST".into()),
+            event_type: Some("invoice.paid".into()),
+            headers: vec![("X-GitHub-Event".into(), "push".into())],
+            body: vec![("/data/id".into(), "42".into())],
+            ..Default::default()
+        };
+
+        let request = client
+            .wait_for_endpoint_request("ep-1", &filters, 45)
+            .await
+            .unwrap();
+
+        assert_eq!(request.map(|request| request.id), Some("req-1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_endpoint_request_reads_no_content_as_nothing_yet() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/endpoints/ep-1/requests/wait")
+            .match_query(mockito::Matcher::Any)
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+
+        let request = client
+            .wait_for_endpoint_request("ep-1", &RequestWaitFilters::default(), 0)
+            .await
+            .unwrap();
+
+        assert!(request.is_none());
+        mock.assert_async().await;
     }
 }

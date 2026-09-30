@@ -328,6 +328,20 @@ Exit status `0` means success, `1` means a runtime failure, `2` means command-li
 
 `--json`, `--color`, `--yes`, `--log-level`, `--log-dir`, and `--log-stdout` are global flags and are accepted before or after any subcommand, so `hooklistener tunnel --log-level debug prepare` and `hooklistener --log-level debug tunnel prepare` are equivalent.
 
+### Wait for a webhook in CI
+
+`endpoint wait` prints the first request that matches its filters and exits `0`, or exits `1` with the `wait_timeout` error code when `--timeout` passes first. Use it to check that your system sends the webhook it should:
+
+```bash
+export HOOKLISTENER_TOKEN=<api-key> HOOKLISTENER_ORG=<organization-id>
+SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+./scripts/create-test-order.sh  # your app posts its webhook to the endpoint
+hooklistener --json endpoint wait <endpoint-id> --since "$SINCE" \
+  --body /order/id=42 --timeout 2m > webhook.json
+```
+
+Only requests captured after `--since` match. It defaults to when the command starts, so note the time before triggering the webhook, or pass a duration such as `--since 1m`. The other filters are `--method`, `--path`, `--event-type` and `--event-id` (detected for senders such as Stripe and GitHub), `--header NAME=VALUE`, and `--body /JSON/POINTER=VALUE`, whose value is read as JSON when it parses.
+
 ### Migration
 
 The following spellings still parse and behave as before. The `endpoint` and `anon` list/show names remain listed as aliases in `--help`; every other entry is hidden from `--help`. Scripts should move to the replacement; the `-ms` and `-hours` flags print a one-line deprecation warning on stderr and leave stdout untouched.

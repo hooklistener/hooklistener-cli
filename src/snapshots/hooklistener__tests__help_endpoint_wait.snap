@@ -1,0 +1,36 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"endpoint\", \"wait\"])"
+---
+Wait for a request matching the filters to reach an endpoint
+
+Usage: hooklistener endpoint wait [OPTIONS] <ENDPOINT_ID>
+
+Arguments:
+  <ENDPOINT_ID>  Debug endpoint ID
+
+Options:
+      --since <WHEN>             Match requests captured after this: an RFC 3339 time, a request ID,
+                                 or a duration ago such as 90s or 5m [default: now]
+      --method <METHOD>          HTTP method [possible values: GET, POST, PUT, PATCH, DELETE, HEAD,
+                                 OPTIONS]
+      --path <PATH>              Exact request path
+      --event-type <EVENT_TYPE>  Event type detected for known senders, such as invoice.paid
+      --event-id <EVENT_ID>      Event ID detected for known senders, such as evt_123
+      --header <NAME=VALUE>      Header value to match, as NAME=VALUE; repeatable
+      --body </POINTER=VALUE>    JSON body value at a JSON Pointer, as /POINTER=VALUE; repeatable.
+                                 VALUE is read as JSON when it parses: 42 is a number, '"42"' a
+                                 string
+      --timeout <DURATION>       Maximum wait, such as 60, 2m, or 1h (up to 1h) [default: 30s]
+  -o, --org <ORG_ID>             Organization ID (overrides the configured default)
+  -h, --help                     Print help (see more with '--help')
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout

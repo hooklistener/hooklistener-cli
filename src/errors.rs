@@ -103,6 +103,14 @@ impl PlanLimitError {
     }
 }
 
+/// `endpoint wait` ran out of time before a matching request arrived.
+#[derive(Debug, Error)]
+#[error("No matching request reached endpoint {endpoint_id} within {timeout}.")]
+pub struct RequestWaitTimeout {
+    pub endpoint_id: String,
+    pub timeout: String,
+}
+
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error("Failed to check for updates: {0}")]
@@ -133,6 +141,11 @@ pub fn error_hint(err: &anyhow::Error) -> Option<&str> {
     if let Some(e) = err.downcast_ref::<UpdateError>() {
         return e.hint();
     }
+    if err.downcast_ref::<RequestWaitTimeout>().is_some() {
+        return Some(
+            "Check the filters and --since: without --since, only requests captured after the command started match.",
+        );
+    }
 
     let message = err.to_string();
     if message.contains("Session expired") || message.contains("No access token") {
@@ -158,6 +171,8 @@ pub fn error_code(err: &anyhow::Error) -> String {
         error.code().to_string()
     } else if err.downcast_ref::<UpdateError>().is_some() {
         "update_error".to_string()
+    } else if err.downcast_ref::<RequestWaitTimeout>().is_some() {
+        "wait_timeout".to_string()
     } else {
         let message = err.to_string();
         if message.contains("Confirmation required") {
