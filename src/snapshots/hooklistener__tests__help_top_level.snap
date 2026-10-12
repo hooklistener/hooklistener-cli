@@ -10,6 +10,7 @@ Commands:
   listen         Forward events from a debug endpoint to a local URL
   tunnel         Expose a local HTTP server on a public Hooklistener URL
   endpoint       Manage debug endpoints and their captured requests
+  inbox          Create email inboxes and wait for the codes and links in their emails
   static-tunnel  Reserve and manage static tunnel slugs
   anon           Create temporary endpoints and tunnels (no login required)
   cases          Save captured requests as cases, then replay or run them against a target
@@ -40,7 +41,7 @@ Global options:
       --log-stdout         Also write logs to stdout
 
 COMMAND GROUPS:
-  Capture and delivery: listen, tunnel, endpoint, static-tunnel, anon
+  Capture and delivery: listen, tunnel, endpoint, inbox, static-tunnel, anon
   Review and automation: cases, share, monitor
   Account and settings: login, logout, org, config
   Maintenance: diagnostics, clean-logs, completions, update
@@ -58,3 +59,7 @@ COMMON WORKFLOWS:
   Create and inspect hosted captures:
     hooklistener endpoint create <name>
     hooklistener endpoint list-requests <endpoint-id>
+
+  Read the code in an email your app sends:
+    hooklistener inbox create <name>
+    hooklistener inbox wait <inbox> --code

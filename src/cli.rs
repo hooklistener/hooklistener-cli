@@ -9,6 +9,7 @@ use crate::commands::cases::CasesAction;
 use crate::commands::completions::CompletionShell;
 use crate::commands::config::ConfigAction;
 use crate::commands::endpoint::EndpointAction;
+use crate::commands::inbox::InboxAction;
 use crate::commands::monitor::MonitorAction;
 use crate::commands::org::OrgAction;
 use crate::commands::share::ShareAction;
@@ -21,7 +22,7 @@ use crate::output::ColorMode;
 #[command(about = "Inspect webhooks, replay failures, and expose localhost from your terminal")]
 #[command(version)]
 #[command(
-    after_help = "COMMAND GROUPS:\n  Capture and delivery: listen, tunnel, endpoint, static-tunnel, anon\n  Review and automation: cases, share, monitor\n  Account and settings: login, logout, org, config\n  Maintenance: diagnostics, clean-logs, completions, update\n\nCOMMON WORKFLOWS:\n  Sign in:\n    hooklistener login\n\n  Forward an existing debug endpoint:\n    hooklistener listen <endpoint-slug> --target http://localhost:3000\n\n  Expose a local HTTP server:\n    hooklistener tunnel --port 3000\n\n  Create and inspect hosted captures:\n    hooklistener endpoint create <name>\n    hooklistener endpoint list-requests <endpoint-id>"
+    after_help = "COMMAND GROUPS:\n  Capture and delivery: listen, tunnel, endpoint, inbox, static-tunnel, anon\n  Review and automation: cases, share, monitor\n  Account and settings: login, logout, org, config\n  Maintenance: diagnostics, clean-logs, completions, update\n\nCOMMON WORKFLOWS:\n  Sign in:\n    hooklistener login\n\n  Forward an existing debug endpoint:\n    hooklistener listen <endpoint-slug> --target http://localhost:3000\n\n  Expose a local HTTP server:\n    hooklistener tunnel --port 3000\n\n  Create and inspect hosted captures:\n    hooklistener endpoint create <name>\n    hooklistener endpoint list-requests <endpoint-id>\n\n  Read the code in an email your app sends:\n    hooklistener inbox create <name>\n    hooklistener inbox wait <inbox> --code"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -140,6 +141,11 @@ pub enum Commands {
     Endpoint {
         #[command(subcommand)]
         action: EndpointAction,
+    },
+    /// Create email inboxes and wait for the codes and links in their emails
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
     },
     /// Reserve and manage static tunnel slugs
     StaticTunnel {

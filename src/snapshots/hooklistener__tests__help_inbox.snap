@@ -1,0 +1,28 @@
+---
+source: src/main.rs
+expression: "render_help_snapshot(&[\"inbox\"])"
+---
+Create email inboxes and wait for the codes and links in their emails
+
+Usage: hooklistener inbox [OPTIONS] <COMMAND>
+
+Commands:
+  create       Create an email inbox and print its address
+  list         List email inboxes for an organization
+  list-emails  List the emails an inbox received, newest first [aliases: emails]
+  show-email   Show an email with its code, link, and text [aliases: email]
+  wait         Wait for an email to reach an inbox, then print it, its code, or its link
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Global options:
+      --json               Output supported command responses or event streams as JSON
+      --color <COLOR>      Styling policy for human output [default: auto] [possible values: auto,
+                           always, never]
+      --yes                Confirm destructive commands without an interactive prompt
+      --log-level <LEVEL>  Log level [default: info] [possible values: trace, debug, info, warn,
+                           error]
+      --log-dir <DIR>      Directory for log files
+      --log-stdout         Also write logs to stdout

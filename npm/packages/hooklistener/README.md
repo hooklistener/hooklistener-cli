@@ -26,6 +26,10 @@ hooklistener endpoint list
 hooklistener endpoint requests <endpoint-id>
 hooklistener endpoint forward-request <endpoint-id> <request-id> http://localhost:3000/webhook
 
+# Read the one-time code from an email your app sends
+hooklistener inbox create "Signup tests" --slug signup
+hooklistener inbox wait signup --since 5m --code
+
 # Expose local server with a public URL
 hooklistener tunnel --port 3000
 
