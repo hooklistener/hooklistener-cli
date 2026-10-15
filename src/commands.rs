@@ -5,6 +5,7 @@ pub mod cases;
 pub mod completions;
 pub mod config;
 pub mod endpoint;
+pub mod inbox;
 pub mod listen;
 pub mod login;
 pub mod monitor;

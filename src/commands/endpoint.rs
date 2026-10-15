@@ -1,14 +1,17 @@
 //! `endpoint` commands: debug endpoints, captured requests, and forwards.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Subcommand;
 use reqwest::Url;
 use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
 
-use crate::api::ApiClient;
-use crate::cli::HttpMethod;
+use crate::api::{ApiClient, RequestWaitFilters};
+use crate::cli::{HttpMethod, format_duration, parse_duration, parse_duration_within};
 use crate::commands::confirm_destructive_action;
 use crate::credentials::{ensure_valid_token, require_organization};
+use crate::errors::RequestWaitTimeout;
 use crate::output::Stylize;
 use crate::receipts::{
     forward_poll_command, forward_poll_path, forward_resource_uri, request_forwards_resource_uri,
@@ -78,6 +81,44 @@ pub enum EndpointAction {
         endpoint_id: String,
         /// Captured request ID
         request_id: String,
+        /// Organization ID (overrides the configured default)
+        #[arg(short = 'o', long, value_name = "ORG_ID")]
+        org: Option<String>,
+    },
+    /// Wait for a request matching the filters to reach an endpoint
+    ///
+    /// Made for CI: prints the request and exits 0 once one arrives, or exits
+    /// 1 when --timeout passes first. Only requests captured after --since
+    /// match, and --since defaults to when the command starts, so pass a time
+    /// noted before triggering the webhook, or --since 1m, to also catch one
+    /// that is already there.
+    Wait {
+        /// Debug endpoint ID
+        endpoint_id: String,
+        /// Match requests captured after this: an RFC 3339 time, a request ID, or a duration ago such as 90s or 5m [default: now]
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+        /// HTTP method
+        #[arg(long, value_enum, ignore_case = true)]
+        method: Option<HttpMethod>,
+        /// Exact request path
+        #[arg(long)]
+        path: Option<String>,
+        /// Event type detected for known senders, such as invoice.paid
+        #[arg(long)]
+        event_type: Option<String>,
+        /// Event ID detected for known senders, such as evt_123
+        #[arg(long)]
+        event_id: Option<String>,
+        /// Header value to match, as NAME=VALUE; repeatable
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        headers: Vec<String>,
+        /// JSON body value at a JSON Pointer, as /POINTER=VALUE; repeatable. VALUE is read as JSON when it parses: 42 is a number, '"42"' a string
+        #[arg(long = "body", value_name = "/POINTER=VALUE")]
+        body: Vec<String>,
+        /// Maximum wait, such as 60, 2m, or 1h (up to 1h) [default: 30s]
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration_within(Duration::ZERO, MAX_REQUEST_WAIT))]
+        timeout: Option<Duration>,
         /// Organization ID (overrides the configured default)
         #[arg(short = 'o', long, value_name = "ORG_ID")]
         org: Option<String>,
@@ -276,6 +317,36 @@ pub async fn execute(action: EndpointAction, json: bool, yes: bool) -> Result<Co
                 print_endpoint_request_detail(&request);
             }
         }
+        EndpointAction::Wait {
+            endpoint_id,
+            since,
+            method,
+            path,
+            event_type,
+            event_id,
+            headers,
+            body,
+            timeout,
+            org,
+        } => {
+            let filters = RequestWaitFilters {
+                since: Some(resolve_since(since.as_deref(), Utc::now())?),
+                method: method.map(|method| method.as_uppercase().to_string()),
+                path,
+                event_type,
+                event_id,
+                headers: parse_match_pairs(&headers, "--header")?,
+                body: parse_body_matches(&body)?,
+            };
+            run_endpoint_wait(
+                endpoint_id,
+                filters,
+                timeout.unwrap_or(DEFAULT_REQUEST_WAIT),
+                org,
+                json,
+            )
+            .await?;
+        }
         EndpointAction::DeleteRequest {
             endpoint_id,
             request_id,
@@ -381,6 +452,103 @@ pub async fn execute(action: EndpointAction, json: bool, yes: bool) -> Result<Co
         }
     }
     Ok(ControlFlow::Continue(()))
+}
+
+const DEFAULT_REQUEST_WAIT: Duration = Duration::from_secs(30);
+const MAX_REQUEST_WAIT: Duration = Duration::from_secs(60 * 60);
+/// The server holds one wait call for at most a minute.
+const MAX_SERVER_WAIT_SECONDS: u64 = 60;
+
+/// `--since` as the server takes it: a duration becomes the time that long
+/// ago, and an RFC 3339 time or a request ID goes as it is. Without it, the
+/// time the command started.
+pub fn resolve_since(raw: Option<&str>, now: DateTime<Utc>) -> Result<String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(now.to_rfc3339_opts(SecondsFormat::Millis, true));
+    };
+
+    match parse_duration(raw) {
+        Ok(ago) => chrono::Duration::from_std(ago)
+            .ok()
+            .and_then(|ago| now.checked_sub_signed(ago))
+            .map(|since| since.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .ok_or_else(|| anyhow!("--since {raw} is too far back.")),
+        Err(_) => Ok(raw.to_string()),
+    }
+}
+
+/// Splits repeatable NAME=VALUE flags at the first `=`.
+pub fn parse_match_pairs(values: &[String], flag: &str) -> Result<Vec<(String, String)>> {
+    values
+        .iter()
+        .map(|value| match value.split_once('=') {
+            Some((name, matched)) if !name.trim().is_empty() => {
+                Ok((name.trim().to_string(), matched.to_string()))
+            }
+            _ => bail!("{flag} takes NAME=VALUE, got '{value}'."),
+        })
+        .collect()
+}
+
+pub fn parse_body_matches(values: &[String]) -> Result<Vec<(String, String)>> {
+    let matches = parse_match_pairs(values, "--body")?;
+    if let Some((pointer, _)) = matches
+        .iter()
+        .find(|(pointer, _)| !pointer.starts_with('/'))
+    {
+        bail!("--body takes a JSON Pointer such as /data/object/id=VALUE, got '{pointer}'.");
+    }
+    Ok(matches)
+}
+
+pub async fn run_endpoint_wait(
+    endpoint_id: String,
+    filters: RequestWaitFilters,
+    timeout: Duration,
+    org: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let mut config = config::Config::load()?;
+    let organization_id = require_organization(org, &config)?;
+    let token = ensure_valid_token(&mut config).await?;
+    let client = ApiClient::with_organization(token, Some(organization_id.clone()))?;
+    let deadline = Instant::now() + timeout;
+
+    // Each call waits up to a minute. Later calls keep the same --since, so a
+    // request that arrives between two calls still matches.
+    loop {
+        let seconds = deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            .min(MAX_SERVER_WAIT_SECONDS);
+
+        if let Some(request) = client
+            .wait_for_endpoint_request(&endpoint_id, &filters, seconds)
+            .await?
+        {
+            if json {
+                print_json(&serde_json::json!({
+                    "status": "received",
+                    "organization_id": organization_id,
+                    "endpoint_id": endpoint_id,
+                    "request": request
+                }))?;
+            } else {
+                print_status(OutputStatus::Ok, "REQUEST RECEIVED");
+                println!();
+                print_endpoint_request_detail(&request);
+            }
+            return Ok(());
+        }
+
+        if deadline.saturating_duration_since(Instant::now()) < Duration::from_secs(1) {
+            return Err(RequestWaitTimeout {
+                endpoint_id,
+                timeout: format_duration(timeout),
+            }
+            .into());
+        }
+    }
 }
 
 pub fn validate_forward_target_url(target_url: &str) -> Result<()> {

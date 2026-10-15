@@ -1,7 +1,7 @@
 pub mod cases;
 
 use crate::{
-    errors::TunnelLifecycleError,
+    errors::{PlanLimitError, TunnelLifecycleError},
     models::{ForwardResponse, WebhookRequest},
     target_policy::TargetPolicy,
 };
@@ -224,10 +224,54 @@ fn structured_server_error_detail(body: &str) -> Option<String> {
     Some(bounded_control_neutral_text(&detail))
 }
 
+const MAX_UPGRADE_URL_BYTES: usize = 512;
+
+/// The `upgrade` hint the server attaches to plan-limit errors
+/// (`{"error": "...", "upgrade": {"reason", "upgrade_url", "trial_available"}}`).
+fn plan_upgrade(body: &str) -> Option<(String, String, bool)> {
+    let payload = serde_json::from_str::<Value>(body).ok()?;
+    let upgrade = payload
+        .get("upgrade")
+        .or_else(|| payload.get("error").and_then(|error| error.get("upgrade")))?;
+    let upgrade_url = safe_upgrade_url(upgrade.get("upgrade_url").and_then(Value::as_str)?)?;
+    let reason = match upgrade.get("reason").and_then(Value::as_str) {
+        Some("plan_feature_unavailable") => "plan_feature_unavailable",
+        _ => "plan_limit_reached",
+    };
+    let trial_available = upgrade
+        .get("trial_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Some((reason.to_string(), upgrade_url, trial_available))
+}
+
+/// Only an https link, or plain http to a loopback dev server, is shown, and
+/// only as `Url` re-serializes it, so a response cannot smuggle another scheme
+/// or terminal control sequences into the hint.
+fn safe_upgrade_url(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    let allowed = match url.scheme() {
+        "https" => true,
+        "http" => server_url_is_loopback(&url),
+        _ => false,
+    };
+    let url = url.to_string();
+
+    (allowed && url.len() <= MAX_UPGRADE_URL_BYTES).then_some(url)
+}
+
 fn server_response_error(context: &str, status: StatusCode, body: &str) -> anyhow::Error {
-    match structured_server_error_detail(body) {
-        Some(detail) => anyhow!("{context} (HTTP {status}; {detail})"),
-        None => anyhow!("{context} (HTTP {status})"),
+    let message = match structured_server_error_detail(body) {
+        Some(detail) => format!("{context} (HTTP {status}; {detail})"),
+        None => format!("{context} (HTTP {status})"),
+    };
+
+    match plan_upgrade(body) {
+        Some((reason, upgrade_url, trial_available)) => {
+            PlanLimitError::new(message, reason, upgrade_url, trial_available).into()
+        }
+        None => anyhow!(message),
     }
 }
 
@@ -766,6 +810,138 @@ pub struct MessageResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct DataResponse<T> {
     data: T,
+}
+
+/// Filters for [`ApiClient::wait_for_endpoint_request`]. Headers are sent as
+/// `header[<name>]=<value>` and body matches as `body[<JSON Pointer>]=<value>`.
+#[derive(Debug, Default)]
+pub struct RequestWaitFilters {
+    pub since: Option<String>,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub event_type: Option<String>,
+    pub event_id: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<(String, String)>,
+}
+
+impl RequestWaitFilters {
+    fn query(&self, timeout_seconds: u64) -> Vec<(String, String)> {
+        let mut query = vec![("timeout".to_string(), timeout_seconds.to_string())];
+        let optional = [
+            ("since", &self.since),
+            ("method", &self.method),
+            ("path", &self.path),
+            ("event_type", &self.event_type),
+            ("event_id", &self.event_id),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                query.push((name.to_string(), value.clone()));
+            }
+        }
+        query.extend(
+            self.headers
+                .iter()
+                .map(|(name, value)| (format!("header[{name}]"), value.clone())),
+        );
+        query.extend(
+            self.body
+                .iter()
+                .map(|(pointer, value)| (format!("body[{pointer}]"), value.clone())),
+        );
+        query
+    }
+}
+
+// ── Email inbox models ──────────────────────────────────────────────────────
+
+/// An email inbox. The server also sends the inbox's SMTP sandbox settings,
+/// which can include a password; they are not kept, so `--json` output is
+/// safe to leave in CI logs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailInbox {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub email_address: String,
+    #[serde(default)]
+    pub email_count: Option<u64>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+/// A captured email as an inbox listing returns it. Fields the CLI does not
+/// render stay in `other`, so `--json` prints the summary unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxEmailSummary {
+    pub id: String,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxEmailsResponse {
+    pub data: Vec<InboxEmailSummary>,
+    pub pagination: Pagination,
+}
+
+/// A captured email with its bodies and the values the server extracts from
+/// them: `code` (the likely one-time code) and `verification_link`. Fields the
+/// CLI does not render stay in `other`, so `--json` prints the whole email.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxEmail {
+    pub id: String,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub codes: Vec<String>,
+    #[serde(default)]
+    pub verification_link: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<Value>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
+}
+
+/// Filters shared by an inbox's email listing and its wait call. `since` is
+/// an RFC 3339 time or an email ID; `to` is an exact recipient; `from` and
+/// `subject_contains` are case-insensitive substrings.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EmailFilters {
+    pub since: Option<String>,
+    pub to: Option<String>,
+    pub from: Option<String>,
+    pub subject_contains: Option<String>,
+}
+
+impl EmailFilters {
+    fn query(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
+        [
+            ("since", &self.since),
+            ("to", &self.to),
+            ("from", &self.from),
+            ("subject_contains", &self.subject_contains),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.as_deref().map(|value| (name, value)))
+    }
 }
 
 // ── Anonymous Endpoint models ───────────────────────────────────────────────
@@ -1363,9 +1539,128 @@ impl ApiClient {
         Ok(response.data)
     }
 
+    /// Long-polls up to `timeout_seconds` (the server allows at most 60) for
+    /// the next request matching `filters`; `None` when none arrives in time.
+    pub async fn wait_for_endpoint_request(
+        &self,
+        endpoint_id: &str,
+        filters: &RequestWaitFilters,
+        timeout_seconds: u64,
+    ) -> Result<Option<DebugRequestDetail>> {
+        let path = format!("/api/v1/endpoints/{}/requests/wait", endpoint_id);
+        let mut url = Url::parse(&self.api_url(&path)?).context("Invalid wait URL")?;
+        url.query_pairs_mut()
+            .extend_pairs(filters.query(timeout_seconds));
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("Failed to wait for endpoint request")?;
+
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+
+        let response: DataResponse<DebugRequestDetail> = self
+            .parse_json_response(response, "wait for endpoint request")
+            .await?;
+        Ok(Some(response.data))
+    }
+
     pub async fn delete_endpoint_request(&self, endpoint_id: &str, request_id: &str) -> Result<()> {
         let path = format!("/api/v1/endpoints/{}/requests/{}", endpoint_id, request_id);
         self.delete_empty(&path, "delete endpoint request").await
+    }
+
+    pub async fn list_inboxes(&self) -> Result<Vec<EmailInbox>> {
+        let response: DataResponse<Vec<EmailInbox>> =
+            self.get_json("/api/v1/inboxes", "list inboxes").await?;
+        Ok(response.data)
+    }
+
+    pub async fn create_inbox(&self, name: &str, slug: Option<&str>) -> Result<EmailInbox> {
+        let mut body = serde_json::Map::new();
+        body.insert("name".to_string(), Value::String(name.to_string()));
+        if let Some(slug) = slug {
+            body.insert("slug".to_string(), Value::String(slug.to_string()));
+        }
+        let response: DataResponse<EmailInbox> = self
+            .post_json("/api/v1/inboxes", &Value::Object(body), "create inbox")
+            .await?;
+        Ok(response.data)
+    }
+
+    /// `/api/v1/inboxes/<inbox_id>/<segments>`, each segment percent-encoded.
+    fn inbox_url(&self, inbox_id: &str, segments: &[&str]) -> Result<Url> {
+        let mut url = Url::parse(&self.api_url("/api/v1/inboxes")?).context("Invalid inbox URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("Invalid inbox URL"))?
+            .push(inbox_id)
+            .extend(segments);
+        Ok(url)
+    }
+
+    async fn get_url_json<T: DeserializeOwned>(&self, url: Url, context: &str) -> Result<T> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to {context}"))?;
+        self.parse_json_response(response, context).await
+    }
+
+    /// Emails in an inbox, newest first.
+    pub async fn list_inbox_emails(
+        &self,
+        inbox_id: &str,
+        filters: &EmailFilters,
+        page: u32,
+        page_size: u32,
+    ) -> Result<InboxEmailsResponse> {
+        let mut url = self.inbox_url(inbox_id, &["emails"])?;
+        url.query_pairs_mut()
+            .append_pair("page", &page.to_string())
+            .append_pair("page_size", &page_size.to_string())
+            .extend_pairs(filters.query());
+        self.get_url_json(url, "list inbox emails").await
+    }
+
+    pub async fn get_inbox_email(&self, inbox_id: &str, email_id: &str) -> Result<InboxEmail> {
+        let url = self.inbox_url(inbox_id, &["emails", email_id])?;
+        let response: DataResponse<InboxEmail> = self.get_url_json(url, "get inbox email").await?;
+        Ok(response.data)
+    }
+
+    /// Long-polls up to `timeout_seconds` (the server allows at most 60) for
+    /// the next email matching `filters`; `None` when none arrives in time.
+    /// With `since`, an email already received after it is returned at once.
+    pub async fn wait_for_inbox_email(
+        &self,
+        inbox_id: &str,
+        filters: &EmailFilters,
+        timeout_seconds: u64,
+    ) -> Result<Option<InboxEmail>> {
+        let mut url = self.inbox_url(inbox_id, &["emails", "wait"])?;
+        url.query_pairs_mut()
+            .append_pair("timeout", &timeout_seconds.to_string())
+            .extend_pairs(filters.query());
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("Failed to wait for inbox email")?;
+
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+
+        let response: DataResponse<InboxEmail> = self
+            .parse_json_response(response, "wait for inbox email")
+            .await?;
+        Ok(Some(response.data))
     }
 
     pub async fn forward_endpoint_request(
@@ -2037,6 +2332,99 @@ mod tests {
         assert!(detail.len() <= MAX_SERVER_ERROR_DETAIL_BYTES);
     }
 
+    #[test]
+    fn server_response_error_keeps_the_plan_upgrade_link() {
+        let upgrade_url = "https://app.hooklistener.com/organization/settings/billing?upgrade_source=api_static_tunnels";
+        let body = serde_json::json!({
+            "error": "Static tunnel limit reached (1). Delete an existing one or upgrade your plan.",
+            "upgrade": {
+                "reason": "plan_limit_reached",
+                "resource": "static_tunnels",
+                "limit": 1,
+                "plan": "free_plan",
+                "trial_available": true,
+                "upgrade_url": upgrade_url
+            }
+        })
+        .to_string();
+
+        let error =
+            server_response_error("create static tunnel failed", StatusCode::FORBIDDEN, &body);
+
+        assert_eq!(
+            error.to_string(),
+            "create static tunnel failed (HTTP 403 Forbidden; message=Static tunnel limit reached (1). Delete an existing one or upgrade your plan.)"
+        );
+        assert_eq!(crate::errors::error_code(&error), "plan_limit_reached");
+        assert_eq!(
+            crate::errors::error_hint(&error),
+            Some(format!("Start a free Pro trial to lift this limit: {upgrade_url}").as_str())
+        );
+
+        let receipt = crate::errors::json_error_receipt(&error);
+        assert_eq!(receipt["error"]["details"]["upgrade_url"], upgrade_url);
+        assert_eq!(receipt["error"]["details"]["trial_available"], true);
+    }
+
+    #[test]
+    fn plan_feature_errors_without_a_trial_point_to_the_plans() {
+        let body = serde_json::json!({
+            "error": "Static tunnels are not available on your current plan. Please upgrade.",
+            "upgrade": {
+                "reason": "plan_feature_unavailable",
+                "trial_available": false,
+                "upgrade_url": "https://app.hooklistener.com/organization/settings/billing"
+            }
+        })
+        .to_string();
+
+        let error = server_response_error("Request failed", StatusCode::FORBIDDEN, &body)
+            .context("create static tunnel");
+
+        assert_eq!(
+            crate::errors::error_code(&error),
+            "plan_feature_unavailable"
+        );
+        assert_eq!(
+            crate::errors::error_hint(&error),
+            Some(
+                "Upgrade your plan to lift this limit: https://app.hooklistener.com/organization/settings/billing"
+            )
+        );
+    }
+
+    #[test]
+    fn plan_upgrade_links_must_be_https_or_loopback() {
+        assert_eq!(safe_upgrade_url("javascript:alert(1)"), None);
+        assert_eq!(safe_upgrade_url("http://billing.example/upgrade"), None);
+        assert_eq!(
+            safe_upgrade_url("http://localhost:4000/organization/settings/billing").as_deref(),
+            Some("http://localhost:4000/organization/settings/billing")
+        );
+
+        let escaped = safe_upgrade_url("https://app.hooklistener.com/billing?x=\u{1b}]52;c;e\u{7}")
+            .expect("https link is kept");
+        assert!(!escaped.contains('\u{1b}') && !escaped.contains('\u{7}'));
+
+        let too_long = format!("https://app.hooklistener.com/{}", "a".repeat(600));
+        assert_eq!(safe_upgrade_url(&too_long), None);
+    }
+
+    #[test]
+    fn server_response_error_ignores_an_unusable_upgrade_link() {
+        let body = serde_json::json!({
+            "error": "Nope",
+            "upgrade": {"upgrade_url": "ftp://billing.example"}
+        })
+        .to_string();
+
+        let error = server_response_error("Request failed", StatusCode::FORBIDDEN, &body);
+
+        assert!(error.downcast_ref::<PlanLimitError>().is_none());
+        assert_eq!(crate::errors::error_code(&error), "command_failed");
+        assert_eq!(crate::errors::error_hint(&error), None);
+    }
+
     #[tokio::test]
     async fn relay_ticket_exchange_uses_authorization_header_and_parses_safe_receipt() {
         let mut server = mockito::Server::new_async().await;
@@ -2680,6 +3068,221 @@ mod tests {
         redirect.assert_async().await;
         elsewhere.assert_async().await;
     }
+
+    const INBOX_ID: &str = "5f0c6e2a-1b2c-4d5e-8f90-123456789abc";
+
+    fn inbox_client(server: &mockito::Server) -> ApiClient {
+        ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn wait_for_inbox_email_encodes_filters_and_returns_the_email() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                format!("/api/v1/inboxes/{INBOX_ID}/emails/wait").as_str(),
+            )
+            .match_header("authorization", "Bearer test-token")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("timeout".into(), "45".into()),
+                mockito::Matcher::UrlEncoded("since".into(), "2026-10-12T12:00:00+02:00".into()),
+                mockito::Matcher::UrlEncoded("to".into(), "signup+run42@hookinbox.com".into()),
+                mockito::Matcher::UrlEncoded("from".into(), "acme".into()),
+                mockito::Matcher::UrlEncoded("subject_contains".into(), "your code".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"em-1","subject":"Your code","code":"482913","codes":["482913"],"verification_link":null,"html_body":"<p>482913</p>"}}"#,
+            )
+            .create_async()
+            .await;
+
+        let filters = EmailFilters {
+            since: Some("2026-10-12T12:00:00+02:00".into()),
+            to: Some("signup+run42@hookinbox.com".into()),
+            from: Some("acme".into()),
+            subject_contains: Some("your code".into()),
+        };
+        let email = inbox_client(&server)
+            .wait_for_inbox_email(INBOX_ID, &filters, 45)
+            .await
+            .unwrap()
+            .expect("an email");
+
+        assert_eq!(email.id, "em-1");
+        assert_eq!(email.code.as_deref(), Some("482913"));
+        assert_eq!(email.verification_link, None);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_inbox_email_reads_no_content_as_nothing_yet() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                format!("/api/v1/inboxes/{INBOX_ID}/emails/wait").as_str(),
+            )
+            .match_query(mockito::Matcher::UrlEncoded("timeout".into(), "0".into()))
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let email = inbox_client(&server)
+            .wait_for_inbox_email(INBOX_ID, &EmailFilters::default(), 0)
+            .await
+            .unwrap();
+
+        assert!(email.is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn inbox_plan_limit_keeps_the_upgrade_link() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/v1/inboxes")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":"Email inbox limit reached for your plan","upgrade":{"reason":"plan_limit_reached","upgrade_url":"https://app.hooklistener.com/billing","trial_available":false}}"#,
+            )
+            .create_async()
+            .await;
+
+        let err = inbox_client(&server)
+            .create_inbox("ci", None)
+            .await
+            .unwrap_err();
+
+        let plan = err
+            .downcast_ref::<PlanLimitError>()
+            .expect("a plan-limit error");
+        assert_eq!(plan.upgrade_url(), "https://app.hooklistener.com/billing");
+        assert!(err.to_string().contains("Email inbox limit reached"));
+    }
+
+    #[tokio::test]
+    async fn create_inbox_sends_name_and_optional_slug() {
+        let mut server = mockito::Server::new_async().await;
+        let with_slug = server
+            .mock("POST", "/api/v1/inboxes")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"name": "Signup tests", "slug": "signup"}),
+            ))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"in-1","name":"Signup tests","slug":"signup","email_address":"signup@hookinbox.com","email_count":0,"smtp":{"password":"secret"}}}"#,
+            )
+            .create_async()
+            .await;
+        let without_slug = server
+            .mock("POST", "/api/v1/inboxes")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"name": "CI"})))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"id":"in-2","name":"CI","slug":"ci-x1y2","email_address":"ci-x1y2@hookinbox.com"}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = inbox_client(&server);
+        let inbox = client
+            .create_inbox("Signup tests", Some("signup"))
+            .await
+            .unwrap();
+        assert_eq!(inbox.email_address, "signup@hookinbox.com");
+        assert!(
+            !serde_json::to_string(&inbox).unwrap().contains("secret"),
+            "SMTP settings never reach --json output"
+        );
+
+        let inbox = client.create_inbox("CI", None).await.unwrap();
+        assert_eq!(inbox.slug, "ci-x1y2");
+        assert_eq!(inbox.email_count, None);
+
+        with_slug.assert_async().await;
+        without_slug.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_inbox_emails_sends_page_and_filters_and_encodes_the_path() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                format!("/api/v1/inboxes/{INBOX_ID}/emails").as_str(),
+            )
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("page".into(), "2".into()),
+                mockito::Matcher::UrlEncoded("page_size".into(), "10".into()),
+                mockito::Matcher::UrlEncoded("since".into(), "2026-10-12T12:00:00.000Z".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":[{"id":"em-1","from":"a@b.c","subject":"Hi","created_at":"2026-10-12T12:00:01Z","text_preview":"hello"}],"pagination":{"page":2,"page_size":10,"total_count":11,"total_pages":2}}"#,
+            )
+            .create_async()
+            .await;
+        let escaped = server
+            .mock(
+                "GET",
+                format!("/api/v1/inboxes/{INBOX_ID}/emails/a%2Fb%3Fc").as_str(),
+            )
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = inbox_client(&server);
+        let filters = EmailFilters {
+            since: Some("2026-10-12T12:00:00.000Z".into()),
+            ..Default::default()
+        };
+        let emails = client
+            .list_inbox_emails(INBOX_ID, &filters, 2, 10)
+            .await
+            .unwrap();
+        assert_eq!(emails.data[0].id, "em-1");
+        assert_eq!(emails.pagination.total_count, 11);
+        let json = serde_json::to_value(&emails.data[0]).unwrap();
+        assert_eq!(json["text_preview"], "hello", "unrendered fields are kept");
+
+        assert!(client.get_inbox_email(INBOX_ID, "a/b?c").await.is_err());
+
+        mock.assert_async().await;
+        escaped.assert_async().await;
+    }
+
+    #[test]
+    fn inbox_email_json_keeps_every_field_the_server_sent() {
+        let raw = serde_json::json!({
+            "id": "em-1",
+            "from": "Acme <no-reply@acme.test>",
+            "recipients": ["signup@hookinbox.com"],
+            "subject": "Confirm",
+            "created_at": "2026-10-12T12:00:00Z",
+            "code": "482913",
+            "codes": ["482913", "2026"],
+            "verification_link": "https://acme.test/verify?t=1",
+            "links": ["https://acme.test/verify?t=1"],
+            "text": "Code 482913",
+            "text_body": "Code 482913",
+            "html_body": "<p>Code 482913</p>",
+            "headers": {"x-run": "42"},
+            "header_list": [["X-Run", "42"]],
+            "attachments": [{"index": 0, "filename": "a.pdf"}]
+        });
+
+        let email: InboxEmail = serde_json::from_value(raw.clone()).unwrap();
+
+        assert_eq!(email.codes, vec!["482913", "2026"]);
+        assert_eq!(serde_json::to_value(&email).unwrap(), raw);
+    }
 }
 
 #[cfg(test)]
@@ -2724,5 +3327,66 @@ mod audit_findings {
             !leaked.matched_async().await,
             "refresh token was forwarded to the redirect target"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_endpoint_request_sends_filters_and_returns_the_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/endpoints/ep-1/requests/wait")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("timeout".into(), "45".into()),
+                mockito::Matcher::UrlEncoded("since".into(), "2026-09-30T12:00:00.000Z".into()),
+                mockito::Matcher::UrlEncoded("method".into(), "POST".into()),
+                mockito::Matcher::UrlEncoded("event_type".into(), "invoice.paid".into()),
+                mockito::Matcher::UrlEncoded("header[X-GitHub-Event]".into(), "push".into()),
+                mockito::Matcher::UrlEncoded("body[/data/id]".into(), "42".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"id":"req-1","method":"POST","url":"https://example.com/w/x"}}"#)
+            .create_async()
+            .await;
+
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+        let filters = RequestWaitFilters {
+            since: Some("2026-09-30T12:00:00.000Z".into()),
+            method: Some("POST".into()),
+            event_type: Some("invoice.paid".into()),
+            headers: vec![("X-GitHub-Event".into(), "push".into())],
+            body: vec![("/data/id".into(), "42".into())],
+            ..Default::default()
+        };
+
+        let request = client
+            .wait_for_endpoint_request("ep-1", &filters, 45)
+            .await
+            .unwrap();
+
+        assert_eq!(request.map(|request| request.id), Some("req-1".to_string()));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_endpoint_request_reads_no_content_as_nothing_yet() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/endpoints/ep-1/requests/wait")
+            .match_query(mockito::Matcher::Any)
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+
+        let request = client
+            .wait_for_endpoint_request("ep-1", &RequestWaitFilters::default(), 0)
+            .await
+            .unwrap();
+
+        assert!(request.is_none());
+        mock.assert_async().await;
     }
 }

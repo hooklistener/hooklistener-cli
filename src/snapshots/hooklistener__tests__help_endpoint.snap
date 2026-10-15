@@ -13,6 +13,7 @@ Commands:
   delete           Delete a debug endpoint by ID
   list-requests    List captured requests for an endpoint [aliases: requests]
   show-request     Show a captured request [aliases: request]
+  wait             Wait for a request matching the filters to reach an endpoint
   delete-request   Delete a captured request
   forward-request  Replay a captured request to a target URL
   list-forwards    List forwards of a captured request [aliases: forwards]

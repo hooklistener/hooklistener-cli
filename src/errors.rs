@@ -53,6 +53,151 @@ impl TunnelLifecycleError {
     }
 }
 
+/// A request the server refused because of the organization's plan: a limit
+/// reached, or a feature the plan does not include. It keeps the billing link
+/// the server sent with the error, so the user learns where to lift the limit
+/// instead of hitting a dead end.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct PlanLimitError {
+    message: String,
+    reason: String,
+    upgrade_url: String,
+    trial_available: bool,
+    hint: String,
+}
+
+impl PlanLimitError {
+    pub fn new(
+        message: String,
+        reason: String,
+        upgrade_url: String,
+        trial_available: bool,
+    ) -> Self {
+        let hint = if trial_available {
+            format!("Start a free Pro trial to lift this limit: {upgrade_url}")
+        } else {
+            format!("Upgrade your plan to lift this limit: {upgrade_url}")
+        };
+
+        Self {
+            message,
+            reason,
+            upgrade_url,
+            trial_available,
+            hint,
+        }
+    }
+
+    /// `plan_limit_reached` or `plan_feature_unavailable`.
+    pub fn code(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn hint(&self) -> &str {
+        &self.hint
+    }
+
+    pub fn upgrade_url(&self) -> &str {
+        &self.upgrade_url
+    }
+}
+
+/// `endpoint wait` ran out of time before a matching request arrived.
+#[derive(Debug, Error)]
+#[error("No matching request reached endpoint {endpoint_id} within {timeout}.")]
+pub struct RequestWaitTimeout {
+    pub endpoint_id: String,
+    pub timeout: String,
+}
+
+/// Exit status of `inbox wait` when `--timeout` passes first.
+pub const EXIT_EMAIL_WAIT_TIMEOUT: i32 = 5;
+
+/// Exit status of `inbox wait --code` or `--link` when the matching email has
+/// no such value.
+pub const EXIT_EMAIL_VALUE_MISSING: i32 = 6;
+
+/// `inbox wait` ran out of time before a matching email arrived.
+#[derive(Debug, Error)]
+#[error("No matching email reached inbox {inbox} within {timeout}.")]
+pub struct EmailWaitTimeout {
+    pub inbox: String,
+    pub timeout: String,
+}
+
+/// The one value `inbox wait --code` or `--link` prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailValue {
+    Code,
+    Link,
+}
+
+impl EmailValue {
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Code => "--code",
+            Self::Link => "--link",
+        }
+    }
+
+    /// The field of the email JSON that holds the value.
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Link => "verification_link",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Code => "one-time code",
+            Self::Link => "verification link",
+        }
+    }
+}
+
+/// `inbox wait --code` or `--link` matched an email without that value.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct EmailValueMissing {
+    value: EmailValue,
+    message: String,
+    hint: String,
+}
+
+impl EmailValueMissing {
+    pub fn new(value: EmailValue, inbox: &str, email_id: &str, subject: Option<&str>) -> Self {
+        let label = value.label();
+        let message = match subject {
+            Some(subject) => {
+                format!("Email {email_id} (\"{subject}\") matched but has no {label}.")
+            }
+            None => format!("Email {email_id} matched but has no {label}."),
+        };
+        let hint = format!(
+            "Read it with `hooklistener inbox show-email {inbox} {email_id}`, or narrow --from or --subject-contains to the email that carries the {label}."
+        );
+        Self {
+            value,
+            message,
+            hint,
+        }
+    }
+
+    /// `code_not_found` or `link_not_found`.
+    pub fn code(&self) -> &'static str {
+        match self.value {
+            EmailValue::Code => "code_not_found",
+            EmailValue::Link => "link_not_found",
+        }
+    }
+
+    pub fn hint(&self) -> &str {
+        &self.hint
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error("Failed to check for updates: {0}")]
@@ -77,8 +222,24 @@ pub fn error_hint(err: &anyhow::Error) -> Option<&str> {
     if let Some(e) = err.downcast_ref::<TunnelLifecycleError>() {
         return e.hint();
     }
+    if let Some(e) = err.downcast_ref::<PlanLimitError>() {
+        return Some(e.hint());
+    }
     if let Some(e) = err.downcast_ref::<UpdateError>() {
         return e.hint();
+    }
+    if err.downcast_ref::<RequestWaitTimeout>().is_some() {
+        return Some(
+            "Check the filters and --since: without --since, only requests captured after the command started match.",
+        );
+    }
+    if err.downcast_ref::<EmailWaitTimeout>().is_some() {
+        return Some(
+            "Start `inbox wait` before triggering the email, or pass --since (such as --since 5m) to include one already received. Then check --to, --from and --subject-contains.",
+        );
+    }
+    if let Some(e) = err.downcast_ref::<EmailValueMissing>() {
+        return Some(e.hint());
     }
 
     let message = err.to_string();
@@ -101,8 +262,16 @@ pub fn error_hint(err: &anyhow::Error) -> Option<&str> {
 pub fn error_code(err: &anyhow::Error) -> String {
     if let Some(error) = err.downcast_ref::<TunnelLifecycleError>() {
         error.code().to_string()
+    } else if let Some(error) = err.downcast_ref::<PlanLimitError>() {
+        error.code().to_string()
     } else if err.downcast_ref::<UpdateError>().is_some() {
         "update_error".to_string()
+    } else if err.downcast_ref::<RequestWaitTimeout>().is_some()
+        || err.downcast_ref::<EmailWaitTimeout>().is_some()
+    {
+        "wait_timeout".to_string()
+    } else if let Some(error) = err.downcast_ref::<EmailValueMissing>() {
+        error.code().to_string()
     } else {
         let message = err.to_string();
         if message.contains("Confirmation required") {
@@ -120,6 +289,12 @@ pub fn error_code(err: &anyhow::Error) -> String {
 }
 
 pub fn command_exit_code(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<EmailWaitTimeout>().is_some() {
+        return EXIT_EMAIL_WAIT_TIMEOUT;
+    }
+    if err.downcast_ref::<EmailValueMissing>().is_some() {
+        return EXIT_EMAIL_VALUE_MISSING;
+    }
     match err.downcast_ref::<TunnelLifecycleError>() {
         Some(TunnelLifecycleError::IncompatibleSchema { .. }) => 3,
         Some(TunnelLifecycleError::CursorExpired { .. }) => 4,
@@ -145,7 +320,13 @@ pub fn json_error_receipt(err: &anyhow::Error) -> serde_json::Value {
         Some(TunnelLifecycleError::IncompatibleSchema { supported, actual }) => {
             serde_json::json!({"supported_major": supported, "actual_major": actual})
         }
-        _ => serde_json::Value::Null,
+        _ => match err.downcast_ref::<PlanLimitError>() {
+            Some(error) => serde_json::json!({
+                "upgrade_url": error.upgrade_url(),
+                "trial_available": error.trial_available,
+            }),
+            None => serde_json::Value::Null,
+        },
     };
 
     serde_json::json!({
