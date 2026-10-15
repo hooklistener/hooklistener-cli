@@ -193,6 +193,7 @@ async fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
         }
+        Commands::Inbox { action } => commands::inbox::execute(action, json).await?,
         Commands::Cases { action } => {
             if commands::cases::execute(action, json).await? {
                 std::process::exit(1);

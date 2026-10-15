@@ -100,6 +100,7 @@ Duration flags accept a bare number of seconds (`--ttl 3600`) or a unit suffix (
 | Expose a local server | `hooklistener tunnel` | A provider needs a public URL that points directly to localhost |
 | Expose localhost without signing in | `hooklistener anon tunnel` | You need a bounded temporary relay and can accept reduced limits |
 | Inspect and replay captured requests | `hooklistener endpoint` | You need stored payloads, headers, and forwarding history |
+| Read emails your app sends | `hooklistener inbox` | A test or agent needs the code or link from a signup, sign-in, or reset email |
 | Run saved endpoint cases | `hooklistener cases` | You want to replay a repeatable test suite against a URL or saved target |
 | Create a temporary endpoint | `hooklistener anon` | You need a short-lived capture URL without an account |
 | Share a captured request | `hooklistener share` | A teammate needs access to a payload and its forwarding history |
@@ -272,6 +273,7 @@ Use `hooklistener <command> --help` for every option and subcommand.
 | `listen` | Forward events from a debug endpoint to a local URL |
 | `tunnel`, `static-tunnel` | Expose a local HTTP server on a public URL and reserve static tunnel slugs |
 | `endpoint`, `cases` | Manage debug endpoints and captured requests, and run saved replay cases |
+| `inbox` | Create email inboxes and wait for the codes and links in their emails |
 | `anon` | Create temporary endpoints and tunnels without signing in |
 | `share` | Create, inspect, and revoke public links to captured requests |
 | `monitor` | Create and inspect uptime monitors |
@@ -324,7 +326,7 @@ Runtime errors use a consistent envelope:
 {"$schema":"hooklistener.cli.error/1","schema_version":1,"type":"error","error":{"causes":[],"code":"command_failed","hint":null,"message":"..."},"ok":false}
 ```
 
-Exit status `0` means success, `1` means a runtime failure, `2` means command-line parsing failed, `3` means the tunnel schema major is incompatible, and `4` means an event cursor expired. Destructive commands in scripts require `--yes`. `login` and `completions` do not support JSON output.
+Exit status `0` means success, `1` means a runtime failure, `2` means command-line parsing failed, `3` means the tunnel schema major is incompatible, `4` means an event cursor expired, `5` means `inbox wait` timed out, and `6` means the email `inbox wait --code` or `--link` matched has no code or link. Destructive commands in scripts require `--yes`. `login` and `completions` do not support JSON output.
 
 `--json`, `--color`, `--yes`, `--log-level`, `--log-dir`, and `--log-stdout` are global flags and are accepted before or after any subcommand, so `hooklistener tunnel --log-level debug prepare` and `hooklistener --log-level debug tunnel prepare` are equivalent.
 
@@ -341,6 +343,27 @@ hooklistener --json endpoint wait <endpoint-id> --since "$SINCE" \
 ```
 
 Only requests captured after `--since` match. It defaults to when the command starts, so note the time before triggering the webhook, or pass a duration such as `--since 1m`. The other filters are `--method`, `--path`, `--event-type` and `--event-id` (detected for senders such as Stripe and GitHub), `--header NAME=VALUE`, and `--body /JSON/POINTER=VALUE`, whose value is read as JSON when it parses.
+
+### Read a code or link from an email in CI
+
+`inbox wait` waits for an email your app sends and prints a short summary of it, or with `--code` or `--link` only the one-time code or verification link, so a script can capture it without `curl` or `jq`:
+
+```bash
+export HOOKLISTENER_TOKEN=<api-key> HOOKLISTENER_ORG=<organization-id>
+hooklistener inbox create "Signup tests" --slug acme-signup  # once
+ADDR="acme-signup+$GITHUB_RUN_ID@hookinbox.com"
+STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+./scripts/sign-up.sh "$ADDR"  # your app emails $ADDR
+CODE=$(hooklistener inbox wait "$ADDR" --since "$STARTED" --code)
+```
+
+`<inbox>` is an inbox ID, slug, or address. A plus address such as `acme-signup+42@hookinbox.com` is delivered to the `acme-signup` inbox and also filters by that recipient, as `--to` does, so parallel runs never see each other's mail. `--from` and `--subject-contains` match case-insensitive substrings.
+
+Without `--since`, only emails that arrive after the command starts match: start `inbox wait` before triggering the email, or pass `--since` with a time noted before the trigger, an email ID, or a duration such as `5m`. `--timeout` (default `2m`, up to `1h`) bounds the whole wait; calls longer than the server's one-minute limit repeat with the same `--since`.
+
+`inbox wait` exits `0` when an email matched, `5` with the `wait_timeout` error code when `--timeout` passed first, and `6` with `code_not_found` or `link_not_found` when the email that matched has no code or link. With `--json` it prints the whole email, including `code`, `codes`, `verification_link`, `links`, `text`, the bodies, headers, and attachments; `--code` and `--link` do not combine with `--json`.
+
+`inbox list-emails <inbox>` (alias `emails`) lists what arrived, newest first, with the same filters, and `inbox show-email <inbox> <email-id>` (alias `email`) prints one email with its code, link, and text.
 
 ### Migration
 

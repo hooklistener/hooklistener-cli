@@ -1,0 +1,49 @@
+---
+source: src/main.rs
+expression: output
+---
+INBOX CREATE
+[OK] INBOX CREATED
+
+ID             5f0c6e2a-1b2c-4d5e-8f90-123456789abc
+NAME           Signup tests
+SLUG           signup
+ADDRESS        signup@hookinbox.com
+EMAILS         0
+CREATED AT     2026-10-12T12:00:00Z
+
+
+INBOX WAIT
+[OK] EMAIL RECEIVED
+
+EMAIL ID       dd9c44e7-e7fb-4236-b65a-215bd64901d1
+FROM           Acme <no-reply@acme.test>
+TO             signup+run42@hookinbox.com
+SUBJECT        Confirm your email
+RECEIVED AT    2026-10-12T12:00:05Z
+CODE           482913
+LINK           https://acme.test/verify?token=abc
+
+
+INBOX WAIT WITHOUT CODE OR LINK
+[OK] EMAIL RECEIVED
+
+EMAIL ID       dd9c44e7-e7fb-4236-b65a-215bd64901d1
+FROM           Acme <no-reply@acme.test>
+TO             signup+run42@hookinbox.com
+SUBJECT        Confirm your email
+RECEIVED AT    2026-10-12T12:00:05Z
+CODE           (none)
+LINK           (none)
+
+
+INBOX SHOW-EMAIL
+EMAIL ID       dd9c44e7-e7fb-4236-b65a-215bd64901d1
+FROM           Acme <no-reply@acme.test>
+TO             signup+run42@hookinbox.com
+SUBJECT        Confirm your email
+RECEIVED AT    2026-10-12T12:00:05Z
+CODE           482913
+LINK           https://acme.test/verify?token=abc
+CODES          482913, 2026
+ATTACHMENTS    receipt.pdf, (unnamed)

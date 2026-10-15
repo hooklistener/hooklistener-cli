@@ -111,6 +111,93 @@ pub struct RequestWaitTimeout {
     pub timeout: String,
 }
 
+/// Exit status of `inbox wait` when `--timeout` passes first.
+pub const EXIT_EMAIL_WAIT_TIMEOUT: i32 = 5;
+
+/// Exit status of `inbox wait --code` or `--link` when the matching email has
+/// no such value.
+pub const EXIT_EMAIL_VALUE_MISSING: i32 = 6;
+
+/// `inbox wait` ran out of time before a matching email arrived.
+#[derive(Debug, Error)]
+#[error("No matching email reached inbox {inbox} within {timeout}.")]
+pub struct EmailWaitTimeout {
+    pub inbox: String,
+    pub timeout: String,
+}
+
+/// The one value `inbox wait --code` or `--link` prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailValue {
+    Code,
+    Link,
+}
+
+impl EmailValue {
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Code => "--code",
+            Self::Link => "--link",
+        }
+    }
+
+    /// The field of the email JSON that holds the value.
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Link => "verification_link",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Code => "one-time code",
+            Self::Link => "verification link",
+        }
+    }
+}
+
+/// `inbox wait --code` or `--link` matched an email without that value.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct EmailValueMissing {
+    value: EmailValue,
+    message: String,
+    hint: String,
+}
+
+impl EmailValueMissing {
+    pub fn new(value: EmailValue, inbox: &str, email_id: &str, subject: Option<&str>) -> Self {
+        let label = value.label();
+        let message = match subject {
+            Some(subject) => {
+                format!("Email {email_id} (\"{subject}\") matched but has no {label}.")
+            }
+            None => format!("Email {email_id} matched but has no {label}."),
+        };
+        let hint = format!(
+            "Read it with `hooklistener inbox show-email {inbox} {email_id}`, or narrow --from or --subject-contains to the email that carries the {label}."
+        );
+        Self {
+            value,
+            message,
+            hint,
+        }
+    }
+
+    /// `code_not_found` or `link_not_found`.
+    pub fn code(&self) -> &'static str {
+        match self.value {
+            EmailValue::Code => "code_not_found",
+            EmailValue::Link => "link_not_found",
+        }
+    }
+
+    pub fn hint(&self) -> &str {
+        &self.hint
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error("Failed to check for updates: {0}")]
@@ -146,6 +233,14 @@ pub fn error_hint(err: &anyhow::Error) -> Option<&str> {
             "Check the filters and --since: without --since, only requests captured after the command started match.",
         );
     }
+    if err.downcast_ref::<EmailWaitTimeout>().is_some() {
+        return Some(
+            "Start `inbox wait` before triggering the email, or pass --since (such as --since 5m) to include one already received. Then check --to, --from and --subject-contains.",
+        );
+    }
+    if let Some(e) = err.downcast_ref::<EmailValueMissing>() {
+        return Some(e.hint());
+    }
 
     let message = err.to_string();
     if message.contains("Session expired") || message.contains("No access token") {
@@ -171,8 +266,12 @@ pub fn error_code(err: &anyhow::Error) -> String {
         error.code().to_string()
     } else if err.downcast_ref::<UpdateError>().is_some() {
         "update_error".to_string()
-    } else if err.downcast_ref::<RequestWaitTimeout>().is_some() {
+    } else if err.downcast_ref::<RequestWaitTimeout>().is_some()
+        || err.downcast_ref::<EmailWaitTimeout>().is_some()
+    {
         "wait_timeout".to_string()
+    } else if let Some(error) = err.downcast_ref::<EmailValueMissing>() {
+        error.code().to_string()
     } else {
         let message = err.to_string();
         if message.contains("Confirmation required") {
@@ -190,6 +289,12 @@ pub fn error_code(err: &anyhow::Error) -> String {
 }
 
 pub fn command_exit_code(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<EmailWaitTimeout>().is_some() {
+        return EXIT_EMAIL_WAIT_TIMEOUT;
+    }
+    if err.downcast_ref::<EmailValueMissing>().is_some() {
+        return EXIT_EMAIL_VALUE_MISSING;
+    }
     match err.downcast_ref::<TunnelLifecycleError>() {
         Some(TunnelLifecycleError::IncompatibleSchema { .. }) => 3,
         Some(TunnelLifecycleError::CursorExpired { .. }) => 4,

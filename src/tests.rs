@@ -5,6 +5,7 @@ use crate::commands::cases::*;
 use crate::commands::completions::*;
 use crate::commands::config::*;
 use crate::commands::endpoint::*;
+use crate::commands::inbox::*;
 use crate::commands::monitor::*;
 use crate::commands::org::*;
 use crate::commands::share::*;
@@ -913,6 +914,16 @@ fn help_snapshot_endpoint_list() {
 }
 
 #[test]
+fn help_snapshot_inbox() {
+    insta::assert_snapshot!("help_inbox", render_help_snapshot(&["inbox"]));
+}
+
+#[test]
+fn help_snapshot_inbox_wait() {
+    insta::assert_snapshot!("help_inbox_wait", render_help_snapshot(&["inbox", "wait"]));
+}
+
+#[test]
 fn help_snapshot_tunnel() {
     insta::assert_snapshot!("help_tunnel", render_help_snapshot(&["tunnel"]));
 }
@@ -1327,6 +1338,128 @@ fn endpoint_wait_timeout_has_its_own_error_code() {
 }
 
 #[test]
+fn inbox_wait_parses_filters_and_output_flags() {
+    let cli = Cli::try_parse_from([
+        "hooklistener",
+        "inbox",
+        "wait",
+        "signup+run42@hookinbox.com",
+        "--from",
+        "acme",
+        "--subject-contains",
+        "your code",
+        "--since",
+        "5m",
+        "--timeout",
+        "90",
+        "--code",
+        "-o",
+        "org_1",
+    ])
+    .unwrap_or_else(|err| panic!("inbox wait parses: {err}"));
+
+    match cli.command {
+        Some(Commands::Inbox {
+            action:
+                InboxAction::Wait {
+                    inbox,
+                    filters,
+                    since,
+                    timeout,
+                    code,
+                    link,
+                    org,
+                },
+        }) => {
+            assert_eq!(inbox, "signup+run42@hookinbox.com");
+            assert_eq!(filters.to, None);
+            assert_eq!(filters.from.as_deref(), Some("acme"));
+            assert_eq!(filters.subject_contains.as_deref(), Some("your code"));
+            assert_eq!(since.as_deref(), Some("5m"));
+            assert_eq!(timeout, Some(std::time::Duration::from_secs(90)));
+            assert!(code);
+            assert!(!link);
+            assert_eq!(org.as_deref(), Some("org_1"));
+        }
+        _ => panic!("inbox wait must yield Wait"),
+    }
+
+    let parse = |extra: &[&str]| {
+        let mut args = vec!["hooklistener", "inbox", "wait", "signup"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args)
+    };
+    assert!(parse(&["--link"]).is_ok());
+    assert!(
+        parse(&["--code", "--link"]).is_err(),
+        "--code and --link each print one value"
+    );
+    assert!(
+        parse(&["--timeout", "2h"]).is_err(),
+        "a wait longer than an hour is refused"
+    );
+}
+
+#[test]
+fn inbox_emails_and_email_are_aliases() {
+    for spelling in ["list-emails", "emails"] {
+        let cli = Cli::try_parse_from([
+            "hooklistener",
+            "inbox",
+            spelling,
+            "signup",
+            "--to",
+            "signup+run42@hookinbox.com",
+            "--page-size",
+            "100",
+        ])
+        .unwrap_or_else(|err| panic!("inbox {spelling} parses: {err}"));
+        assert!(
+            matches!(
+                cli.command,
+                Some(Commands::Inbox {
+                    action: InboxAction::ListEmails {
+                        page: 1,
+                        page_size: 100,
+                        ..
+                    }
+                })
+            ),
+            "inbox {spelling} must yield ListEmails"
+        );
+    }
+    assert!(
+        Cli::try_parse_from([
+            "hooklistener",
+            "inbox",
+            "emails",
+            "signup",
+            "--page-size",
+            "101"
+        ])
+        .is_err(),
+        "the server returns at most 100 emails per page"
+    );
+
+    for spelling in ["show-email", "email"] {
+        let cli = Cli::try_parse_from(["hooklistener", "inbox", spelling, "signup", "em-1"])
+            .unwrap_or_else(|err| panic!("inbox {spelling} parses: {err}"));
+        match cli.command {
+            Some(Commands::Inbox {
+                action:
+                    InboxAction::ShowEmail {
+                        inbox, email_id, ..
+                    },
+            }) => {
+                assert_eq!(inbox, "signup");
+                assert_eq!(email_id, "em-1");
+            }
+            _ => panic!("inbox {spelling} must yield ShowEmail"),
+        }
+    }
+}
+
+#[test]
 fn endpoint_request_is_alias_of_show_request() {
     for spelling in ["request", "show-request"] {
         let cli = Cli::try_parse_from(["hooklistener", "endpoint", spelling, "ep_1", "req_1"])
@@ -1587,6 +1720,7 @@ fn top_level_commands_are_listed_in_grouped_order() {
             "listen",
             "tunnel",
             "endpoint",
+            "inbox",
             "static-tunnel",
             "anon",
             "cases",
@@ -3598,4 +3732,67 @@ fn validate_forward_target_url_requires_http_or_https() {
         "unexpected error: {}",
         err
     );
+}
+
+#[test]
+fn command_output_inbox_snapshot() {
+    let inbox: api::EmailInbox = serde_json::from_value(serde_json::json!({
+        "id": "5f0c6e2a-1b2c-4d5e-8f90-123456789abc",
+        "name": "Signup tests",
+        "slug": "signup",
+        "email_address": "signup@hookinbox.com",
+        "email_count": 0,
+        "created_at": "2026-10-12T12:00:00Z"
+    }))
+    .unwrap();
+    let email = |code: Option<&str>, link: Option<&str>| -> api::InboxEmail {
+        serde_json::from_value(serde_json::json!({
+            "id": "dd9c44e7-e7fb-4236-b65a-215bd64901d1",
+            "from": "Acme <no-reply@acme.test>",
+            "recipients": ["signup+run42@hookinbox.com"],
+            "subject": "Confirm your email",
+            "created_at": "2026-10-12T12:00:05Z",
+            "code": code,
+            "codes": code.map_or_else(Vec::new, |code| vec![code, "2026"]),
+            "verification_link": link,
+            "attachments": [{"index": 0, "filename": "receipt.pdf"}, {"index": 1}]
+        }))
+        .unwrap()
+    };
+    let found = email(Some("482913"), Some("https://acme.test/verify?token=abc"));
+
+    let output = render_snapshot_sections(vec![
+        (
+            "inbox create",
+            render_status_block(
+                OutputStatus::Ok,
+                "inbox created",
+                &inbox_detail_fields(&inbox),
+            ),
+        ),
+        (
+            "inbox wait",
+            render_status_block(
+                OutputStatus::Ok,
+                "email received",
+                &email_summary_fields(&found),
+            ),
+        ),
+        (
+            "inbox wait without code or link",
+            render_status_block(
+                OutputStatus::Ok,
+                "email received",
+                &email_summary_fields(&email(None, None)),
+            ),
+        ),
+        (
+            "inbox show-email",
+            render_field_block(&email_detail_fields(&found)),
+        ),
+    ]);
+
+    assert_no_emoji(&output);
+    assert_no_ansi_escape(&output);
+    insta::assert_snapshot!("command_output_inbox", output);
 }
