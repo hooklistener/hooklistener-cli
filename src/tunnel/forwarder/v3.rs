@@ -106,6 +106,7 @@ impl TunnelForwarder {
         };
 
         let mut request = client.request(method, target);
+        // Sender-supplied proxy headers are dropped and replaced by ours.
         for (name, value) in &start.headers {
             if should_forward_request_header(name)
                 && let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
@@ -114,6 +115,7 @@ impl TunnelForwarder {
                 request = request.header(name, value);
             }
         }
+        request = self.apply_trusted_forwarded_headers(request);
         if let Some(content_length) = start.content_length {
             request = request.header(reqwest::header::CONTENT_LENGTH, content_length);
         }

@@ -2150,13 +2150,14 @@ impl ApiClient {
 
         let mut request_builder = replay_client.request(method, url);
 
-        // Add headers (excluding host-related ones)
+        // Add headers, excluding host-related ones and sender-supplied proxy headers.
         for (key, value) in &original_request.headers {
             let key_lower = key.to_lowercase();
             if !key_lower.starts_with("host")
                 && !key_lower.starts_with("x-forwarded")
                 && !key_lower.starts_with("cf-")
                 && key_lower != "content-length"
+                && !crate::tunnel::is_untrusted_proxy_header(key)
             {
                 request_builder = request_builder.header(key, value);
             }
@@ -2697,6 +2698,56 @@ mod tests {
         let target_url = format!("{}/webhook", server.url());
         let result = client.forward_request(&request, &target_url).await.unwrap();
         assert!(result.success);
+        assert_eq!(result.status_code, Some(200));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_forward_request_drops_untrusted_proxy_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let mut mock = server
+            .mock("POST", "/webhook")
+            .match_header("stripe-signature", "t=1,v1=abc");
+        for header in [
+            "forwarded",
+            "x-real-ip",
+            "true-client-ip",
+            "client-ip",
+            "via",
+        ] {
+            mock = mock.match_header(header, mockito::Matcher::Missing);
+        }
+        let mock = mock.with_status(200).with_body("ok").create_async().await;
+
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+        let request = WebhookRequest {
+            id: "req-1".to_string(),
+            timestamp: 0,
+            remote_addr: "127.0.0.1".to_string(),
+            headers: [
+                ("Stripe-Signature", "t=1,v1=abc"),
+                ("Forwarded", "for=203.0.113.9"),
+                ("X-Real-IP", "203.0.113.9"),
+                ("True-Client-IP", "203.0.113.9"),
+                ("Client-IP", "203.0.113.9"),
+                ("Via", "1.1 evil.example"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+            content_length: 0,
+            method: "POST".to_string(),
+            url: "/webhook".to_string(),
+            path: Some("/webhook".to_string()),
+            query_params: HashMap::new(),
+            created_at: "2024-01-01".to_string(),
+            body_preview: Some("{}".to_string()),
+            body: Some("{}".to_string()),
+        };
+
+        let target_url = format!("{}/webhook", server.url());
+        let result = client.forward_request(&request, &target_url).await.unwrap();
         assert_eq!(result.status_code, Some(200));
         mock.assert_async().await;
     }

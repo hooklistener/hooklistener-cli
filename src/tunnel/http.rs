@@ -56,6 +56,51 @@ pub(crate) fn decode_request_body_limited(
     Ok(body)
 }
 
+/// Proxy and client-address headers that are never forwarded to a local target.
+///
+/// Whoever sends a webhook chooses every request header. The CLI connects to
+/// the local target from loopback, an address many frameworks trust as a
+/// reverse proxy, so a forwarded copy of one of these headers would let any
+/// sender pick the client IP, scheme, host, or proxy chain the local app sees.
+/// `listen` and `tunnel` drop them all; `tunnel` then sets `X-Forwarded-Host`
+/// and `X-Forwarded-Proto` itself (see [`TrustedForwardedHeaders`]).
+///
+/// TUI replays, captured-request forwarding, and exported curl commands skip
+/// the same list.
+const UNTRUSTED_PROXY_HEADERS: &[&str] = &[
+    // RFC 7239 and the de facto X-Forwarded-* family.
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-prefix",
+    // Read as the request scheme by frameworks such as Rack and Spring.
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    // Client address headers set by proxies and CDNs.
+    "x-real-ip",
+    "client-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "x-originating-ip",
+    "x-remote-ip",
+    "x-remote-addr",
+    // Proxy chain.
+    "via",
+];
+
+/// Whether `key` names a sender-controlled proxy header (case-insensitive).
+pub(crate) fn is_untrusted_proxy_header(key: &str) -> bool {
+    UNTRUSTED_PROXY_HEADERS
+        .iter()
+        .any(|header| key.eq_ignore_ascii_case(header))
+}
+
+/// Whether a request header from the relay may be copied onto the local
+/// request: drops framing and hop-by-hop headers, which reqwest sets from the
+/// body actually sent, and every untrusted proxy header.
 pub(crate) fn should_forward_request_header(key: &str) -> bool {
     const HEADERS_TO_DROP: &[&str] = &[
         "connection",
@@ -72,6 +117,64 @@ pub(crate) fn should_forward_request_header(key: &str) -> bool {
     !HEADERS_TO_DROP
         .iter()
         .any(|header| key.eq_ignore_ascii_case(header))
+        && !is_untrusted_proxy_header(key)
+}
+
+/// `X-Forwarded-Host` and `X-Forwarded-Proto` values the CLI sets on `tunnel`
+/// requests, so local apps that build absolute URLs see the public tunnel URL.
+///
+/// Both come from the public host the relay reports when the tunnel joins,
+/// never from the incoming request. There is no `X-Forwarded-For`: the relay
+/// protocol does not carry a client address the CLI could vouch for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrustedForwardedHeaders {
+    host: reqwest::header::HeaderValue,
+    proto: reqwest::header::HeaderValue,
+}
+
+impl TrustedForwardedHeaders {
+    /// Parses the join response's `subdomain`: a bare public host such as
+    /// `abc123.hook.events` (served over HTTPS) or an `http(s)://` origin.
+    /// Returns `None` for anything that is not a plain origin.
+    pub(crate) fn from_public_host(public_host: &str) -> Option<Self> {
+        let public_host = public_host.trim().trim_end_matches('/');
+        let url = if public_host.starts_with("http://") || public_host.starts_with("https://") {
+            reqwest::Url::parse(public_host)
+        } else {
+            reqwest::Url::parse(&format!("https://{public_host}"))
+        }
+        .ok()?;
+
+        let proto = match url.scheme() {
+            "https" => "https",
+            "http" => "http",
+            _ => return None,
+        };
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        let host = url.host_str()?;
+        let host = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+
+        Some(Self {
+            host: reqwest::header::HeaderValue::from_str(&host).ok()?,
+            proto: reqwest::header::HeaderValue::from_static(proto),
+        })
+    }
+
+    pub(crate) fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header("x-forwarded-host", self.host.clone())
+            .header("x-forwarded-proto", self.proto.clone())
+    }
 }
 
 pub(crate) fn supported_tunnel_method(method: &str) -> Option<reqwest::Method> {
