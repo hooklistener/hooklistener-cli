@@ -64,7 +64,10 @@ hooklistener listen stripe-sandbox \
 
 Listener targets are loopback-only by default. Hooklistener resolves and pins the target address,
 does not follow redirects, ignores proxy environment variables, and rejects target URLs containing
-credentials, query strings, or fragments. Use `--allow-non-loopback` only for an explicitly trusted
+credentials, query strings, fragments, or encoded path separators. When the target has a path, such
+as `/webhooks/stripe`, forwarded requests must stay under it: a request path that could leave it,
+including through encoded separators such as `%2f` or `%5c`, is rejected without contacting your
+app. Use `--allow-non-loopback` only for an explicitly trusted
 remote target. HTTPS certificate verification can be disabled only with the visible
 `--insecure-tls` opt-in.
 

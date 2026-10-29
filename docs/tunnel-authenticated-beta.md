@@ -46,8 +46,9 @@ proxy environment variables, and does not follow redirects.
 Targets are loopback-only unless `--allow-non-loopback` is supplied for an
 explicitly trusted host. `listen` also requires a visible `--insecure-tls` flag
 to disable HTTPS certificate verification. Target credentials, query strings,
-fragments, invalid schemes, and forbidden addresses are rejected before relay
-activation.
+fragments, encoded path separators, invalid schemes, and forbidden addresses are
+rejected before relay activation. Requests whose path could leave the target
+path, including through encoded separators, are rejected before forwarding.
 
 ## Phase 1 boundaries
 
