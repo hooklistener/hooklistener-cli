@@ -3650,6 +3650,242 @@ fn tunnel_response_event_redacts_sensitive_headers() {
 }
 
 #[test]
+fn request_received_receipt_redacts_query_secrets() {
+    let receipt = tunnel_event_receipt(
+        &TunnelEvent::RequestReceived {
+            request_id: "req-1".into(),
+            method: "GET".into(),
+            path: "/hook".into(),
+            headers: std::collections::HashMap::new(),
+            body: None,
+            query_string: "access_token=SECRET&foo=bar&api_key=OTHER".into(),
+            replay: false,
+        },
+        "127.0.0.1",
+        3000,
+        Some("org-1"),
+        None,
+    );
+
+    assert_eq!(
+        receipt["query_string"],
+        "access_token=[REDACTED]&foo=bar&api_key=[REDACTED]"
+    );
+    assert_eq!(
+        receipt["local_target_url"],
+        "http://127.0.0.1:3000/hook?access_token=[REDACTED]&foo=bar&api_key=[REDACTED]"
+    );
+    let serialized = receipt.to_string();
+    assert!(!serialized.contains("SECRET"));
+    assert!(!serialized.contains("OTHER"));
+    assert!(serialized.contains("foo=bar"));
+}
+
+#[test]
+fn request_received_receipt_keeps_harmless_query_verbatim() {
+    let receipt = tunnel_event_receipt(
+        &TunnelEvent::RequestReceived {
+            request_id: "req-2".into(),
+            method: "POST".into(),
+            path: "/hook".into(),
+            headers: std::collections::HashMap::new(),
+            body: None,
+            query_string: "delivery=abc&status_code=200;page=2".into(),
+            replay: false,
+        },
+        "localhost",
+        3000,
+        None,
+        None,
+    );
+
+    assert_eq!(
+        receipt["query_string"],
+        "delivery=abc&status_code=200;page=2"
+    );
+    assert_eq!(
+        receipt["local_target_url"],
+        "http://localhost:3000/hook?delivery=abc&status_code=200;page=2"
+    );
+}
+
+#[test]
+fn listen_forward_events_redact_query_secrets_in_target_url() {
+    let target_url = "http://localhost:3000/webhooks/github?token=LISTENSECRET&delivery=abc";
+    for event in [
+        TunnelEvent::ForwardSuccess {
+            request_id: "req_123".to_string(),
+            target_url: target_url.to_string(),
+            status: 204,
+            duration_ms: 37,
+        },
+        TunnelEvent::ForwardError {
+            request_id: "req_123".to_string(),
+            target_url: target_url.to_string(),
+            error: "connection refused".to_string(),
+            duration_ms: 37,
+        },
+    ] {
+        let receipt = listen_event_receipt(
+            &event,
+            "github-webhooks",
+            "http://localhost:3000/webhooks",
+            None,
+        );
+
+        assert_eq!(
+            receipt["target_url"],
+            "http://localhost:3000/webhooks/github?token=[REDACTED]&delivery=abc"
+        );
+        assert!(!receipt.to_string().contains("LISTENSECRET"));
+    }
+}
+
+#[test]
+fn listen_webhook_event_redacts_query_secrets_in_request_url() {
+    let request = models::WebhookRequest {
+        id: "req_123".to_string(),
+        timestamp: 1_781_000_000,
+        remote_addr: "Tunnel".to_string(),
+        headers: std::collections::HashMap::new(),
+        content_length: 0,
+        method: "GET".to_string(),
+        url: "https://hook.example/w/abc?sig=WEBHOOKSIG&id=7".to_string(),
+        path: None,
+        query_params: std::collections::HashMap::new(),
+        created_at: "2026-07-08T10:00:00Z".to_string(),
+        body_preview: None,
+        body: None,
+    };
+    let receipt = listen_event_receipt(
+        &TunnelEvent::WebhookReceived(Box::new(request)),
+        "github-webhooks",
+        "http://localhost:3000/webhooks",
+        None,
+    );
+
+    assert_eq!(
+        receipt["request"]["url"],
+        "https://hook.example/w/abc?sig=[REDACTED]&id=7"
+    );
+    assert_eq!(
+        receipt["request"]["path"],
+        "https://hook.example/w/abc?sig=[REDACTED]&id=7"
+    );
+    assert!(!receipt.to_string().contains("WEBHOOKSIG"));
+}
+
+#[test]
+fn redact_query_string_handles_separators_and_malformed_input() {
+    for (query, expected) in [
+        ("", ""),
+        ("foo=bar", "foo=bar"),
+        // Order, names, separators, and harmless values are preserved.
+        (
+            "b=2&token=t1;a=1&secret=s1",
+            "b=2&token=[REDACTED];a=1&secret=[REDACTED]",
+        ),
+        // Names without a value, empty values, and repeated or trailing separators.
+        ("token&code=&sig=x", "token&code=&sig=[REDACTED]"),
+        ("a=1&&password=p;;b=2&", "a=1&&password=[REDACTED];;b=2&"),
+        ("=orphan&&=", "=orphan&&="),
+        // Only the first `=` splits the name from the value.
+        ("signature=abc==&x=y=z", "signature=[REDACTED]&x=y=z"),
+        // Case-insensitive, percent-decoded, and `+`-decoded names.
+        (
+            "API_KEY=k&Code=c&JWT=j",
+            "API_KEY=[REDACTED]&Code=[REDACTED]&JWT=[REDACTED]",
+        ),
+        (
+            "access%5Ftoken=t&%61pi_key=k",
+            "access%5Ftoken=[REDACTED]&%61pi_key=[REDACTED]",
+        ),
+        (
+            "client+secret=s&api%20key=k",
+            "client+secret=[REDACTED]&api%20key=[REDACTED]",
+        ),
+        // These names only match once decoded.
+        (
+            "%74oken=t&%73ig=s&c%6Fde=c&foo=%74oken",
+            "%74oken=[REDACTED]&%73ig=[REDACTED]&c%6Fde=[REDACTED]&foo=%74oken",
+        ),
+        // Malformed escapes and invalid UTF-8 never panic and still match.
+        (
+            "token%=t&%zzsecret=s&%=v&%FF=w",
+            "token%=[REDACTED]&%zzsecret=[REDACTED]&%=v&%FF=w",
+        ),
+        ("refresh_token=%E0%A4%A", "refresh_token=[REDACTED]"),
+        // Nested names, cloud signatures, and servlet session path parameters.
+        (
+            "user[password]=p&X-Amz-Signature=s&X-Amz-Date=d",
+            "user[password]=[REDACTED]&X-Amz-Signature=[REDACTED]&X-Amz-Date=d",
+        ),
+        (
+            ";jsessionid=abc;view=full",
+            ";jsessionid=[REDACTED];view=full",
+        ),
+        // Every name from the audit's list.
+        (
+            "token=1&access_token=1&refresh_token=1&id_token=1&jwt=1&bearer=1&api_key=1&apikey=1&key=1&secret=1&client_secret=1&password=1&passwd=1&signature=1&sig=1&auth=1&authorization=1&session=1&sessionid=1&code=1",
+            "token=[REDACTED]&access_token=[REDACTED]&refresh_token=[REDACTED]&id_token=[REDACTED]&jwt=[REDACTED]&bearer=[REDACTED]&api_key=[REDACTED]&apikey=[REDACTED]&key=[REDACTED]&secret=[REDACTED]&client_secret=[REDACTED]&password=[REDACTED]&passwd=[REDACTED]&signature=[REDACTED]&sig=[REDACTED]&auth=[REDACTED]&authorization=[REDACTED]&session=[REDACTED]&sessionid=[REDACTED]&code=[REDACTED]",
+        ),
+        // Look-alikes that are not credentials stay visible.
+        (
+            "status_code=200&zip_code=10001&keyword=k&key_id=7&monkey=m&author=a",
+            "status_code=200&zip_code=10001&keyword=k&key_id=7&monkey=m&author=a",
+        ),
+    ] {
+        assert_eq!(redact_query_string(query), expected, "query: {query:?}");
+    }
+}
+
+#[test]
+fn redact_url_query_only_touches_the_query() {
+    assert_eq!(
+        redact_url_query("http://127.0.0.1:3000/hook"),
+        "http://127.0.0.1:3000/hook"
+    );
+    assert_eq!(
+        redact_url_query("http://127.0.0.1:3000/token/hook?token=t&a=1#key=frag"),
+        "http://127.0.0.1:3000/token/hook?token=[REDACTED]&a=1#key=frag"
+    );
+    assert_eq!(redact_url_query("/hook?"), "/hook?");
+    assert_eq!(redact_url_query("/hook#frag?token=t"), "/hook#frag?token=t");
+}
+
+#[test]
+fn header_and_query_redaction_share_one_credential_rule() {
+    for name in [
+        "authorization",
+        "Proxy-Authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "x-auth-token",
+        "client_secret",
+        "X-Hub-Signature-256",
+        "x-session-id",
+    ] {
+        assert!(
+            sensitive_credential_name(name),
+            "{name} should be sensitive"
+        );
+        assert_eq!(
+            redact_query_string(&format!("{name}=value")),
+            format!("{name}=[REDACTED]")
+        );
+    }
+    for name in [
+        "content-type",
+        "user-agent",
+        "x-github-event",
+        "x-request-id",
+    ] {
+        assert!(!sensitive_credential_name(name), "{name} should be visible");
+    }
+}
+
+#[test]
 fn buffered_summary_event_receipt_includes_count_and_oldest() {
     let event = TunnelEvent::BufferedSummary {
         count: 3,

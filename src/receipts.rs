@@ -103,14 +103,41 @@ pub fn tunnel_event_base(event: &str, status: &str) -> serde_json::Value {
     )
 }
 
+const REDACTED_VALUE: &str = "[REDACTED]";
+
+/// Substrings that mark a credential however the name is cased or separated:
+/// `access_token`, `clientSecret`, `X-Api-Key`, `PHPSESSID`.
+const CREDENTIAL_NAME_SUBSTRINGS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "sessionid",
+    "sessid",
+];
+
+/// Whole words that name a credential: `Authorization`, `Set-Cookie`,
+/// `X-Amz-Signature`, `sig`, `session_id`.
+const CREDENTIAL_NAME_WORDS: &[&str] = &[
+    "authorization",
+    "auth",
+    "bearer",
+    "jwt",
+    "cookie",
+    "signature",
+    "sig",
+    "session",
+];
+
 pub fn redact_tunnel_headers(
     headers: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
     headers
         .iter()
         .map(|(name, value)| {
-            let value = if sensitive_header_name(name) {
-                "[REDACTED]".to_string()
+            let value = if sensitive_credential_name(name) {
+                REDACTED_VALUE.to_string()
             } else {
                 value.clone()
             };
@@ -120,16 +147,109 @@ pub fn redact_tunnel_headers(
         .collect()
 }
 
-pub fn sensitive_header_name(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase().replace('_', "-");
+/// Reports whether a header or query parameter name looks like it carries a
+/// credential. Headers and query strings share this one rule so a receipt
+/// redacts a secret the same way whichever channel the sender used.
+pub fn sensitive_credential_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let words: Vec<&str> = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let compact = words.concat();
 
-    matches!(
-        normalized.as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
-    ) || normalized.contains("token")
-        || normalized.contains("secret")
-        || normalized.contains("api-key")
-        || normalized.ends_with("-key")
+    CREDENTIAL_NAME_SUBSTRINGS
+        .iter()
+        .any(|needle| compact.contains(needle))
+        || words.iter().any(|word| CREDENTIAL_NAME_WORDS.contains(word))
+        // `key`, `api_key`, `X-Api-Key`, `private.key`; not `keyword` or `key_id`.
+        || words.last() == Some(&"key")
+        // An OAuth authorization code; `status_code` and `zip_code` stay visible.
+        || compact == "code"
+}
+
+/// Replaces the value of each credential-like query parameter with
+/// `[REDACTED]`, for receipts and other machine-readable output. The local
+/// target must still be sent the original query.
+///
+/// Parameter order, names, `&` and `;` separators, and all other values are
+/// kept as sent. Names match case-insensitively, both as sent and after
+/// percent-decoding. A parameter without `=` or with an empty value has
+/// nothing to hide and is left alone.
+pub fn redact_query_string(query: &str) -> String {
+    let mut redacted = String::with_capacity(query.len());
+
+    for segment in query.split_inclusive(['&', ';']) {
+        let pair = segment.strip_suffix(['&', ';']).unwrap_or(segment);
+        let separator = &segment[pair.len()..];
+
+        match pair.split_once('=') {
+            Some((name, value)) if !value.is_empty() && sensitive_query_param_name(name) => {
+                redacted.push_str(name);
+                redacted.push('=');
+                redacted.push_str(REDACTED_VALUE);
+            }
+            _ => redacted.push_str(pair),
+        }
+        redacted.push_str(separator);
+    }
+
+    redacted
+}
+
+/// Applies [`redact_query_string`] to the query of a URL or path, leaving the
+/// scheme, host, path, and fragment unchanged.
+pub fn redact_url_query(url: &str) -> String {
+    let (before_fragment, fragment) = url.split_at(url.find('#').unwrap_or(url.len()));
+    match before_fragment.split_once('?') {
+        Some((base, query)) => format!("{base}?{}{fragment}", redact_query_string(query)),
+        None => url.to_string(),
+    }
+}
+
+fn sensitive_query_param_name(raw_name: &str) -> bool {
+    sensitive_credential_name(raw_name)
+        || sensitive_credential_name(&decode_query_component(raw_name))
+}
+
+/// Decodes `+` and valid `%XX` escapes as `application/x-www-form-urlencoded`
+/// does. Malformed escapes stay literal and invalid UTF-8 is replaced, so the
+/// result is only fit for matching names, never for display or forwarding.
+fn decode_query_component(raw: &str) -> String {
+    fn hex_value(byte: Option<&u8>) -> Option<u8> {
+        char::from(*byte?).to_digit(16).map(|digit| digit as u8)
+    }
+
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => match (
+                hex_value(bytes.get(index + 1)),
+                hex_value(bytes.get(index + 2)),
+            ) {
+                (Some(high), Some(low)) => {
+                    decoded.push((high << 4) | low);
+                    index += 3;
+                }
+                _ => {
+                    decoded.push(b'%');
+                    index += 1;
+                }
+            },
+            _ => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 pub fn reconnect_failure_reason(event: &TunnelEvent) -> Option<&str> {
@@ -282,8 +402,8 @@ pub fn listen_event_receipt(
             receipt["request"] = serde_json::json!({
                 "id": &request.id,
                 "method": &request.method,
-                "path": request.path.as_deref().unwrap_or(&request.url),
-                "url": &request.url,
+                "path": redact_url_query(request.path.as_deref().unwrap_or(&request.url)),
+                "url": redact_url_query(&request.url),
                 "remote_addr": &request.remote_addr,
                 "content_length": request.content_length,
                 "created_at": &request.created_at,
@@ -307,7 +427,7 @@ pub fn listen_event_receipt(
             receipt["request_id"] = serde_json::json!(request_id);
             receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
             receipt["request_resource_uri"] = serde_json::json!(request_resource_uri);
-            receipt["target_url"] = serde_json::json!(forward_target_url);
+            receipt["target_url"] = serde_json::json!(redact_url_query(forward_target_url));
             receipt["status_code"] = serde_json::json!(status);
             receipt["duration_ms"] = serde_json::json!(duration_ms);
             receipt
@@ -324,7 +444,7 @@ pub fn listen_event_receipt(
             receipt["request_id"] = serde_json::json!(request_id);
             receipt["resource_uri"] = serde_json::json!(&request_resource_uri);
             receipt["request_resource_uri"] = serde_json::json!(request_resource_uri);
-            receipt["target_url"] = serde_json::json!(forward_target_url);
+            receipt["target_url"] = serde_json::json!(redact_url_query(forward_target_url));
             receipt["error"] = serde_json::json!(error);
             receipt["duration_ms"] = serde_json::json!(duration_ms);
             receipt["next_actions"] = serde_json::json!([
@@ -466,9 +586,10 @@ pub fn tunnel_event_receipt(
             receipt["request_resource_uri"] = serde_json::json!(&request_resource_uri);
             receipt["method"] = serde_json::json!(method);
             receipt["path"] = serde_json::json!(path);
-            receipt["query_string"] = serde_json::json!(query_string);
-            receipt["local_target_url"] =
-                serde_json::json!(local_tunnel_request_target(host, port, path, query_string));
+            receipt["query_string"] = serde_json::json!(redact_query_string(query_string));
+            receipt["local_target_url"] = serde_json::json!(redact_url_query(
+                &local_tunnel_request_target(host, port, path, query_string)
+            ));
             receipt["headers"] = serde_json::json!(redact_tunnel_headers(headers));
             receipt["body_size"] = serde_json::json!(body.as_ref().map(String::len).unwrap_or(0));
             receipt

@@ -2222,6 +2222,94 @@ async fn test_response_buffer_overload_reports_unknown_outcome() {
 }
 
 #[tokio::test]
+async fn test_query_secrets_reach_local_target_but_not_json_receipt() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let query = "access_token=SUPERSECRETQUERYTOKEN&foo=bar;sig=SIGVALUE";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    let (forwarder, _event_rx) = forwarder_for_local_address(address).await;
+    let (writer, _control_rx, _response_rx) = test_priority_writer();
+    let delivery = LocalDelivery {
+        request_id: "req-poc-query".to_string(),
+        method: "GET".to_string(),
+        path: "/hook".to_string(),
+        query_string: query.to_string(),
+        headers: vec![("user-agent".to_string(), "poc".to_string())],
+        body: Vec::new(),
+        deadline_unix_ms: unix_time_ms() + 30_000,
+        replay: false,
+    };
+
+    // The presentation event keeps the real query; only the JSON receipt redacts it.
+    let event = delivery.received_event();
+    assert!(matches!(
+        &event,
+        TunnelEvent::RequestReceived { query_string, .. } if query_string == query
+    ));
+    let receipt = crate::receipts::tunnel_event_receipt(
+        &event,
+        "127.0.0.1",
+        address.port(),
+        Some("org-1"),
+        None,
+    );
+    assert_eq!(
+        receipt["query_string"],
+        "access_token=[REDACTED]&foo=bar;sig=[REDACTED]"
+    );
+    assert_eq!(
+        receipt["local_target_url"],
+        format!(
+            "http://127.0.0.1:{}/hook?access_token=[REDACTED]&foo=bar;sig=[REDACTED]",
+            address.port()
+        )
+    );
+    let serialized = receipt.to_string();
+    assert!(!serialized.contains("SUPERSECRETQUERYTOKEN"));
+    assert!(!serialized.contains("SIGVALUE"));
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        forwarder.forward_tunnel_request(
+            delivery,
+            Arc::new(AtomicU8::new(DELIVERY_QUEUED)),
+            writer,
+            "cli:tunnel:test".to_string(),
+            TunnelLimits::from_join_response(&serde_json::json!({})),
+            ResponseBufferBudget::new(),
+        ),
+    )
+    .await
+    .expect("forwarding a request with a query timed out")
+    .unwrap();
+
+    let request = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("local target server timed out")
+        .unwrap();
+    assert!(
+        request.starts_with(&format!("GET /hook?{query} HTTP/1.1\r\n")),
+        "local target saw: {request}"
+    );
+}
+
+#[tokio::test]
 async fn test_response_writer_failure_after_delivery_started_reports_unknown_outcome() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
