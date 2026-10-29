@@ -13,7 +13,10 @@ use tokio::time::sleep;
 
 use crate::credentials::{save_login_tokens, token_expiry_from_now};
 use crate::output::Stylize;
-use crate::render::{OutputStatus, output_label, print_field, print_json, print_status};
+use crate::render::{
+    OutputStatus, TerminalTextLayout, output_label, print_field, print_json, print_status,
+    sanitize_terminal,
+};
 use crate::{api, auth, config};
 
 pub async fn logout(json: bool) -> Result<()> {
@@ -89,8 +92,15 @@ pub async fn run_login_flow(force_reauth: bool) -> Result<()> {
         .is_ok();
 
     println!("\n{}\n", "HOOKLISTENER LOGIN".bold());
-    print_field("OPEN", portal_url.as_str().underlined());
-    print!("{} {}", output_label("CODE").bold(), display_code.bold());
+    print_field(
+        "OPEN",
+        sanitize_terminal(&portal_url, TerminalTextLayout::Inline).underlined(),
+    );
+    print!(
+        "{} {}",
+        output_label("CODE").bold(),
+        sanitize_terminal(&display_code, TerminalTextLayout::Inline).bold()
+    );
     if clipboard_ok {
         print!(" {}", "(copied to clipboard)".dim());
     }

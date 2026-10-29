@@ -4,7 +4,10 @@ use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 
 use crate::output::Stylize;
-use crate::render::{OutputStatus, output_field, print_field, print_json, print_status_block};
+use crate::render::{
+    OutputStatus, output_field, print_field, print_json, print_status_block,
+    sanitize_terminal_display,
+};
 use crate::{config, credentials};
 
 #[derive(Subcommand)]
@@ -54,7 +57,10 @@ pub async fn execute(action: ConfigAction, json: bool) -> Result<()> {
                     "organization_id": organization_id
                 }))?;
             } else {
-                print_field("CONFIG FILE", config_path.display());
+                print_field(
+                    "CONFIG FILE",
+                    sanitize_terminal_display(config_path.display()),
+                );
                 println!();
                 if env_token {
                     print_field(
@@ -74,7 +80,7 @@ pub async fn execute(action: ConfigAction, json: bool) -> Result<()> {
                     }
                 }
                 match &organization_id {
-                    Some(org_id) => print_field("ORGANIZATION", org_id),
+                    Some(org_id) => print_field("ORGANIZATION", sanitize_terminal_display(org_id)),
                     None => print_field("ORGANIZATION", "(none)".dim()),
                 }
             }
@@ -118,11 +124,13 @@ pub async fn execute(action: ConfigAction, json: bool) -> Result<()> {
                                 output_field("KEY", "selected_organization_id"),
                                 output_field(
                                     "VALUE",
-                                    config
-                                        .selected_organization_id
-                                        .as_deref()
-                                        .unwrap_or_default()
-                                        .bold(),
+                                    sanitize_terminal_display(
+                                        config
+                                            .selected_organization_id
+                                            .as_deref()
+                                            .unwrap_or_default(),
+                                    )
+                                    .bold(),
                                 ),
                             ],
                         );

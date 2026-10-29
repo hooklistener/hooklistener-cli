@@ -9,8 +9,8 @@ use crate::commands::confirm_destructive_action;
 use crate::credentials::{ensure_valid_token, require_organization};
 use crate::output::Stylize;
 use crate::render::{
-    OutputStatus, new_table, print_context, print_empty_state, print_field, print_json,
-    print_status, sanitize_terminal_display,
+    OutputField, OutputStatus, new_table, output_field, print_context, print_empty_state,
+    print_field, print_json, print_status, print_status_block, sanitize_terminal_display,
 };
 use crate::{api, config};
 
@@ -75,17 +75,11 @@ pub async fn execute(action: StaticTunnelAction, json: bool, yes: bool) -> Resul
                     "result": created
                 }))?;
             } else {
-                print_status(OutputStatus::Ok, "STATIC TUNNEL CREATED");
-                println!();
-                print_field("ID", &created.static_tunnel.id);
-                print_field("SLUG", created.static_tunnel.slug.as_str().bold());
-                if let Some(name) = created.static_tunnel.name.as_deref() {
-                    print_field("NAME", name);
-                }
-                print_field("ORGANIZATION", organization_id.dim());
-                if let Some(message) = created.message {
-                    print_field("MESSAGE", message.dim());
-                }
+                print_status_block(
+                    OutputStatus::Ok,
+                    "STATIC TUNNEL CREATED",
+                    &static_tunnel_created_fields(&created, &organization_id),
+                );
             }
         }
         StaticTunnelAction::Delete {
@@ -118,15 +112,45 @@ pub async fn execute(action: StaticTunnelAction, json: bool, yes: bool) -> Resul
             } else {
                 print_status(OutputStatus::Ok, "STATIC TUNNEL DELETED");
                 println!();
-                print_field("SLUG/ID", static_tunnel_id);
-                print_field("ORGANIZATION", organization_id.dim());
+                print_field("SLUG/ID", sanitize_terminal_display(&static_tunnel_id));
+                print_field(
+                    "ORGANIZATION",
+                    sanitize_terminal_display(&organization_id).dim(),
+                );
                 if let Some(message) = response.message {
-                    print_field("MESSAGE", message.dim());
+                    print_field("MESSAGE", sanitize_terminal_display(&message).dim());
                 }
             }
         }
     }
     Ok(ControlFlow::Continue(()))
+}
+
+/// The `static-tunnel create` confirmation; every value but the labels comes
+/// from the API or the user, so each is neutralized before styling.
+pub(crate) fn static_tunnel_created_fields(
+    created: &api::StaticTunnelCreateResponse,
+    organization_id: &str,
+) -> Vec<OutputField> {
+    let tunnel = &created.static_tunnel;
+    let mut fields = vec![
+        output_field("ID", sanitize_terminal_display(&tunnel.id)),
+        output_field("SLUG", sanitize_terminal_display(&tunnel.slug).bold()),
+    ];
+    if let Some(name) = tunnel.name.as_deref() {
+        fields.push(output_field("NAME", sanitize_terminal_display(name)));
+    }
+    fields.push(output_field(
+        "ORGANIZATION",
+        sanitize_terminal_display(organization_id).dim(),
+    ));
+    if let Some(message) = created.message.as_deref() {
+        fields.push(output_field(
+            "MESSAGE",
+            sanitize_terminal_display(message).dim(),
+        ));
+    }
+    fields
 }
 
 pub fn print_static_tunnels(response: &api::StaticTunnelsResponse) {

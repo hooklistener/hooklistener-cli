@@ -7,8 +7,8 @@ use crate::api::ApiClient;
 use crate::credentials::ensure_valid_token;
 use crate::output::Stylize;
 use crate::render::{
-    OutputStatus, new_table, output_field, print_empty_state, print_json, print_status,
-    print_status_block,
+    OutputField, OutputStatus, TerminalTextLayout, new_table, output_field, print_empty_state,
+    print_json, print_status, print_status_block, sanitize_terminal,
 };
 use crate::{api, config};
 
@@ -69,10 +69,7 @@ pub async fn execute(action: OrgAction, json: bool) -> Result<()> {
                 print_status_block(
                     OutputStatus::Ok,
                     "ORGANIZATION SELECTED",
-                    &[
-                        output_field("NAME", organization_name.bold()),
-                        output_field("ORGANIZATION", org_id.dim()),
-                    ],
+                    &organization_selected_fields(&organization_name, &org_id),
                 );
             }
         }
@@ -93,6 +90,24 @@ pub async fn execute(action: OrgAction, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The `org use` confirmation. The name comes from the API, so it is
+/// neutralized before styling.
+pub(crate) fn organization_selected_fields(
+    organization_name: &str,
+    org_id: &str,
+) -> Vec<OutputField> {
+    vec![
+        output_field(
+            "NAME",
+            sanitize_terminal(organization_name, TerminalTextLayout::Inline).bold(),
+        ),
+        output_field(
+            "ORGANIZATION",
+            sanitize_terminal(org_id, TerminalTextLayout::Inline).dim(),
+        ),
+    ]
+}
+
 pub fn print_organizations(organizations: &[api::Organization], selected_org: Option<&str>) {
     if organizations.is_empty() {
         print_empty_state(
@@ -102,6 +117,16 @@ pub fn print_organizations(organizations: &[api::Organization], selected_org: Op
         return;
     }
 
+    println!(
+        "{}",
+        render_organizations_table(organizations, selected_org)
+    );
+}
+
+pub(crate) fn render_organizations_table(
+    organizations: &[api::Organization],
+    selected_org: Option<&str>,
+) -> String {
     let mut table = new_table(&["", "ID", "Name"]);
     for org in organizations {
         let marker = if selected_org.is_some_and(|id| id == org.id) {
@@ -109,7 +134,11 @@ pub fn print_organizations(organizations: &[api::Organization], selected_org: Op
         } else {
             ""
         };
-        table.add_row(vec![marker, &org.id, &org.name]);
+        table.add_row(vec![
+            marker.to_string(),
+            sanitize_terminal(&org.id, TerminalTextLayout::Inline).into_owned(),
+            sanitize_terminal(&org.name, TerminalTextLayout::Inline).into_owned(),
+        ]);
     }
-    println!("{table}");
+    table.to_string()
 }

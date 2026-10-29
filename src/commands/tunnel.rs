@@ -463,11 +463,17 @@ pub async fn run_tunnel_lifecycle_command(
             } else {
                 print_status(OutputStatus::Ok, "TUNNEL PREPARED");
                 println!();
-                print_field("TARGET", local_target_url);
-                print_field("ORGANIZATION", context.organization_id);
-                print_field("CONTRACT", context.contract.version);
+                print_field("TARGET", sanitize_terminal_display(&local_target_url));
+                print_field(
+                    "ORGANIZATION",
+                    sanitize_terminal_display(&context.organization_id),
+                );
+                print_field(
+                    "CONTRACT",
+                    sanitize_terminal_display(&context.contract.version),
+                );
                 if let Some(slug) = target.slug {
-                    print_field("SLUG", slug);
+                    print_field("SLUG", sanitize_terminal_display(&slug));
                 }
                 Ok(())
             }
@@ -712,17 +718,29 @@ pub async fn run_anonymous_tunnel_activation(
     } else {
         print_status(OutputStatus::Ok, "ANONYMOUS TUNNEL CREATED");
         println!();
-        print_field("ROUTE", &created.id);
-        print_field("PUBLIC URL", created.url.as_str().underlined());
-        print_field("EXPIRES AT", created.expires_at.as_str().dim());
+        let route_id = sanitize_terminal(&created.id, TerminalTextLayout::Inline);
+        print_field("ROUTE", &route_id);
+        print_field(
+            "PUBLIC URL",
+            sanitize_terminal(&created.url, TerminalTextLayout::Inline).underlined(),
+        );
+        print_field(
+            "EXPIRES AT",
+            sanitize_terminal(&created.expires_at, TerminalTextLayout::Inline).dim(),
+        );
         println!();
-        print_field("ROUTE TOKEN", created.route_token.as_str().yellow());
-        print_field("CLAIM TOKEN", created.claim_token.as_str().yellow());
+        print_field(
+            "ROUTE TOKEN",
+            sanitize_terminal(&created.route_token, TerminalTextLayout::Inline).yellow(),
+        );
+        print_field(
+            "CLAIM TOKEN",
+            sanitize_terminal(&created.claim_token, TerminalTextLayout::Inline).yellow(),
+        );
         print_field(
             "ACTION",
             format!(
-                "Save both tokens. Claim later with `hooklistener anon claim {} --token <claim-token>`.",
-                created.id
+                "Save both tokens. Claim later with `hooklistener anon claim {route_id} --token <claim-token>`."
             )
             .dim(),
         );
