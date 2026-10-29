@@ -21,6 +21,7 @@ use crate::tunnel::framing::{
     ChannelMessage, DIRECT_RESPONSE_MODE, decode_channel_message, selected_tunnel_protocol,
     tunnel_join_payload_for_version, validate_framing_contract, validate_join_mode,
 };
+use crate::tunnel::http::TrustedForwardedHeaders;
 use crate::tunnel::limits::{
     LEGACY_MAX_REQUEST_BODY_BYTES, LEGACY_MAX_RESPONSE_BODY_BYTES,
     LEGACY_MAX_RESPONSE_HEADER_BYTES, TUNNEL_MAX_FRAME_BYTES, TUNNEL_MAX_RESPONSE_HEADERS,
@@ -49,6 +50,8 @@ pub struct TunnelForwarder {
     replay_buffered: bool,
     pub(crate) presentation_drops: Arc<AtomicUsize>,
     pub(crate) resume_session_id: Arc<Mutex<Option<String>>>,
+    /// Proxy headers derived from the public tunnel host of the current session.
+    trusted_forwarded_headers: Arc<Mutex<Option<TrustedForwardedHeaders>>>,
     anonymous_route: Option<AnonymousRouteCredential>,
 }
 
@@ -86,6 +89,7 @@ impl TunnelForwarder {
             replay_buffered,
             presentation_drops: Arc::new(AtomicUsize::new(0)),
             resume_session_id: Arc::new(Mutex::new(None)),
+            trusted_forwarded_headers: Arc::new(Mutex::new(None)),
             anonymous_route: None,
         }
     }
@@ -102,6 +106,36 @@ impl TunnelForwarder {
             initial_ticket: Arc::new(Mutex::new(initial_ticket)),
         });
         self
+    }
+
+    /// Records the public tunnel host from a successful join response. Local
+    /// requests then carry `X-Forwarded-Host`/`X-Forwarded-Proto` derived from
+    /// it, or none when the relay reported no usable host.
+    pub(crate) fn record_public_host(&self, join_response: &serde_json::Value) {
+        let headers = join_response
+            .get("subdomain")
+            .and_then(serde_json::Value::as_str)
+            .and_then(TrustedForwardedHeaders::from_public_host);
+        *self
+            .trusted_forwarded_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = headers;
+    }
+
+    /// Adds the trusted proxy headers for the current session to a local request.
+    pub(crate) fn apply_trusted_forwarded_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        let headers = self
+            .trusted_forwarded_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match headers {
+            Some(headers) => headers.apply(request),
+            None => request,
+        }
     }
 
     pub(crate) fn emit_presentation(&self, event: TunnelEvent) {
@@ -358,6 +392,7 @@ impl TunnelForwarder {
                                     .lock()
                                     .map_err(|_| anyhow!("Tunnel resume state is unavailable"))? =
                                     Some(session_id);
+                                self.record_public_host(response);
 
                                 let subdomain = response
                                     .get("subdomain")

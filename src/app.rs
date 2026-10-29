@@ -2,6 +2,7 @@ use crate::api::ApiClient;
 use crate::config::Config;
 use crate::models::{ForwardResponse, WebhookRequest};
 use crate::syntax::JsonHighlighter;
+use crate::tunnel::is_untrusted_proxy_header;
 use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Span;
@@ -208,7 +209,10 @@ impl TunnelReplayRequest {
 
         for (key, value) in &self.headers {
             let key_lower = key.to_lowercase();
-            if matches!(key_lower.as_str(), "host" | "content-length") {
+            // Like tunnel forwarding, never replay sender-supplied proxy headers.
+            if matches!(key_lower.as_str(), "host" | "content-length")
+                || is_untrusted_proxy_header(key)
+            {
                 continue;
             }
             if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
@@ -1454,9 +1458,11 @@ impl App {
 
         for (key, value) in &request.headers {
             let key_lower = key.to_lowercase();
+            // Exported commands drop the same proxy headers that forwarding does.
             if skip_headers
                 .iter()
                 .any(|prefix| key_lower.starts_with(prefix))
+                || is_untrusted_proxy_header(key)
             {
                 continue;
             }
@@ -2982,6 +2988,58 @@ mod tests {
         unexpected.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn test_tunnel_replay_send_drops_untrusted_proxy_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let mut mock = server
+            .mock("POST", "/webhook")
+            .match_header("x-hub-signature-256", "sha256=abc");
+        for header in [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-real-ip",
+            "true-client-ip",
+            "via",
+        ] {
+            mock = mock.match_header(header, mockito::Matcher::Missing);
+        }
+        let mock = mock.with_status(204).create_async().await;
+        let (local_host, local_port) = server
+            .host_with_port()
+            .rsplit_once(':')
+            .map(|(host, port)| (host.to_string(), port.parse::<u16>().unwrap()))
+            .unwrap();
+        let replay = TunnelReplayRequest {
+            request_id: "req-1".to_string(),
+            method: "POST".to_string(),
+            path: "/webhook".to_string(),
+            query_string: String::new(),
+            headers: HashMap::from(
+                [
+                    ("X-Hub-Signature-256", "sha256=abc"),
+                    ("Forwarded", "for=203.0.113.9"),
+                    ("X-Forwarded-For", "203.0.113.9"),
+                    ("X-Forwarded-Host", "evil.example"),
+                    ("X-Forwarded-Proto", "https"),
+                    ("X-Real-IP", "203.0.113.9"),
+                    ("True-Client-IP", "203.0.113.9"),
+                    ("Via", "1.1 evil.example"),
+                ]
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+            ),
+            body: Some(r#"{"event":"ping"}"#.to_string()),
+            local_host,
+            local_port,
+        };
+
+        let outcome = replay.send().await.unwrap();
+
+        assert_eq!(outcome.status, 204);
+        mock.assert_async().await;
+    }
+
     #[test]
     fn test_d_from_tunneling_opens_detail() {
         let mut app = make_app_with_state(AppState::Tunneling);
@@ -3410,6 +3468,32 @@ mod tests {
         assert!(!curl.contains("x-real-ip"));
         // authorization should be kept
         assert!(curl.contains("authorization"));
+    }
+
+    #[test]
+    fn test_generate_curl_skips_untrusted_proxy_headers() {
+        let request = make_request_with_headers(
+            "POST",
+            "https://example.com/hook",
+            vec![
+                ("Forwarded", "for=203.0.113.9"),
+                ("X-Forwarded-Host", "evil.example"),
+                ("True-Client-IP", "203.0.113.9"),
+                ("Client-IP", "203.0.113.9"),
+                ("x-client-ip", "203.0.113.9"),
+                ("x-originating-ip", "203.0.113.9"),
+                ("x-remote-ip", "203.0.113.9"),
+                ("x-remote-addr", "203.0.113.9"),
+                ("Via", "1.1 evil.example"),
+                ("stripe-signature", "t=1,v1=abc"),
+            ],
+        );
+
+        let curl = App::generate_curl(&request);
+
+        assert!(!curl.contains("203.0.113.9"), "{curl}");
+        assert!(!curl.contains("evil.example"), "{curl}");
+        assert!(curl.contains("stripe-signature: t=1,v1=abc"), "{curl}");
     }
 
     #[test]

@@ -570,6 +570,7 @@ impl TunnelForwarder {
         let mut req_builder = client.request(request_method, target);
 
         // reqwest sets request framing headers from the body actually sent.
+        // Sender-supplied proxy headers are dropped and replaced by ours.
         for (key, value) in headers {
             if should_forward_request_header(&key)
                 && let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
@@ -578,6 +579,7 @@ impl TunnelForwarder {
                 req_builder = req_builder.header(header_name, header_value);
             }
         }
+        req_builder = self.apply_trusted_forwarded_headers(req_builder);
 
         if !body.is_empty() {
             req_builder = req_builder.body(body);

@@ -316,7 +316,7 @@ impl TunnelClient {
         Ok(())
     }
 
-    async fn handle_message(&self, text: &str, write: &mut WsWrite) -> Result<()> {
+    pub(super) async fn handle_message(&self, text: &str, write: &mut WsWrite) -> Result<()> {
         let msg: ChannelMessage = serde_json::from_str(text)?;
         let log_topic = bounded_control_neutral_log_text(&msg.topic);
         let log_event = bounded_control_neutral_log_text(&msg.event);
@@ -429,7 +429,8 @@ impl TunnelClient {
             }
         };
 
-        // Add headers. reqwest sets request framing headers from the body we actually send.
+        // Add headers. reqwest sets request framing headers from the body we actually send,
+        // and sender-supplied proxy headers are dropped.
         for (key, value) in &request.headers {
             if should_forward_request_header(key) {
                 req_builder = req_builder.header(key, json_value_to_string(value));

@@ -1131,8 +1131,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
 
         inventory = source(V3_TEST_INVENTORY).splitlines()
-        self.assertEqual(len(inventory), 31)
-        self.assertEqual(len(set(inventory)), 31)
+        self.assertEqual(len(inventory), 32)
+        self.assertEqual(len(set(inventory)), 32)
         self.assertIn(
             "fixtures/tunnel_v3_release_test_inventory.txt",
             source(V3_TEST_GATE),

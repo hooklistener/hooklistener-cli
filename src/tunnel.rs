@@ -17,6 +17,7 @@ mod writer;
 
 pub use client::TunnelClient;
 pub use forwarder::TunnelForwarder;
+pub(crate) use http::is_untrusted_proxy_header;
 pub use limits::PRESENTATION_QUEUE_CAPACITY;
 pub(crate) use preview::body_preview;
 

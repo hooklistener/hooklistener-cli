@@ -386,6 +386,428 @@ fn test_should_forward_request_header_filters_framing_headers() {
     assert!(should_forward_request_header("x-custom-header"));
 }
 
+/// Proxy headers a webhook sender can set to fool a local app that trusts loopback.
+const SPOOFABLE_PROXY_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-prefix",
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    "x-real-ip",
+    "client-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "x-originating-ip",
+    "x-remote-ip",
+    "x-remote-addr",
+    "via",
+];
+
+const SPOOFED_PROXY_VALUE: &str = "spoofed-203.0.113.9";
+const TEST_PUBLIC_HOST: &str = "abc123.hook.events";
+
+/// Lower, upper, and title case spellings of a header name.
+fn header_spellings(header: &str) -> [String; 3] {
+    let title_case = header
+        .split('-')
+        .map(|segment| {
+            let mut characters = segment.chars();
+            characters
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + characters.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    [header.to_string(), header.to_ascii_uppercase(), title_case]
+}
+
+/// Webhook headers carrying every spoofable proxy header in several spellings.
+fn spoofed_webhook_headers() -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("content-type".to_string(), "application/json".to_string()),
+        ("Stripe-Signature".to_string(), "t=1,v1=abc".to_string()),
+        ("x-custom-header".to_string(), "kept".to_string()),
+    ];
+    for header in SPOOFABLE_PROXY_HEADERS {
+        for spelling in header_spellings(header) {
+            headers.push((spelling, SPOOFED_PROXY_VALUE.to_string()));
+        }
+    }
+    headers
+}
+
+/// Accepts one local request and returns its request line and headers.
+async fn spawn_local_header_capture() -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let head_end = loop {
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end;
+            }
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "local request ended before its headers");
+            request.extend_from_slice(&buffer[..read]);
+        };
+        let head = String::from_utf8(request[..head_end].to_vec()).unwrap();
+        // Drain the body so closing the socket cannot reset the connection.
+        let body_bytes = captured_header_values(&head, "content-length")
+            .first()
+            .map_or(0, |length| length.parse::<usize>().unwrap());
+        while request.len() < head_end + 4 + body_bytes {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "local request ended before its body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        head
+    });
+    (address, server)
+}
+
+fn captured_header_values(head: &str, name: &str) -> Vec<String> {
+    head.split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(header, _)| header.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_string())
+        .collect()
+}
+
+/// Asserts the local target saw none of the sender's proxy headers, only the
+/// `X-Forwarded-Host`/`X-Forwarded-Proto` pair the CLI derives from the public
+/// tunnel host (when one is expected), and every ordinary webhook header.
+fn assert_local_request_has_no_spoofed_proxy_headers(head: &str, public_host: Option<&str>) {
+    assert!(
+        !head.contains("spoofed"),
+        "spoofed proxy header reached the local target:\n{head}"
+    );
+    for header in SPOOFABLE_PROXY_HEADERS {
+        let expected = match (*header, public_host) {
+            ("x-forwarded-host", Some(host)) => vec![host.to_string()],
+            ("x-forwarded-proto", Some(_)) => vec!["https".to_string()],
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            captured_header_values(head, header),
+            expected,
+            "unexpected {header} at the local target:\n{head}"
+        );
+    }
+    assert_eq!(
+        captured_header_values(head, "content-type"),
+        ["application/json"]
+    );
+    assert_eq!(
+        captured_header_values(head, "stripe-signature"),
+        ["t=1,v1=abc"]
+    );
+    assert_eq!(captured_header_values(head, "x-custom-header"), ["kept"]);
+}
+
+#[test]
+fn test_should_forward_request_header_drops_untrusted_proxy_headers() {
+    for header in SPOOFABLE_PROXY_HEADERS {
+        for spelling in header_spellings(header) {
+            assert!(
+                !should_forward_request_header(&spelling),
+                "{spelling} must not be forwarded"
+            );
+            assert!(is_untrusted_proxy_header(&spelling), "{spelling}");
+        }
+    }
+
+    for header in [
+        "content-type",
+        "Content-Type",
+        "authorization",
+        "AUTHORIZATION",
+        "user-agent",
+        "x-custom-header",
+        "stripe-signature",
+        "Stripe-Signature",
+        "x-hub-signature-256",
+        "x-github-event",
+        "svix-signature",
+        "x-shopify-hmac-sha256",
+    ] {
+        assert!(
+            should_forward_request_header(header),
+            "{header} must be forwarded"
+        );
+        assert!(!is_untrusted_proxy_header(header), "{header}");
+    }
+}
+
+#[test]
+fn test_trusted_forwarded_headers_come_only_from_a_plain_public_origin() {
+    let forwarded = |public_host: &str| {
+        TrustedForwardedHeaders::from_public_host(public_host).map(|headers| {
+            let request = headers
+                .apply(reqwest::Client::new().get("http://127.0.0.1:3000/"))
+                .build()
+                .unwrap();
+            (
+                request.headers()["x-forwarded-host"]
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                request.headers()["x-forwarded-proto"]
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+    };
+    let pair = |host: &str, proto: &str| Some((host.to_string(), proto.to_string()));
+
+    assert_eq!(
+        forwarded("abc123.hook.events"),
+        pair("abc123.hook.events", "https")
+    );
+    assert_eq!(
+        forwarded(" https://abc123.hook.events/ "),
+        pair("abc123.hook.events", "https")
+    );
+    assert_eq!(
+        forwarded("https://abc123.hook.events:443"),
+        pair("abc123.hook.events", "https")
+    );
+    assert_eq!(
+        forwarded("http://127.0.0.1:4000"),
+        pair("127.0.0.1:4000", "http")
+    );
+    for rejected in [
+        "",
+        "   ",
+        "abc123.hook.events/path",
+        "abc123.hook.events?next=evil",
+        "https://user:pass@abc123.hook.events",
+        "ftp://abc123.hook.events",
+        "abc 123.hook.events",
+    ] {
+        assert_eq!(forwarded(rejected), None, "{rejected:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_tunnel_v2_forwarding_replaces_client_supplied_proxy_headers() {
+    let (address, local_server) = spawn_local_header_capture().await;
+    let (forwarder, _event_rx) = forwarder_for_local_address(address).await;
+    forwarder.record_public_host(&serde_json::json!({ "subdomain": TEST_PUBLIC_HOST }));
+    let (writer, _control_rx, _response_rx) = test_priority_writer();
+    let limits = TunnelLimits {
+        max_request_body_bytes: 1024,
+        max_response_body_bytes: 1024,
+        max_response_header_bytes: 1024,
+        max_response_header_items: TUNNEL_MAX_RESPONSE_HEADERS,
+        ordered_response_headers: true,
+    };
+    let delivery = LocalDelivery {
+        request_id: "spoofed-proxy-headers".to_string(),
+        method: "POST".to_string(),
+        path: "/hook".to_string(),
+        query_string: String::new(),
+        headers: spoofed_webhook_headers(),
+        body: br#"{"ok":true}"#.to_vec(),
+        deadline_unix_ms: unix_time_ms() + 10_000,
+        replay: false,
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        forwarder.forward_tunnel_request(
+            delivery,
+            Arc::new(AtomicU8::new(DELIVERY_QUEUED)),
+            writer,
+            "tunnel:connect".to_string(),
+            limits,
+            ResponseBufferBudget::new(),
+        ),
+    )
+    .await
+    .expect("protocol v2 forwarding timed out")
+    .unwrap();
+
+    let head = local_server.await.unwrap();
+    assert_local_request_has_no_spoofed_proxy_headers(&head, Some(TEST_PUBLIC_HOST));
+}
+
+#[tokio::test]
+async fn test_tunnel_forwarding_without_public_host_sets_no_proxy_headers() {
+    let (address, local_server) = spawn_local_header_capture().await;
+    let (forwarder, _event_rx) = forwarder_for_local_address(address).await;
+    // A join response without a usable public host leaves the pair unset.
+    forwarder.record_public_host(&serde_json::json!({ "subdomain": "" }));
+    let (writer, _control_rx, _response_rx) = test_priority_writer();
+    let delivery = LocalDelivery {
+        request_id: "no-public-host".to_string(),
+        method: "GET".to_string(),
+        path: "/hook".to_string(),
+        query_string: String::new(),
+        headers: spoofed_webhook_headers(),
+        body: Vec::new(),
+        deadline_unix_ms: unix_time_ms() + 10_000,
+        replay: false,
+    };
+
+    forwarder
+        .forward_tunnel_request(
+            delivery,
+            Arc::new(AtomicU8::new(DELIVERY_QUEUED)),
+            writer,
+            "tunnel:connect".to_string(),
+            TunnelLimits::from_join_response(&serde_json::json!({})),
+            ResponseBufferBudget::new(),
+        )
+        .await
+        .unwrap();
+
+    let head = local_server.await.unwrap();
+    assert_local_request_has_no_spoofed_proxy_headers(&head, None);
+}
+
+#[tokio::test]
+async fn protocol_v3_forwarding_replaces_client_supplied_proxy_headers() {
+    let (address, local_server) = spawn_local_header_capture().await;
+    let (forwarder, _event_rx) = forwarder_for_local_address(address).await;
+    forwarder.record_public_host(&serde_json::json!({ "subdomain": TEST_PUBLIC_HOST }));
+    let (writer, _control_rx, _response_rx) = test_priority_writer();
+    let limits = test_streaming_limits();
+    let stream_id = Uuid::new_v4();
+    let request_connection = tunnel_v3::ConnectionBudget::new(
+        limits.connection_window_bytes,
+        limits.connection_window_items,
+    )
+    .unwrap();
+    let (request_stream, request_body) =
+        tunnel_v3::RequestStreamReceiver::new(stream_id, Some(0), limits, request_connection)
+            .unwrap();
+    let empty_checksum = Sha256::digest(b"")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    request_stream.finish(0, &empty_checksum).unwrap();
+    let incoming = tunnel_v3::IncomingRequest {
+        start: tunnel_v3::RequestStart {
+            stream_id,
+            deadline_unix_ms: unix_time_ms() + 10_000,
+            timeout_ms: 10_000,
+            method: "POST".to_string(),
+            path: "/hook".to_string(),
+            query_string: String::new(),
+            headers: spoofed_webhook_headers(),
+            content_length: Some(0),
+            replay: false,
+        },
+        body: request_body,
+    };
+    let (_response_window_tx, response_window_rx) = mpsc::channel(limits.stream_window_items + 1);
+    let work_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        forwarder.forward_v3_request(
+            incoming,
+            Arc::new(AtomicU8::new(DELIVERY_QUEUED)),
+            writer,
+            "tunnel:connect".to_string(),
+            limits,
+            tunnel_v3::ConnectionSendWindow::new(
+                limits.connection_window_bytes,
+                limits.connection_window_items,
+            ),
+            response_window_rx,
+            work_permit,
+        ),
+    )
+    .await
+    .expect("protocol v3 forwarding timed out")
+    .unwrap();
+
+    let head = local_server.await.unwrap();
+    assert_local_request_has_no_spoofed_proxy_headers(&head, Some(TEST_PUBLIC_HOST));
+}
+
+#[tokio::test]
+async fn test_listen_forwarding_drops_client_supplied_proxy_headers() {
+    let (address, local_server) = spawn_local_header_capture().await;
+    let target = TargetPolicy::resolve(
+        &format!("http://127.0.0.1:{}", address.port()),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let (_token_tx, token_rx) = watch::channel("token".to_string());
+    let (event_tx, _event_rx) = mpsc::channel(PRESENTATION_QUEUE_CAPACITY);
+    let client = TunnelClient::new(token_rx, "demo".to_string(), target, None, event_tx);
+
+    // Stand-in relay socket that hands back the request acknowledgement.
+    let websocket_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_address = websocket_listener.local_addr().unwrap();
+    let relay = tokio::spawn(async move {
+        let (socket, _) = websocket_listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        match websocket.next().await {
+            Some(Ok(Message::Text(text))) => serde_json::from_str::<ChannelMessage>(&text).unwrap(),
+            message => panic!("expected a request acknowledgement, got {message:?}"),
+        }
+    });
+    let (websocket, _) = connect_async(format!("ws://{websocket_address}"))
+        .await
+        .unwrap();
+    let (mut write, _read) = websocket.split();
+
+    let headers = spoofed_webhook_headers()
+        .into_iter()
+        .map(|(name, value)| (name, serde_json::Value::String(value)))
+        .collect::<serde_json::Map<_, _>>();
+    let message = serde_json::to_string(&ChannelMessage {
+        topic: "cli:tunnel:demo".to_string(),
+        event: "webhook_received".to_string(),
+        payload: serde_json::json!({
+            "request": {
+                "id": "listen-spoofed-proxy-headers",
+                "method": "POST",
+                "path": "/hook",
+                "headers": headers,
+                "body": r#"{"ok":true}"#,
+            }
+        }),
+        reference: None,
+    })
+    .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.handle_message(&message, &mut write),
+    )
+    .await
+    .expect("listen forwarding timed out")
+    .unwrap();
+
+    let head = local_server.await.unwrap();
+    assert_local_request_has_no_spoofed_proxy_headers(&head, None);
+    let ack = relay.await.unwrap();
+    assert_eq!(ack.event, "request_ack");
+    assert_eq!(ack.payload["status"], "proxied");
+    assert_eq!(ack.payload["status_code"], 204);
+}
+
 #[test]
 fn protocol_v3_205_reset_content_forbids_body_and_nonzero_content_length() {
     assert!(response_body_forbidden("GET", 205));
