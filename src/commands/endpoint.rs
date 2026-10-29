@@ -197,10 +197,17 @@ pub async fn execute(action: EndpointAction, json: bool, yes: bool) -> Result<Co
                 print_status(OutputStatus::Ok, "ENDPOINT CREATED");
                 println!();
                 print_endpoint_detail(&endpoint);
-                print_field("ORGANIZATION", &organization_id);
+                print_field(
+                    "ORGANIZATION",
+                    sanitize_terminal(&organization_id, TerminalTextLayout::Inline),
+                );
                 print_field(
                     "ACTION",
-                    format!("Run `hooklistener listen {}`", endpoint.slug).dim(),
+                    format!(
+                        "Run `hooklistener listen {}`",
+                        sanitize_terminal(&endpoint.slug, TerminalTextLayout::Inline)
+                    )
+                    .dim(),
                 );
             }
         }
@@ -233,7 +240,10 @@ pub async fn execute(action: EndpointAction, json: bool, yes: bool) -> Result<Co
                 }))?;
             } else {
                 print_endpoint_detail(&endpoint);
-                print_field("ORGANIZATION", &organization_id);
+                print_field(
+                    "ORGANIZATION",
+                    sanitize_terminal(&organization_id, TerminalTextLayout::Inline),
+                );
             }
         }
         EndpointAction::Delete { endpoint_id, org } => {
@@ -262,8 +272,14 @@ pub async fn execute(action: EndpointAction, json: bool, yes: bool) -> Result<Co
                     OutputStatus::Ok,
                     "ENDPOINT DELETED",
                     &[
-                        output_field("ENDPOINT", endpoint_id.bold()),
-                        output_field("ORGANIZATION", organization_id.dim()),
+                        output_field(
+                            "ENDPOINT",
+                            sanitize_terminal(&endpoint_id, TerminalTextLayout::Inline).bold(),
+                        ),
+                        output_field(
+                            "ORGANIZATION",
+                            sanitize_terminal(&organization_id, TerminalTextLayout::Inline).dim(),
+                        ),
                     ],
                 );
             }
@@ -380,9 +396,18 @@ pub async fn execute(action: EndpointAction, json: bool, yes: bool) -> Result<Co
                     OutputStatus::Ok,
                     "REQUEST DELETED",
                     &[
-                        output_field("REQUEST", request_id.bold()),
-                        output_field("ENDPOINT", endpoint_id.dim()),
-                        output_field("ORGANIZATION", organization_id.dim()),
+                        output_field(
+                            "REQUEST",
+                            sanitize_terminal(&request_id, TerminalTextLayout::Inline).bold(),
+                        ),
+                        output_field(
+                            "ENDPOINT",
+                            sanitize_terminal(&endpoint_id, TerminalTextLayout::Inline).dim(),
+                        ),
+                        output_field(
+                            "ORGANIZATION",
+                            sanitize_terminal(&organization_id, TerminalTextLayout::Inline).dim(),
+                        ),
                     ],
                 );
             }

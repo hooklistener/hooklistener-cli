@@ -95,17 +95,32 @@ pub async fn execute(action: ShareAction, json: bool, yes: bool) -> Result<Contr
             } else {
                 print_status(OutputStatus::Ok, "SHARE LINK CREATED");
                 println!();
-                print_field("SHARE TOKEN", shared.share_token);
+                print_field(
+                    "SHARE TOKEN",
+                    sanitize_terminal(&shared.share_token, TerminalTextLayout::Inline),
+                );
                 if let Some(url) = shared.share_url.as_deref() {
-                    print_field("SHARE URL", url.underlined());
+                    print_field(
+                        "SHARE URL",
+                        sanitize_terminal(url, TerminalTextLayout::Inline).underlined(),
+                    );
                 }
-                print_field("REQUEST ID", shared.debug_request_id);
-                print_field("ORGANIZATION", &organization_id);
+                print_field(
+                    "REQUEST ID",
+                    sanitize_terminal(&shared.debug_request_id, TerminalTextLayout::Inline),
+                );
+                print_field(
+                    "ORGANIZATION",
+                    sanitize_terminal(&organization_id, TerminalTextLayout::Inline),
+                );
                 if shared.password_protected {
                     print_field("PASSWORD", "protected".yellow());
                 }
                 if let Some(expires) = shared.expires_at.as_deref() {
-                    print_field("EXPIRES AT", expires.dim());
+                    print_field(
+                        "EXPIRES AT",
+                        sanitize_terminal(expires, TerminalTextLayout::Inline).dim(),
+                    );
                 }
                 print_field("INCLUDE FWDS", shared.include_forwards);
             }
@@ -139,7 +154,10 @@ pub async fn execute(action: ShareAction, json: bool, yes: bool) -> Result<Contr
                     print_status(OutputStatus::Info, "PROTECTED SHARE");
                     println!();
                     if let Some(expires) = data.get("expires_at").and_then(|v| v.as_str()) {
-                        print_field("EXPIRES AT", expires.dim());
+                        print_field(
+                            "EXPIRES AT",
+                            sanitize_terminal(expires, TerminalTextLayout::Inline).dim(),
+                        );
                     }
                     print_field(
                         "ACTION",
@@ -176,8 +194,14 @@ pub async fn execute(action: ShareAction, json: bool, yes: bool) -> Result<Contr
                     OutputStatus::Ok,
                     "SHARE REVOKED",
                     &[
-                        output_field("SHARE TOKEN", share_token.bold()),
-                        output_field("ORGANIZATION", organization_id.dim()),
+                        output_field(
+                            "SHARE TOKEN",
+                            sanitize_terminal(&share_token, TerminalTextLayout::Inline).bold(),
+                        ),
+                        output_field(
+                            "ORGANIZATION",
+                            sanitize_terminal(&organization_id, TerminalTextLayout::Inline).dim(),
+                        ),
                     ],
                 );
             }

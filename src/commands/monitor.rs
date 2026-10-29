@@ -242,7 +242,10 @@ pub async fn execute(action: MonitorAction, json: bool, yes: bool) -> Result<Con
                 print_status(OutputStatus::Ok, "UPTIME MONITOR CREATED");
                 println!();
                 print_monitor_detail(&monitor);
-                print_field("ORGANIZATION", &organization_id);
+                print_field(
+                    "ORGANIZATION",
+                    sanitize_terminal(&organization_id, TerminalTextLayout::Inline),
+                );
             }
         }
         MonitorAction::List { org } => {
@@ -340,7 +343,10 @@ pub async fn execute(action: MonitorAction, json: bool, yes: bool) -> Result<Con
                 print_status(OutputStatus::Ok, "MONITOR UPDATED");
                 println!();
                 print_monitor_detail(&monitor);
-                print_field("ORGANIZATION", &organization_id);
+                print_field(
+                    "ORGANIZATION",
+                    sanitize_terminal(&organization_id, TerminalTextLayout::Inline),
+                );
             }
         }
         MonitorAction::Delete { monitor_id, org } => {
@@ -369,8 +375,14 @@ pub async fn execute(action: MonitorAction, json: bool, yes: bool) -> Result<Con
                     OutputStatus::Ok,
                     "MONITOR DELETED",
                     &[
-                        output_field("MONITOR", monitor_id.bold()),
-                        output_field("ORGANIZATION", organization_id.dim()),
+                        output_field(
+                            "MONITOR",
+                            sanitize_terminal(&monitor_id, TerminalTextLayout::Inline).bold(),
+                        ),
+                        output_field(
+                            "ORGANIZATION",
+                            sanitize_terminal(&organization_id, TerminalTextLayout::Inline).dim(),
+                        ),
                     ],
                 );
             }

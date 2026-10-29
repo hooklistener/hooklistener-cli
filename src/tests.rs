@@ -162,6 +162,126 @@ fn monitor_output_neutralizes_status_controls_and_truncates_unicode_safely() {
     );
 }
 
+/// A server-controlled string carrying an OSC title, a CSI color, and a CR/LF
+/// pair that would forge an extra status line if printed raw.
+const HOSTILE_TEXT: &str = "Acme\u{1b}]0;PWN\u{7}\u{1b}[31m\r\n[OK] forged";
+const HOSTILE_TEXT_ESCAPED: &str = r"Acme\u{1b}]0;PWN\u{7}\u{1b}[31m\r\n[OK] forged";
+
+fn assert_terminal_inert(output: &str, expected_lines: usize) {
+    assert!(
+        !output.chars().any(|ch| ch.is_control() && ch != '\n'),
+        "output contains a raw control character: {output:?}"
+    );
+    assert_eq!(
+        output.lines().count(),
+        expected_lines,
+        "a payload newline reached the terminal: {output:?}"
+    );
+}
+
+#[test]
+fn organization_list_output_neutralizes_control_characters() {
+    let organizations = [api::Organization {
+        id: "org-1\u{1b}[2J".to_string(),
+        name: "Acme\u{1b}]0;PWN\u{7}\u{1b}[31m\r\n[OK]".to_string(),
+    }];
+
+    let rendered = render_organizations_table(&organizations, Some("org-1\u{1b}[2J"));
+
+    // Border, header, separator, one row, border.
+    assert_terminal_inert(&rendered, 5);
+    assert!(rendered.contains(r"org-1\u{1b}[2J"), "{rendered}");
+    assert!(
+        rendered.contains(r"Acme\u{1b}]0;PWN\u{7}\u{1b}[31m\r\n[OK]"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("│ * "), "{rendered}");
+
+    let benign = [api::Organization {
+        id: "org-1".to_string(),
+        name: "Acme Corp".to_string(),
+    }];
+    assert_eq!(
+        render_organizations_table(&benign, Some("org-1")),
+        render_table(&["", "ID", "Name"], [["*", "org-1", "Acme Corp"]])
+    );
+}
+
+#[test]
+fn organization_use_output_neutralizes_control_characters() {
+    let rendered = render_status_block(
+        OutputStatus::Ok,
+        "ORGANIZATION SELECTED",
+        &organization_selected_fields(HOSTILE_TEXT, "org-1\u{1b}[2J"),
+    );
+
+    assert_terminal_inert(&rendered, 4);
+    assert_eq!(
+        rendered,
+        format!(
+            "[OK] ORGANIZATION SELECTED\n\nNAME           {HOSTILE_TEXT_ESCAPED}\nORGANIZATION   {}\n",
+            r"org-1\u{1b}[2J"
+        )
+    );
+
+    assert_eq!(
+        render_status_block(
+            OutputStatus::Ok,
+            "ORGANIZATION SELECTED",
+            &organization_selected_fields("Acme Corp", "org-1"),
+        ),
+        "[OK] ORGANIZATION SELECTED\n\nNAME           Acme Corp\nORGANIZATION   org-1\n"
+    );
+}
+
+#[test]
+fn static_tunnel_and_anon_output_neutralize_server_supplied_values() {
+    let created = api::StaticTunnelCreateResponse {
+        static_tunnel: api::StaticTunnelSummary {
+            id: "st\u{9b}2J".to_string(),
+            slug: HOSTILE_TEXT.to_string(),
+            name: Some(HOSTILE_TEXT.to_string()),
+        },
+        message: Some(HOSTILE_TEXT.to_string()),
+    };
+    let rendered = render_status_block(
+        OutputStatus::Ok,
+        "STATIC TUNNEL CREATED",
+        &static_tunnel_created_fields(&created, "org-1\r"),
+    );
+    // Title, blank line, ID, SLUG, NAME, ORGANIZATION, MESSAGE.
+    assert_terminal_inert(&rendered, 7);
+    assert_eq!(
+        rendered.matches(HOSTILE_TEXT_ESCAPED).count(),
+        3,
+        "{rendered}"
+    );
+    assert!(rendered.contains(r"st\u{9b}2J"), "{rendered}");
+    assert!(rendered.contains(r"org-1\r"), "{rendered}");
+
+    let status = api::AnonEndpointStatus {
+        id: "anon-1\u{7}".to_string(),
+        active: false,
+        expires_at: Some(HOSTILE_TEXT.to_string()),
+        webhook_url: Some(HOSTILE_TEXT.to_string()),
+        error: Some(HOSTILE_TEXT.to_string()),
+    };
+    let rendered = render_status_block(
+        OutputStatus::Info,
+        "ANONYMOUS ENDPOINT",
+        &anon_endpoint_status_fields(&status),
+    );
+    // Title, blank line, ID, STATUS, EXPIRES AT, WEBHOOK URL, ERROR.
+    assert_terminal_inert(&rendered, 7);
+    assert_eq!(
+        rendered.matches(HOSTILE_TEXT_ESCAPED).count(),
+        3,
+        "{rendered}"
+    );
+    assert!(rendered.contains(r"anon-1\u{7}"), "{rendered}");
+    assert!(rendered.contains("STATUS         expired"), "{rendered}");
+}
+
 fn render_table<'a, const C: usize>(
     headers: &[&str],
     rows: impl IntoIterator<Item = [&'a str; C]>,

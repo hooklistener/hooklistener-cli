@@ -11,9 +11,9 @@ use crate::commands::tunnel::run_anonymous_tunnel_activation;
 use crate::credentials::{ensure_valid_token, require_organization};
 use crate::output::Stylize;
 use crate::render::{
-    OutputStatus, TerminalTextLayout, new_table, print_body_section, print_context,
-    print_empty_state, print_field, print_json, print_key_value_map, print_pagination,
-    print_status, sanitize_terminal, value_or_dash,
+    OutputField, OutputStatus, TerminalTextLayout, new_table, output_field, print_body_section,
+    print_context, print_empty_state, print_field, print_json, print_key_value_map,
+    print_pagination, print_status, print_status_block, sanitize_terminal, value_or_dash,
 };
 use crate::{api, config};
 
@@ -107,11 +107,24 @@ pub async fn execute(
             } else {
                 print_status(OutputStatus::Ok, "ANONYMOUS ENDPOINT CREATED");
                 println!();
-                print_field("ID", endpoint.id);
-                print_field("WEBHOOK URL", endpoint.webhook_url.as_str().underlined());
-                print_field("EXPIRES AT", endpoint.expires_at.dim());
+                print_field(
+                    "ID",
+                    sanitize_terminal(&endpoint.id, TerminalTextLayout::Inline),
+                );
+                print_field(
+                    "WEBHOOK URL",
+                    sanitize_terminal(&endpoint.webhook_url, TerminalTextLayout::Inline)
+                        .underlined(),
+                );
+                print_field(
+                    "EXPIRES AT",
+                    sanitize_terminal(&endpoint.expires_at, TerminalTextLayout::Inline).dim(),
+                );
                 println!();
-                print_field("VIEWER TOKEN", endpoint.viewer_token.as_str().yellow());
+                print_field(
+                    "VIEWER TOKEN",
+                    sanitize_terminal(&endpoint.viewer_token, TerminalTextLayout::Inline).yellow(),
+                );
                 print_field(
                     "ACTION",
                     "Save this token. It is required to list captured events.".dim(),
@@ -124,24 +137,11 @@ pub async fn execute(
             if json {
                 print_json(&status)?;
             } else {
-                print_status(OutputStatus::Info, "ANONYMOUS ENDPOINT");
-                println!();
-                print_field("ID", status.id);
-                let active_str = if status.active {
-                    "active".green().to_string()
-                } else {
-                    "expired".red().to_string()
-                };
-                print_field("STATUS", active_str);
-                if let Some(expires) = status.expires_at.as_deref() {
-                    print_field("EXPIRES AT", expires.dim());
-                }
-                if let Some(url) = status.webhook_url.as_deref() {
-                    print_field("WEBHOOK URL", url.underlined());
-                }
-                if let Some(error) = status.error.as_deref() {
-                    print_field("ERROR", error);
-                }
+                print_status_block(
+                    OutputStatus::Info,
+                    "ANONYMOUS ENDPOINT",
+                    &anon_endpoint_status_fields(&status),
+                );
             }
         }
         AnonAction::ListEvents {
@@ -222,12 +222,21 @@ pub async fn execute(
             } else {
                 print_status(OutputStatus::Ok, "ANONYMOUS ROUTE CLAIMED");
                 println!();
-                print_field("ROUTE", claimed.id);
+                print_field(
+                    "ROUTE",
+                    sanitize_terminal(&claimed.id, TerminalTextLayout::Inline),
+                );
                 print_field(
                     "PUBLIC URL",
-                    format!("https://{}.hook.events", claimed.slug),
+                    format!(
+                        "https://{}.hook.events",
+                        sanitize_terminal(&claimed.slug, TerminalTextLayout::Inline)
+                    ),
                 );
-                print_field("ORGANIZATION", organization_id.dim());
+                print_field(
+                    "ORGANIZATION",
+                    sanitize_terminal(&organization_id, TerminalTextLayout::Inline).dim(),
+                );
                 print_field("CAPTURES TRANSFERRED", "0");
                 print_field(
                     "PRIVACY",
@@ -237,6 +246,42 @@ pub async fn execute(
         }
     }
     Ok(())
+}
+
+/// The `anon show` block. Every value, including the server's error text, is
+/// neutralized before styling.
+pub(crate) fn anon_endpoint_status_fields(status: &api::AnonEndpointStatus) -> Vec<OutputField> {
+    let active = if status.active {
+        "active".green().to_string()
+    } else {
+        "expired".red().to_string()
+    };
+    let mut fields = vec![
+        output_field(
+            "ID",
+            sanitize_terminal(&status.id, TerminalTextLayout::Inline),
+        ),
+        output_field("STATUS", active),
+    ];
+    if let Some(expires) = status.expires_at.as_deref() {
+        fields.push(output_field(
+            "EXPIRES AT",
+            sanitize_terminal(expires, TerminalTextLayout::Inline).dim(),
+        ));
+    }
+    if let Some(url) = status.webhook_url.as_deref() {
+        fields.push(output_field(
+            "WEBHOOK URL",
+            sanitize_terminal(url, TerminalTextLayout::Inline).underlined(),
+        ));
+    }
+    if let Some(error) = status.error.as_deref() {
+        fields.push(output_field(
+            "ERROR",
+            sanitize_terminal(error, TerminalTextLayout::Inline),
+        ));
+    }
+    fields
 }
 
 pub fn print_anon_events(response: &api::AnonEventsResponse) {

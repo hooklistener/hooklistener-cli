@@ -19,7 +19,7 @@ use std::future::Future;
 use std::io::{self, IsTerminal, Write};
 use tokio::task::JoinHandle;
 
-use crate::render::{OutputStatus, eprint_field, eprint_status};
+use crate::render::{OutputStatus, eprint_field, eprint_status, sanitize_terminal_display};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkerCompletion<T> {
@@ -70,8 +70,8 @@ pub fn confirm_destructive_action(
 
     eprint_status(OutputStatus::Warn, title);
     eprintln!();
-    eprint_field("RESOURCE", resource);
-    eprint_field("ORGANIZATION", organization_id);
+    eprint_field("RESOURCE", sanitize_terminal_display(resource));
+    eprint_field("ORGANIZATION", sanitize_terminal_display(organization_id));
     eprint_field("CONSEQUENCE", "This action cannot be undone.");
     eprint!("TYPE YES      Type `yes` to continue: ");
     io::stderr().flush()?;
