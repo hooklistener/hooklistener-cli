@@ -1,3 +1,4 @@
+use crate::api::strip_request_url;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::redirect::Policy;
@@ -238,7 +239,7 @@ impl DeviceCodeFlow {
     }
 
     fn request_error(context: &str, error: reqwest::Error, secret: Option<&str>) -> anyhow::Error {
-        let mut detail = error.without_url().to_string();
+        let mut detail = strip_request_url(error).to_string();
         if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
             detail = detail.replace(secret, "[REDACTED]");
         }
