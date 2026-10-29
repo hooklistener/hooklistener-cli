@@ -116,8 +116,12 @@ requests. If the WebSocket disconnects, in-flight work is cancelled and never re
 tunnels reacquire their slug on reconnect, while requests already dispatched to localhost are
 reported by the service as having an unknown outcome.
 
-Machine-readable tunnel receipts redact authorization, cookies, API keys, tokens, and secret
-header values. Debug logs omit the access-token query parameter from WebSocket endpoints.
+Machine-readable `tunnel --json` and `listen --json` events redact credential-like header
+values and query parameter values, including authorization, cookies, API keys, tokens, secrets,
+passwords, signatures, sessions, and OAuth `code` parameters. Parameter names, order, and other
+values stay visible, and names are matched case-insensitively after percent-decoding. Your local
+server still receives the original, unredacted request. Debug logs omit the access-token query
+parameter from WebSocket endpoints.
 
 ### Operate tunnel lifecycle state
 
