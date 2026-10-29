@@ -1599,10 +1599,17 @@ fn test_streaming_limits() -> tunnel_v3::StreamingLimits {
 async fn forwarder_for_local_address(
     address: std::net::SocketAddr,
 ) -> (TunnelForwarder, mpsc::Receiver<TunnelEvent>) {
+    forwarder_for_local_target(address, "").await
+}
+
+async fn forwarder_for_local_target(
+    address: std::net::SocketAddr,
+    base_path: &str,
+) -> (TunnelForwarder, mpsc::Receiver<TunnelEvent>) {
     let (_token_tx, token_rx) = watch::channel("token".to_string());
     let (event_tx, event_rx) = mpsc::channel(PRESENTATION_QUEUE_CAPACITY);
     let target = TargetPolicy::resolve(
-        &format!("http://127.0.0.1:{}", address.port()),
+        &format!("http://127.0.0.1:{}{base_path}", address.port()),
         false,
         false,
     )
@@ -1811,6 +1818,94 @@ async fn protocol_v3_early_local_response_drains_large_request_and_relays_respon
     local_server.await.unwrap();
 }
 
+#[tokio::test]
+async fn protocol_v3_encoded_path_separator_is_rejected_before_local_forwarding() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (forwarder, mut event_rx) = forwarder_for_local_target(address, "/base").await;
+    let (writer, _control_rx, mut outbound_response_rx) = test_priority_writer();
+    let limits = test_streaming_limits();
+
+    for path in [
+        "..%2fadmin",
+        "%2E%2E%5Cadmin",
+        "%252e%252e/admin",
+        "..;/admin",
+    ] {
+        let stream_id = Uuid::new_v4();
+        let request_connection = tunnel_v3::ConnectionBudget::new(
+            limits.connection_window_bytes,
+            limits.connection_window_items,
+        )
+        .unwrap();
+        let (_request_stream, request_body) =
+            tunnel_v3::RequestStreamReceiver::new(stream_id, Some(0), limits, request_connection)
+                .unwrap();
+        let incoming = tunnel_v3::IncomingRequest {
+            start: tunnel_v3::RequestStart {
+                stream_id,
+                deadline_unix_ms: unix_time_ms() + 10_000,
+                timeout_ms: 10_000,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                query_string: String::new(),
+                headers: Vec::new(),
+                content_length: Some(0),
+                replay: false,
+            },
+            body: request_body,
+        };
+        let phase = Arc::new(AtomicU8::new(DELIVERY_QUEUED));
+        let (_response_window_tx, response_window_rx) =
+            mpsc::channel(limits.stream_window_items + 1);
+        let work_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            forwarder.forward_v3_request(
+                incoming,
+                phase.clone(),
+                writer.clone(),
+                "tunnel:connect".to_string(),
+                limits,
+                tunnel_v3::ConnectionSendWindow::new(
+                    limits.connection_window_bytes,
+                    limits.connection_window_items,
+                ),
+                response_window_rx,
+                work_permit,
+            ),
+        )
+        .await
+        .expect("rejecting an encoded path separator timed out")
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("target_path_encoding_forbidden"), "{error}");
+        assert!(!error.contains("admin"), "error echoed the path: {error}");
+        assert_eq!(phase.load(Ordering::Acquire), DELIVERY_TERMINAL);
+
+        let abort = protocol_v3_control(
+            tokio::time::timeout(Duration::from_secs(1), outbound_response_rx.recv())
+                .await
+                .expect("rejected stream was not aborted")
+                .unwrap(),
+        );
+        assert_eq!(abort.event, "tunnel_stream_abort");
+        assert_eq!(abort.payload["stream_id"], stream_id.to_string());
+        assert_eq!(abort.payload["direction"], "response");
+        assert_eq!(abort.payload["code"], "target_path_encoding_forbidden");
+        assert_eq!(abort.payload["outcome"], "known_not_executed");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("timed out waiting for request failure event"),
+            Some(TunnelEvent::RequestFailed { request_id, .. })
+                if request_id == stream_id.to_string()
+        ));
+    }
+    assert_no_local_connection(&listener).await;
+}
+
 fn test_delivery(deadline_unix_ms: u64) -> LocalDelivery {
     LocalDelivery {
         request_id: "failure-contract".to_string(),
@@ -1866,6 +1961,116 @@ async fn test_deadline_before_forward_reports_known_not_executed() {
             .await
             .expect("timed out waiting for request failure event"),
         Some(TunnelEvent::RequestFailed { request_id, .. }) if request_id == "failure-contract"
+    ));
+}
+
+/// A connection the forwarder opened would wait in the accept backlog, so an
+/// empty backlog after the forwarder returns means no local request was made.
+async fn assert_no_local_connection(listener: &tokio::net::TcpListener) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "a rejected request reached the local target"
+    );
+}
+
+#[tokio::test]
+async fn test_encoded_path_separator_is_rejected_before_local_forwarding() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (forwarder, mut event_rx) = forwarder_for_local_target(address, "/base").await;
+    let (writer, mut control_rx, _response_rx) = test_priority_writer();
+    let limits = TunnelLimits::from_join_response(&serde_json::json!({}));
+
+    for path in ["..%2fadmin", "..%5Cadmin", "..%252fadmin", "%2e%2e%2Fadmin"] {
+        let mut delivery = test_delivery(unix_time_ms() + 10_000);
+        delivery.path = path.to_string();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            forwarder.forward_tunnel_request(
+                delivery,
+                Arc::new(AtomicU8::new(DELIVERY_QUEUED)),
+                writer.clone(),
+                "cli:tunnel:test".to_string(),
+                limits,
+                ResponseBufferBudget::new(),
+            ),
+        )
+        .await
+        .expect("rejecting an encoded path separator timed out")
+        .unwrap();
+
+        let message = channel_message(
+            tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+                .await
+                .expect("timed out waiting for path failure")
+                .unwrap(),
+        );
+        let error = message.payload["error"].as_str().unwrap().to_string();
+        assert!(!error.contains("admin"), "error echoed the path: {error}");
+        assert_delivery_failure(
+            message,
+            "target_path_encoding_forbidden",
+            "known_not_executed",
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("timed out waiting for request failure event"),
+            Some(TunnelEvent::RequestFailed { request_id, .. }) if request_id == "failure-contract"
+        ));
+    }
+    assert_no_local_connection(&listener).await;
+
+    // The same scoped target still receives ordinary encoded paths unchanged.
+    let local_server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        String::from_utf8(request)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    });
+    let mut delivery = test_delivery(unix_time_ms() + 10_000);
+    delivery.path = "/hooks/a%20b/user%40example.com/caf%C3%A9".to_string();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        forwarder.forward_tunnel_request(
+            delivery,
+            Arc::new(AtomicU8::new(DELIVERY_QUEUED)),
+            writer,
+            "cli:tunnel:test".to_string(),
+            limits,
+            ResponseBufferBudget::new(),
+        ),
+    )
+    .await
+    .expect("forwarding an ordinary encoded path timed out")
+    .unwrap();
+    assert_eq!(
+        local_server.await.unwrap(),
+        "GET /base/hooks/a%20b/user%40example.com/caf%C3%A9 HTTP/1.1"
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("timed out waiting for forwarded event"),
+        Some(TunnelEvent::RequestForwarded { status: 204, .. })
     ));
 }
 
