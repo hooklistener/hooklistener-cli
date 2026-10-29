@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use reqwest::{
-    Client, Response, StatusCode, Url,
+    Client, IntoUrl, Response, StatusCode, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
     redirect::Policy,
 };
@@ -294,7 +294,7 @@ async fn read_replay_response_body(response: &mut Response) -> Result<Vec<u8>> {
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         anyhow!(
             "Failed to read replay response: {}",
-            bounded_control_neutral_text(&error.without_url().to_string())
+            bounded_control_neutral_text(&strip_request_url(error).to_string())
         )
     })? {
         if chunk.len() > MAX_REPLAY_RESPONSE_BODY_BYTES.saturating_sub(body.len()) {
@@ -1124,6 +1124,17 @@ fn no_redirect_client() -> Result<Client> {
         .context("Failed to build HTTP client")
 }
 
+/// Drop the request URL from a `reqwest` error before it joins an error chain.
+///
+/// `reqwest::Error` prints its URL in both `Display` and `Debug`, and some
+/// request URLs carry a credential: a share token in `/api/v1/shared/r/<token>`,
+/// a device code in a query string. Map every send and body-read error through
+/// this before attaching context, so the URL never reaches terminal output,
+/// `--json` error causes, or logs. The rest of the error chain is kept.
+pub(crate) fn strip_request_url(error: reqwest::Error) -> reqwest::Error {
+    error.without_url()
+}
+
 /// Refresh an expired CLI access token using a refresh token (no auth needed).
 pub async fn refresh_access_token(
     refresh_token: &str,
@@ -1140,6 +1151,7 @@ pub async fn refresh_access_token(
         .json(&body)
         .send()
         .await
+        .map_err(strip_request_url)
         .context("Failed to refresh access token")?;
 
     let status = response.status();
@@ -1181,6 +1193,7 @@ pub async fn issue_relay_ticket(
         .timeout(RELAY_TICKET_REQUEST_TIMEOUT)
         .send()
         .await
+        .map_err(strip_request_url)
         .context("Failed to request relay handshake ticket")?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
@@ -1371,6 +1384,7 @@ impl ApiClient {
             .get(url)
             .send()
             .await
+            .map_err(strip_request_url)
             .with_context(|| format!("Failed to {context}"))?;
         self.parse_tunnel_response(response, context).await
     }
@@ -1387,6 +1401,7 @@ impl ApiClient {
             .json(body)
             .send()
             .await
+            .map_err(strip_request_url)
             .with_context(|| format!("Failed to {context}"))?;
         self.parse_tunnel_response(response, context).await
     }
@@ -1398,6 +1413,7 @@ impl ApiClient {
             .get(url)
             .send()
             .await
+            .map_err(strip_request_url)
             .with_context(|| format!("Failed to {}", context))?;
         self.parse_json_response(response, context).await
     }
@@ -1415,6 +1431,7 @@ impl ApiClient {
             .json(body)
             .send()
             .await
+            .map_err(strip_request_url)
             .with_context(|| format!("Failed to {}", context))?;
         self.parse_json_response(response, context).await
     }
@@ -1432,6 +1449,7 @@ impl ApiClient {
             .json(body)
             .send()
             .await
+            .map_err(strip_request_url)
             .with_context(|| format!("Failed to {}", context))?;
         self.parse_json_response(response, context).await
     }
@@ -1443,17 +1461,22 @@ impl ApiClient {
             .delete(url)
             .send()
             .await
+            .map_err(strip_request_url)
             .with_context(|| format!("Failed to {}", context))?;
         self.parse_json_response(response, context).await
     }
 
     async fn delete_empty(&self, path: &str, context: &str) -> Result<()> {
-        let url = self.api_url(path)?;
+        self.delete_url_empty(self.api_url(path)?, context).await
+    }
+
+    async fn delete_url_empty(&self, url: impl IntoUrl, context: &str) -> Result<()> {
         let response = self
             .client
             .delete(url)
             .send()
             .await
+            .map_err(strip_request_url)
             .with_context(|| format!("Failed to {}", context))?;
 
         let status = response.status();
@@ -1556,6 +1579,7 @@ impl ApiClient {
             .get(url)
             .send()
             .await
+            .map_err(strip_request_url)
             .context("Failed to wait for endpoint request")?;
 
         if response.status() == StatusCode::NO_CONTENT {
@@ -1607,6 +1631,7 @@ impl ApiClient {
             .get(url)
             .send()
             .await
+            .map_err(strip_request_url)
             .with_context(|| format!("Failed to {context}"))?;
         self.parse_json_response(response, context).await
     }
@@ -1651,6 +1676,7 @@ impl ApiClient {
             .get(url)
             .send()
             .await
+            .map_err(strip_request_url)
             .context("Failed to wait for inbox email")?;
 
         if response.status() == StatusCode::NO_CONTENT {
@@ -2067,15 +2093,30 @@ impl ApiClient {
         Ok(response.data)
     }
 
+    /// `/api/v1/shared/r/<token>`, the token percent-encoded as one path
+    /// segment so a `/`, `?`, `#` or `%` in it cannot change the resource.
+    fn shared_request_url(&self, token: &str) -> Result<Url> {
+        // `push` silently drops "." and "..", which would address the parent.
+        if matches!(token, "" | "." | "..") {
+            return Err(anyhow!("Invalid share token"));
+        }
+        let mut url =
+            Url::parse(&self.api_url("/api/v1/shared/r")?).context("Invalid shared request URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("Invalid shared request URL"))?
+            .push(token);
+        Ok(url)
+    }
+
     pub async fn get_shared_request(&self, token: &str) -> Result<Value> {
-        let path = format!("/api/v1/shared/r/{}", token);
-        let response: DataResponse<Value> = self.get_json(&path, "get shared request").await?;
+        let url = self.shared_request_url(token)?;
+        let response: DataResponse<Value> = self.get_url_json(url, "get shared request").await?;
         Ok(response.data)
     }
 
     pub async fn revoke_shared_request(&self, token: &str) -> Result<()> {
-        let path = format!("/api/v1/shared/r/{}", token);
-        self.delete_empty(&path, "revoke shared request").await
+        let url = self.shared_request_url(token)?;
+        self.delete_url_empty(url, "revoke shared request").await
     }
 
     pub async fn forward_request(
@@ -2178,7 +2219,7 @@ impl ApiClient {
                     headers: HashMap::new(),
                     body: String::new(),
                     error_message: Some(bounded_control_neutral_text(
-                        &error.without_url().to_string(),
+                        &strip_request_url(error).to_string(),
                     )),
                     target_url: target_url.to_string(),
                     duration_ms: duration.as_millis() as u64,
@@ -3327,6 +3368,87 @@ mod audit_findings {
             !leaked.matched_async().await,
             "refresh token was forwarded to the redirect target"
         );
+    }
+
+    const SHARE_TOKEN: &str = "SUPERSECRETSHARETOKEN";
+
+    /// A base URL whose port refuses connections: bind, read the port, release it.
+    fn refused_base_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn assert_share_token_not_exposed(error: &anyhow::Error, message: &str) {
+        let receipt = crate::errors::json_error_receipt(error);
+        let causes = receipt["error"]["causes"].as_array().unwrap();
+        // Only the URL is dropped; the transport causes stay for diagnosis.
+        assert!(!causes.is_empty(), "connection causes were dropped");
+        for rendered in [
+            format!("{error:#}"),
+            format!("{error:?}"),
+            receipt.to_string(),
+        ] {
+            assert!(
+                !rendered.contains(SHARE_TOKEN),
+                "share token exposed: {rendered}"
+            );
+        }
+        assert_eq!(error.to_string(), message);
+    }
+
+    /// Regression test for SA-2026-04 (2026-10 audit): `reqwest::Error` prints
+    /// its request URL, and `share show` puts the share token in the path, so
+    /// a failed connection wrote the token into terminal errors and `--json`
+    /// `causes`. Send and body-read errors now go through `strip_request_url`.
+    #[tokio::test]
+    async fn share_token_is_not_exposed_in_connection_errors() {
+        let client = ApiClient::unauthenticated_at(refused_base_url()).unwrap();
+
+        let error = client.get_shared_request(SHARE_TOKEN).await.unwrap_err();
+
+        assert_share_token_not_exposed(&error, "Failed to get shared request");
+    }
+
+    #[tokio::test]
+    async fn share_token_is_not_exposed_in_revoke_connection_errors() {
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), refused_base_url(), None).unwrap();
+
+        let error = client.revoke_shared_request(SHARE_TOKEN).await.unwrap_err();
+
+        assert_share_token_not_exposed(&error, "Failed to revoke shared request");
+    }
+
+    #[tokio::test]
+    async fn share_token_cannot_change_the_request_path() {
+        let mut server = mockito::Server::new_async().await;
+        let show = server
+            .mock("GET", "/api/v1/shared/r/a%2F..%2Fb%3Fc%23d")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"id":"share-1"}}"#)
+            .create_async()
+            .await;
+        let revoke = server
+            .mock("DELETE", "/api/v1/shared/r/a%2F..%2Fb%3Fc%23d")
+            .with_status(204)
+            .create_async()
+            .await;
+        let client =
+            ApiClient::with_base_url("test-token".to_string(), server.url(), None).unwrap();
+
+        let data = client.get_shared_request("a/../b?c#d").await.unwrap();
+        client.revoke_shared_request("a/../b?c#d").await.unwrap();
+        for token in ["", ".", ".."] {
+            assert!(client.get_shared_request(token).await.is_err());
+            assert!(client.revoke_shared_request(token).await.is_err());
+        }
+
+        assert_eq!(data["id"], "share-1");
+        show.assert_async().await;
+        revoke.assert_async().await;
     }
 
     #[tokio::test]

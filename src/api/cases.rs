@@ -110,7 +110,7 @@ impl ApiClient {
         let response = request
             .send()
             .await
-            .map_err(|error| error.without_url())
+            .map_err(super::strip_request_url)
             .context(
                 "Case action request failed; recover deliveries using the SAME key and inputs",
             )?;
@@ -118,7 +118,7 @@ impl ApiClient {
         let text = response
             .text()
             .await
-            .map_err(|error| error.without_url())
+            .map_err(super::strip_request_url)
             .context(
                 "Lost case action response; recover deliveries using the SAME key and inputs",
             )?;
@@ -182,13 +182,13 @@ impl ApiClient {
         let response = request
             .send()
             .await
-            .map_err(|error| error.without_url())
+            .map_err(super::strip_request_url)
             .context("Case API request failed; delivery POSTs are not retried automatically")?;
         let status = response.status();
         let text = response
             .text()
             .await
-            .map_err(|error| error.without_url())
+            .map_err(super::strip_request_url)
             .context("Failed to read case response; inspect history before retrying a delivery")?;
         if !status.is_success() {
             return Err(super::server_response_error(
