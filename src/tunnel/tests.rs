@@ -742,21 +742,41 @@ async fn protocol_v3_forwarding_replaces_client_supplied_proxy_headers() {
     assert_local_request_has_no_spoofed_proxy_headers(&head, Some(TEST_PUBLIC_HOST));
 }
 
-#[tokio::test]
-async fn test_listen_forwarding_drops_client_supplied_proxy_headers() {
-    let (address, local_server) = spawn_local_header_capture().await;
-    let target = TargetPolicy::resolve(
-        &format!("http://127.0.0.1:{}", address.port()),
+const LISTEN_TEST_REQUEST_ID: &str = "listen-request";
+const LISTEN_TEST_FORWARD_ID: &str = "listen-forward";
+
+async fn listen_target(address: std::net::SocketAddr, base_path: &str) -> TargetPolicy {
+    TargetPolicy::resolve(
+        &format!("http://127.0.0.1:{}{base_path}", address.port()),
         false,
         false,
     )
     .await
-    .unwrap();
+    .unwrap()
+}
+
+fn listen_webhook(method: &str, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": LISTEN_TEST_REQUEST_ID,
+        "forward_id": LISTEN_TEST_FORWARD_ID,
+        "method": method,
+        "path": path,
+        "headers": {"content-type": "application/json"},
+        "body": r#"{"ok":true}"#,
+    })
+}
+
+/// Hands one `webhook_received` message for `request` to a listen client that
+/// forwards to `target`. Returns the acknowledgement a stand-in relay socket
+/// received and every event the client emitted.
+async fn drive_listen_webhook(
+    target: TargetPolicy,
+    request: serde_json::Value,
+) -> (ChannelMessage, Vec<TunnelEvent>) {
     let (_token_tx, token_rx) = watch::channel("token".to_string());
-    let (event_tx, _event_rx) = mpsc::channel(PRESENTATION_QUEUE_CAPACITY);
+    let (event_tx, mut event_rx) = mpsc::channel(PRESENTATION_QUEUE_CAPACITY);
     let client = TunnelClient::new(token_rx, "demo".to_string(), target, None, event_tx);
 
-    // Stand-in relay socket that hands back the request acknowledgement.
     let websocket_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let websocket_address = websocket_listener.local_addr().unwrap();
     let relay = tokio::spawn(async move {
@@ -772,22 +792,10 @@ async fn test_listen_forwarding_drops_client_supplied_proxy_headers() {
         .unwrap();
     let (mut write, _read) = websocket.split();
 
-    let headers = spoofed_webhook_headers()
-        .into_iter()
-        .map(|(name, value)| (name, serde_json::Value::String(value)))
-        .collect::<serde_json::Map<_, _>>();
     let message = serde_json::to_string(&ChannelMessage {
         topic: "cli:tunnel:demo".to_string(),
         event: "webhook_received".to_string(),
-        payload: serde_json::json!({
-            "request": {
-                "id": "listen-spoofed-proxy-headers",
-                "method": "POST",
-                "path": "/hook",
-                "headers": headers,
-                "body": r#"{"ok":true}"#,
-            }
-        }),
+        payload: serde_json::json!({ "request": request }),
         reference: None,
     })
     .unwrap();
@@ -800,12 +808,184 @@ async fn test_listen_forwarding_drops_client_supplied_proxy_headers() {
     .expect("listen forwarding timed out")
     .unwrap();
 
+    // Dropping the client closes the event channel, so the drain below ends.
+    drop(client);
+    let mut events = Vec::new();
+    while let Some(event) = event_rx.recv().await {
+        events.push(event);
+    }
+    let ack = tokio::time::timeout(Duration::from_secs(5), relay)
+        .await
+        .unwrap_or_else(|_| panic!("the relay got no acknowledgement; events: {events:?}"))
+        .unwrap();
+    (ack, events)
+}
+
+/// Asserts that a listen client reported a webhook it refused before sending
+/// anything: a `forward_failed` event against the configured target, and the
+/// error acknowledgement a failed send produces. Returns the reported error.
+fn assert_listen_rejection(
+    ack: &ChannelMessage,
+    events: &[TunnelEvent],
+    configured_target: &str,
+    code: &str,
+) -> String {
+    let [
+        TunnelEvent::WebhookReceived(received),
+        failure @ TunnelEvent::ForwardError {
+            request_id,
+            target_url,
+            error,
+            duration_ms,
+        },
+    ] = events
+    else {
+        panic!("expected webhook_received then forward_failed, got {events:?}");
+    };
+    assert_eq!(received.id, LISTEN_TEST_REQUEST_ID);
+    assert_eq!(request_id, LISTEN_TEST_REQUEST_ID);
+    assert_eq!(target_url, configured_target);
+    assert!(
+        error.starts_with(&format!("{code}: ")),
+        "error does not carry {code}: {error}"
+    );
+    assert_eq!(*duration_ms, 0);
+
+    let receipt = crate::receipts::listen_event_receipt(failure, "demo", configured_target, None);
+    assert_eq!(receipt["event"], "forward_failed");
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["error"], error.as_str());
+
+    assert_eq!(ack.topic, "cli:tunnel:demo");
+    assert_eq!(ack.event, "request_ack");
+    assert_eq!(ack.reference, None);
+    assert_eq!(
+        ack.payload,
+        serde_json::json!({
+            "request_id": LISTEN_TEST_REQUEST_ID,
+            "forward_id": LISTEN_TEST_FORWARD_ID,
+            "status": "error",
+            "proxied_to": configured_target,
+            "error": error,
+            "duration_ms": 0,
+        })
+    );
+    error.clone()
+}
+
+fn payload_keys(message: &ChannelMessage) -> std::collections::BTreeSet<String> {
+    message
+        .payload
+        .as_object()
+        .expect("acknowledgement payload is an object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn test_listen_forwarding_drops_client_supplied_proxy_headers() {
+    let (address, local_server) = spawn_local_header_capture().await;
+    let headers = spoofed_webhook_headers()
+        .into_iter()
+        .map(|(name, value)| (name, serde_json::Value::String(value)))
+        .collect::<serde_json::Map<_, _>>();
+    let mut request = listen_webhook("POST", "/hook");
+    request["headers"] = serde_json::Value::Object(headers);
+
+    let (ack, _events) = drive_listen_webhook(listen_target(address, "").await, request).await;
+
     let head = local_server.await.unwrap();
     assert_local_request_has_no_spoofed_proxy_headers(&head, None);
-    let ack = relay.await.unwrap();
     assert_eq!(ack.event, "request_ack");
     assert_eq!(ack.payload["status"], "proxied");
     assert_eq!(ack.payload["status_code"], 204);
+}
+
+#[tokio::test]
+async fn test_listen_reports_target_policy_rejections_as_failed_forwards() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let configured_target = format!("http://127.0.0.1:{}/base", address.port());
+
+    for (path, code) in [
+        ("/../admin", "target_path_escape"),
+        ("/..%2fadmin", "target_path_encoding_forbidden"),
+    ] {
+        let (ack, events) = drive_listen_webhook(
+            listen_target(address, "/base").await,
+            listen_webhook("POST", path),
+        )
+        .await;
+
+        let error = assert_listen_rejection(&ack, &events, &configured_target, code);
+        assert!(!error.contains("admin"), "error echoed the path: {error}");
+    }
+    assert_no_local_connection(&listener).await;
+}
+
+#[tokio::test]
+async fn test_listen_reports_unsupported_method_as_failed_forward() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let configured_target = format!("http://127.0.0.1:{}", address.port());
+
+    for method in ["OPTIONS", "post", "BREW\r\nx-injected: 1"] {
+        let (ack, events) = drive_listen_webhook(
+            listen_target(address, "").await,
+            listen_webhook(method, "/hook"),
+        )
+        .await;
+
+        let error =
+            assert_listen_rejection(&ack, &events, &configured_target, "unsupported_method");
+        assert!(!error.contains(method), "error echoed the method: {error}");
+    }
+    assert_no_local_connection(&listener).await;
+}
+
+#[tokio::test]
+async fn test_listen_rejection_ack_matches_send_failure_ack() {
+    // A local server that closes the connection unanswered makes the send fail.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let local_server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        drop(socket);
+    });
+
+    let (send_failure_ack, send_failure_events) = drive_listen_webhook(
+        listen_target(address, "/base").await,
+        listen_webhook("POST", "/hook"),
+    )
+    .await;
+    local_server.await.unwrap();
+    assert!(
+        matches!(
+            send_failure_events.as_slice(),
+            [TunnelEvent::WebhookReceived(_), TunnelEvent::ForwardError { target_url, .. }]
+                if target_url.ends_with("/base/hook")
+        ),
+        "expected a failed send, got {send_failure_events:?}"
+    );
+    assert_eq!(send_failure_ack.payload["status"], "error");
+
+    let (rejection_ack, _events) = drive_listen_webhook(
+        listen_target(address, "/base").await,
+        listen_webhook("POST", "/../admin"),
+    )
+    .await;
+
+    assert_eq!(rejection_ack.topic, send_failure_ack.topic);
+    assert_eq!(rejection_ack.event, send_failure_ack.event);
+    assert_eq!(
+        rejection_ack.payload["status"],
+        send_failure_ack.payload["status"]
+    );
+    assert_eq!(
+        payload_keys(&rejection_ack),
+        payload_keys(&send_failure_ack)
+    );
 }
 
 #[test]

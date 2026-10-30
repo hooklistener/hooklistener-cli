@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
+use reqwest::{Method, RequestBuilder, Url};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{
@@ -25,6 +26,11 @@ use crate::tunnel::{
     ReconnectConfig, TunnelEvent, TunnelWebhookRequest, WsWrite, build_ws_url, calculate_backoff,
     is_fatal_error, redact_access_token, websocket_endpoint,
 };
+
+/// Error for a webhook whose method `listen` does not forward. It names the
+/// supported methods instead of repeating the sender's method.
+const UNSUPPORTED_METHOD_ERROR: &str =
+    "unsupported_method: Listen forwards only GET, POST, PUT, DELETE, PATCH, and HEAD requests";
 
 /// Tunnel client for WebSocket connection to Hooklistener server
 pub struct TunnelClient {
@@ -404,43 +410,29 @@ impl TunnelClient {
             "Forwarding webhook to local server"
         );
 
-        let mut target_with_query = self.target.request_url(&request.path, None)?;
-        if !request.query_params.is_empty() {
-            let mut query = target_with_query.query_pairs_mut();
-            for (key, value) in &request.query_params {
-                query.append_pair(key, &json_value_to_string(value));
-            }
-        }
-
-        // The client is pinned to the addresses resolved during activation and ignores proxies.
-        let client = self.target.http_client()?;
-
-        // Build request with method
-        let mut req_builder = match request.method.as_str() {
-            "GET" => client.get(target_with_query.clone()),
-            "POST" => client.post(target_with_query.clone()),
-            "PUT" => client.put(target_with_query.clone()),
-            "DELETE" => client.delete(target_with_query.clone()),
-            "PATCH" => client.patch(target_with_query.clone()),
-            "HEAD" => client.head(target_with_query.clone()),
-            _ => {
-                warn!("Unsupported HTTP method: {}", request.method);
-                return Ok(());
+        let (target_with_query, req_builder) = match self.build_local_request(&request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Nothing reached the local target. Report the refusal the way a
+                // failed send is reported, against the configured target because
+                // no request URL was built.
+                let error_message = error.to_string();
+                warn!(
+                    request_id = %request.id,
+                    error = %error_message,
+                    "Webhook rejected before forwarding to local server"
+                );
+                return self
+                    .report_forward_error(
+                        write,
+                        &request,
+                        &self.target.display_url(),
+                        error_message,
+                        0,
+                    )
+                    .await;
             }
         };
-
-        // Add headers. reqwest sets request framing headers from the body we actually send,
-        // and sender-supplied proxy headers are dropped.
-        for (key, value) in &request.headers {
-            if should_forward_request_header(key) {
-                req_builder = req_builder.header(key, json_value_to_string(value));
-            }
-        }
-
-        // Add body if present
-        if let Some(body) = &request.body {
-            req_builder = req_builder.body(body.clone());
-        }
 
         // Send request
         let start_time = std::time::Instant::now();
@@ -464,29 +456,15 @@ impl TunnelClient {
                                 "Failed to read local response"
                             );
 
-                            let _ = self
-                                .event_tx
-                                .send(TunnelEvent::ForwardError {
-                                    request_id: request.id.clone(),
-                                    target_url: target_with_query.to_string(),
-                                    error: error_message.clone(),
+                            return self
+                                .report_forward_error(
+                                    write,
+                                    &request,
+                                    target_with_query.as_str(),
+                                    error_message,
                                     duration_ms,
-                                })
+                                )
                                 .await;
-
-                            let payload = with_forward_id(
-                                serde_json::json!({
-                                    "request_id": &request.id,
-                                    "status": "error",
-                                    "proxied_to": target_with_query.as_str(),
-                                    "error": error_message,
-                                    "duration_ms": duration_ms,
-                                }),
-                                request.forward_id.as_deref(),
-                            );
-
-                            self.send_request_ack(write, payload).await?;
-                            return Ok(());
                         }
                     };
                 let (response_body, response_body_encoding) = encode_response_body(&response_bytes);
@@ -536,33 +514,97 @@ impl TunnelClient {
                     "Failed to forward request"
                 );
 
-                let _ = self
-                    .event_tx
-                    .send(TunnelEvent::ForwardError {
-                        request_id: request.id.clone(),
-                        target_url: target_with_query.to_string(),
-                        error: error_message.clone(),
-                        duration_ms,
-                    })
-                    .await;
-
-                // Send error acknowledgment
-                let payload = with_forward_id(
-                    serde_json::json!({
-                        "request_id": &request.id,
-                        "status": "error",
-                        "proxied_to": target_with_query.as_str(),
-                        "error": error_message,
-                        "duration_ms": duration_ms,
-                    }),
-                    request.forward_id.as_deref(),
-                );
-
-                self.send_request_ack(write, payload).await?;
+                self.report_forward_error(
+                    write,
+                    &request,
+                    target_with_query.as_str(),
+                    error_message,
+                    duration_ms,
+                )
+                .await?;
             }
         }
 
         Ok(())
+    }
+
+    /// Builds the request to the local target and the URL it is sent to.
+    ///
+    /// Every error starts with a code (`target_path_escape: ...`) and never
+    /// repeats the sender's path or method, because the caller reports it to
+    /// the TUI, `--json` output, and the service.
+    fn build_local_request(&self, request: &TunnelWebhookRequest) -> Result<(Url, RequestBuilder)> {
+        let mut target_with_query = self.target.request_url(&request.path, None)?;
+        if !request.query_params.is_empty() {
+            let mut query = target_with_query.query_pairs_mut();
+            for (key, value) in &request.query_params {
+                query.append_pair(key, &json_value_to_string(value));
+            }
+        }
+
+        // The client is pinned to the addresses resolved during activation and ignores proxies.
+        let client = self.target.http_client()?;
+
+        let method = match request.method.as_str() {
+            "GET" => Method::GET,
+            "POST" => Method::POST,
+            "PUT" => Method::PUT,
+            "DELETE" => Method::DELETE,
+            "PATCH" => Method::PATCH,
+            "HEAD" => Method::HEAD,
+            _ => return Err(anyhow!(UNSUPPORTED_METHOD_ERROR)),
+        };
+        let mut req_builder = client.request(method, target_with_query.clone());
+
+        // Add headers. reqwest sets request framing headers from the body we actually send,
+        // and sender-supplied proxy headers are dropped.
+        for (key, value) in &request.headers {
+            if should_forward_request_header(key) {
+                req_builder = req_builder.header(key, json_value_to_string(value));
+            }
+        }
+
+        // Add body if present
+        if let Some(body) = &request.body {
+            req_builder = req_builder.body(body.clone());
+        }
+
+        Ok((target_with_query, req_builder))
+    }
+
+    /// Reports a webhook that got no local response: a `ForwardError` event,
+    /// which the TUI counts and `--json` prints as `forward_failed`, and an
+    /// error acknowledgement so the service can close its delivery record.
+    async fn report_forward_error(
+        &self,
+        write: &mut WsWrite,
+        request: &TunnelWebhookRequest,
+        target_url: &str,
+        error: String,
+        duration_ms: u64,
+    ) -> Result<()> {
+        let _ = self
+            .event_tx
+            .send(TunnelEvent::ForwardError {
+                request_id: request.id.clone(),
+                target_url: target_url.to_string(),
+                error: error.clone(),
+                duration_ms,
+            })
+            .await;
+
+        let payload = with_forward_id(
+            serde_json::json!({
+                "request_id": &request.id,
+                "status": "error",
+                "proxied_to": target_url,
+                "error": error,
+                "duration_ms": duration_ms,
+            }),
+            request.forward_id.as_deref(),
+        );
+
+        self.send_request_ack(write, payload).await
     }
 
     async fn send_request_ack(

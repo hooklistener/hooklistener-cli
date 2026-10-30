@@ -3663,6 +3663,47 @@ fn listen_forward_success_event_includes_delivery_receipt() {
 }
 
 #[test]
+fn listen_forward_failed_receipt_reports_webhook_rejected_before_forwarding() {
+    let event = TunnelEvent::ForwardError {
+        request_id: "req_123".to_string(),
+        target_url: "http://127.0.0.1:3000/base".to_string(),
+        error: "target_path_escape: Forwarded request path must remain within the configured target path".to_string(),
+        duration_ms: 0,
+    };
+    let mut receipt = listen_event_receipt(
+        &event,
+        "github-webhooks",
+        "http://127.0.0.1:3000/base",
+        None,
+    );
+
+    let receipt_fields = receipt.as_object_mut().unwrap();
+    assert!(receipt_fields.remove("event_id").unwrap().is_string());
+    assert!(receipt_fields.remove("emitted_at").unwrap().is_string());
+    assert_eq!(
+        receipt,
+        serde_json::json!({
+            "$schema": LISTEN_EVENT_SCHEMA,
+            "schema_version": 1,
+            "type": "event",
+            "sequence": 0,
+            "event": "forward_failed",
+            "status": "failed",
+            "command": "listen",
+            "operation": "listen_endpoint",
+            "endpoint_slug": "github-webhooks",
+            "target_url": "http://127.0.0.1:3000/base",
+            "resource_uri": "hooklistener://requests/req_123",
+            "request_id": "req_123",
+            "request_resource_uri": "hooklistener://requests/req_123",
+            "error": "target_path_escape: Forwarded request path must remain within the configured target path",
+            "duration_ms": 0,
+            "next_actions": ["Check that the local target URL is reachable from this machine."]
+        })
+    );
+}
+
+#[test]
 fn tunnel_established_event_includes_public_url_and_resource() {
     let event = TunnelEvent::TunnelEstablished {
         subdomain: "plant-07.hook.events".to_string(),
